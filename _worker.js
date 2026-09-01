@@ -601,6 +601,155 @@ function jsonResponse(data, status = 200) {
 	});
 }
 
+// ===== 分级命令菜单 =====
+// Telegram 按 scope 决定"某个人在某个聊天里看到哪些命令"，优先级从高到低：
+//   chat_member(群+人) > chat_administrators(群) > chat(单聊天) >
+//   all_chat_administrators > all_group_chats / all_private_chats > default
+// 所以分级方式是：
+//   * 普通用户 → default / all_group_chats / all_private_chats，只有 /start、/unban
+//   * 群管理员 → all_chat_administrators，加上 /ban、/spam
+//   * 副主人（OWNER_IDS[1..]，即高级管理员）→ 私聊 chat + 各配置群 chat_member，再加 /check、/blacklist
+//   * 第一主人（OWNER_IDS[0]）→ 私聊 chat + 各配置群 chat_member，投放全部命令
+// 高优先级 scope 只投给具体的人，其他人查询到的仍是低优先级菜单，因此主人命令对他人不可见。
+const NORMAL_USER_COMMAND_MENU = [
+	{ command: 'start', description: '开始自助解封' },
+	{ command: 'unban', description: '申请解封（按提示确认）' },
+];
+
+const GROUP_ADMIN_COMMAND_MENU = [
+	{ command: 'unban', description: '解除本群封禁' },
+	{ command: 'ban', description: '封禁并加黑（只封当前群）' },
+	{ command: 'spam', description: '举报广告号（跨群封禁）' },
+];
+
+const SECONDARY_OWNER_COMMAND_MENU = [
+	{ command: 'unban', description: '解封用户（全部配置群）' },
+	{ command: 'ban', description: '封禁并加黑（只封当前群）' },
+	{ command: 'spam', description: '举报广告号（跨群封禁）' },
+	{ command: 'check', description: '查询封禁状态' },
+	{ command: 'blacklist', description: '查看黑名单' },
+];
+
+// 第一主人菜单 = 全部命令（含隐藏运维指令）。仅投放给 OWNER_IDS[0]。
+const PRIMARY_OWNER_COMMAND_MENU = [
+	{ command: 'unban', description: '解封用户（全部配置群）' },
+	{ command: 'ban', description: '封禁并加黑（只封当前群）' },
+	{ command: 'spam', description: '举报广告号（跨群封禁）' },
+	{ command: 'check', description: '查询封禁状态' },
+	{ command: 'blacklist', description: '查看黑名单' },
+	{ command: 'ad', description: '发起广告举报投票' },
+	{ command: 'add_ad_admin', description: '添加 /ad 发起白名单' },
+	{ command: 'del_ad_admin', description: '移除 /ad 发起白名单' },
+	{ command: 'job', description: '查询批量任务进度' },
+	{ command: 'jobrun', description: '手动续跑批量任务' },
+	{ command: 'admins', description: '查看权限名单' },
+	{ command: 'groups', description: '查看配置群组' },
+	{ command: 'addgroup', description: '添加动态群组' },
+	{ command: 'delgroup', description: '移除动态群组' },
+	{ command: 'listgroups', description: '查看生效群组' },
+	{ command: 'leavegroup', description: '让机器人退出群组' },
+	{ command: 'addword', description: '添加广告词' },
+	{ command: 'delword', description: '删除广告词' },
+	{ command: 'listwords', description: '查看广告词库' },
+	{ command: 'importdefault', description: '导入推荐广告词库' },
+	{ command: 'learn', description: '学习广告文本指纹' },
+	{ command: 'learnlast', description: '按序号学习快照广告' },
+	{ command: 'recent', description: '拉取疑似广告快照' },
+	{ command: 'listsamples', description: '查看广告样本' },
+	{ command: 'delsample', description: '删除广告样本' },
+	{ command: 'clearsamples', description: '清空广告样本' },
+	{ command: 'start', description: '自助解封入口' },
+	{ command: 'help', description: '展开全部隐藏指令' },
+];
+
+// 每次初始化最多投放的"精确到人"菜单数量。Cloudflare Workers 单请求有子请求上限，
+// 群数 × 主人数不设限会把预算耗尽，因此超出部分跳过并在回执里明确报告。
+const TIERED_MENU_PER_MEMBER_CALL_LIMIT = 30;
+
+async function callTelegramMenuApi(method, body) {
+	const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body)
+	});
+	let result = null;
+	try {
+		result = await response.json();
+	} catch (_) { /* 非 JSON 响应按失败处理 */ }
+	return {
+		ok: response.ok && result?.ok === true,
+		status: response.status,
+		description: result?.description || '',
+		result
+	};
+}
+
+async function applyBotCommandMenu(label, commands, scope) {
+	const payload = { commands, scope };
+	const outcome = await callTelegramMenuApi('setMyCommands', payload);
+	return {
+		菜单: label,
+		作用域: scope.type,
+		命令数: commands.length,
+		已设置: outcome.ok,
+		...(outcome.ok ? {} : { HTTP状态码: outcome.status, Telegram返回: outcome.description || outcome.result })
+	};
+}
+
+// 分级菜单投放。返回逐条结果，调用方汇总进初始化回执，失败项不阻断其它 scope。
+async function applyTieredCommandMenus() {
+	const menus = [];
+
+	// 1) 兜底三层：任何人（含普通成员）只看到 /start、/unban
+	menus.push(await applyBotCommandMenu('普通用户(默认)', NORMAL_USER_COMMAND_MENU, { type: 'default' }));
+	menus.push(await applyBotCommandMenu('普通用户(私聊)', NORMAL_USER_COMMAND_MENU, { type: 'all_private_chats' }));
+	menus.push(await applyBotCommandMenu('普通用户(群聊)', NORMAL_USER_COMMAND_MENU, { type: 'all_group_chats' }));
+
+	// 2) 群管理员：所有群的管理员统一菜单
+	menus.push(await applyBotCommandMenu('群管理员', GROUP_ADMIN_COMMAND_MENU, { type: 'all_chat_administrators' }));
+
+	// 3) 主人层：精确到人投放，别人拿不到这些 scope
+	const primaryOwnerId = OWNER_IDS[0] || '';
+	const secondaryOwnerIds = OWNER_IDS.slice(1);
+	let perMemberCalls = 0;
+	const skipped = [];
+
+	if (primaryOwnerId) {
+		menus.push(await applyBotCommandMenu('第一主人(私聊)', PRIMARY_OWNER_COMMAND_MENU, {
+			type: 'chat',
+			chat_id: primaryOwnerId
+		}));
+	}
+	for (const ownerId of secondaryOwnerIds) {
+		menus.push(await applyBotCommandMenu(`副主人 ${ownerId}(私聊)`, SECONDARY_OWNER_COMMAND_MENU, {
+			type: 'chat',
+			chat_id: ownerId
+		}));
+	}
+
+	// 群内 chat_member：让主人/副主人在群里也能看到自己那一层菜单，
+	// 而不是被 all_chat_administrators 的群管理员菜单覆盖。
+	for (const groupId of GROUP_IDS) {
+		for (const [ownerId, commands, label] of [
+			...(primaryOwnerId ? [[primaryOwnerId, PRIMARY_OWNER_COMMAND_MENU, '第一主人']] : []),
+			...secondaryOwnerIds.map((id) => [id, SECONDARY_OWNER_COMMAND_MENU, `副主人 ${id}`]),
+		]) {
+			if (perMemberCalls >= TIERED_MENU_PER_MEMBER_CALL_LIMIT) {
+				skipped.push(`${label} @ ${groupId}`);
+				continue;
+			}
+			perMemberCalls += 1;
+			menus.push(await applyBotCommandMenu(`${label}(群 ${groupId})`, commands, {
+				type: 'chat_member',
+				chat_id: groupId,
+				user_id: ownerId
+			}));
+		}
+	}
+
+	return { menus, skipped };
+}
+
 async function handleInitialization(request) {
 	try {
 		// 设置 Webhook
@@ -633,54 +782,44 @@ async function handleInitialization(request) {
 			}, 500);
 		}
 
-		// 设置机器人命令
-		const setCommandsUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
-		const setCommandsBody = {
-			commands: [
-				{ command: "unban", description: "开始自助解封" },
-				{ command: "ban", description: "添加用户到全局黑名单 (当前群管理员)" },
-				{ command: "spam", description: "举报并加入全局黑名单 (当前群管理员)" },
-				{ command: "check", description: "查询封禁状态 (高级管理员)" },
-				{ command: "blacklist", description: "查看当前黑名单 (高级管理员)" }
-			]
+		// 设置分级机器人命令菜单
+		const { menus, skipped } = await applyTieredCommandMenus();
+		const failed = menus.filter((item) => !item.已设置);
+		// 兜底菜单（default / 私聊 / 群聊 / 群管理员）必须成功；
+		// 精确到人的 chat / chat_member 允许失败（主人没私聊过 bot、或不在某个群）。
+		const baselineFailed = failed.filter((item) => ['default', 'all_private_chats', 'all_group_chats', 'all_chat_administrators'].includes(item.作用域));
+		const webhookInfo = {
+			已设置: true,
+			目标地址: webhookUrl.toString(),
+			允许更新类型: setWebhookBody.allowed_updates
+		};
+		const commandInfo = {
+			已设置: baselineFailed.length === 0,
+			分级说明: {
+				普通用户: NORMAL_USER_COMMAND_MENU.map((c) => `/${c.command}`),
+				群管理员: GROUP_ADMIN_COMMAND_MENU.map((c) => `/${c.command}`),
+				副主人: SECONDARY_OWNER_COMMAND_MENU.map((c) => `/${c.command}`),
+				第一主人: `全部 ${PRIMARY_OWNER_COMMAND_MENU.length} 条命令`
+			},
+			投放结果: menus,
+			...(skipped.length ? { 已跳过: skipped, 跳过原因: `单次初始化最多投放 ${TIERED_MENU_PER_MEMBER_CALL_LIMIT} 个精确到人的菜单，请再次访问初始化地址补齐` } : {}),
+			...(failed.length && !baselineFailed.length ? { 提示: '精确到人的菜单存在失败项：通常是该主人尚未私聊过机器人，或不在该配置群内；不影响其它菜单。' } : {})
 		};
 
-		const commandsResponse = await fetch(setCommandsUrl, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(setCommandsBody)
-		});
-
-		if (commandsResponse.ok) {
+		if (baselineFailed.length === 0) {
 			return jsonResponse({
 				成功: true,
-				消息: 'Webhook 和命令设置成功',
-				Webhook: {
-					已设置: true,
-					目标地址: webhookUrl.toString(),
-					允许更新类型: setWebhookBody.allowed_updates
-				},
-				命令: {
-					已设置: true
-				}
+				消息: 'Webhook 和分级命令菜单设置成功',
+				Webhook: webhookInfo,
+				命令: commandInfo
 			});
-		} else {
-			const result = await commandsResponse.json();
-			return jsonResponse({
-				成功: false,
-				消息: '命令设置失败',
-				Webhook: {
-					已设置: true,
-					目标地址: webhookUrl.toString(),
-					允许更新类型: setWebhookBody.allowed_updates
-				},
-				命令: {
-					已设置: false,
-					HTTP状态码: commandsResponse.status,
-					Telegram返回: result
-				}
-			}, 500);
 		}
+		return jsonResponse({
+			成功: false,
+			消息: '命令设置失败',
+			Webhook: webhookInfo,
+			命令: commandInfo
+		}, 500);
 	} catch (error) {
 		return jsonResponse({
 			成功: false,
@@ -704,6 +843,10 @@ const BULK_TASK_D1_RETRY_DELAY_MS = 200;
 const BULK_TASK_FAILURE_LIMIT = 100;
 const BULK_TASK_LEASE_MS = 45000;
 const D1_BATCH_MUTATION_SIZE = 20;
+// 黑名单 INSERT 每条记录 6 列（含 scope_groups），D1 单条语句绑定参数上限 100，
+// 因此每批最多 16 行（16×6=96 ≤ 100）。DELETE / SELECT IN 仍按 20 一批。
+const D1_BLACKLIST_INSERT_COLUMNS = 6;
+const D1_BLACKLIST_INSERT_BATCH_SIZE = Math.floor(100 / D1_BLACKLIST_INSERT_COLUMNS);
 const BATCH_USER_PROFILE_CONCURRENCY = 3;
 const BATCH_USER_NAME_MAX_LENGTH = 48;
 const BULK_JOB_PROFILE_PAGE_SIZE = 10;
@@ -799,7 +942,7 @@ async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 // 读取并归一化黑名单
 // === D1 工具函数 ===
 // 首次访问 D1 时建表（幂等），避免人工建表步骤
-const D1_SCHEMA_VERSION = 5;
+const D1_SCHEMA_VERSION = 6;
 const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
 const D1_INIT_PROMISES = new WeakMap();
@@ -845,6 +988,101 @@ async function loadD1RuntimeCachedValue(env, cache, loader) {
 	}
 }
 
+// ===== 黑名单生效群范围（scope_groups）=====
+// 语义：null = 全局黑名单（全部配置群生效，且自助解封被全局拒绝）；
+//       非空数组 = 仅在这些群生效，其它群完全不受影响（误杀者仍能加入别的私密群）。
+// 唯一全局来源 = 真人 /spam；群内 /ban、广告自动检测、/ad 投票、杀神库都只写"当前群"。
+// 历史记录 scope_groups 为 NULL，按全局解释，与本次改动前行为一致。
+function normalizeBlacklistScope(value) {
+	if (value === null || value === undefined) return null;
+	const tokens = Array.isArray(value)
+		? value
+		: String(value).split(/[,，\s]+/);
+	const ids = [...new Set(
+		tokens
+			.map((id) => String(id ?? '').trim())
+			.filter((id) => /^-?\d{5,20}$/.test(id))
+	)].sort();
+	// 空字符串 / 全是垃圾值 → 视为全局，绝不产出"谁都不生效"的空范围记录。
+	return ids.length > 0 ? ids : null;
+}
+
+function serializeBlacklistScope(scope) {
+	const normalized = normalizeBlacklistScope(scope);
+	return normalized ? normalized.join(',') : null;
+}
+
+// 合并两个范围：任一为全局则结果为全局（范围只会放大，不会因再次加黑被收窄）。
+function mergeBlacklistScopes(current, incoming) {
+	const a = normalizeBlacklistScope(current);
+	const b = normalizeBlacklistScope(incoming);
+	if (a === null || b === null) return null;
+	return normalizeBlacklistScope([...a, ...b]);
+}
+
+// 该记录是否在指定群生效。范围为全局时恒为 true。
+function blacklistScopeCoversGroup(scope, chatId) {
+	const normalized = normalizeBlacklistScope(scope);
+	if (normalized === null) return true;
+	const id = String(chatId ?? '').trim();
+	return id !== '' && normalized.includes(id);
+}
+
+// 从范围中移除若干群（群管理员 /unban 只解除本群）。
+// 返回 { scope, changed, emptied }：emptied=true 表示范围被清空，调用方应删除整条记录。
+function removeGroupsFromBlacklistScope(scope, groupIds) {
+	const normalized = normalizeBlacklistScope(scope);
+	if (normalized === null) {
+		// 全局记录无法被"部分解除"：全局语义就是所有群都封，收窄等于偷偷放行。
+		return { scope: null, changed: false, emptied: false, global: true };
+	}
+	const removing = new Set(
+		(Array.isArray(groupIds) ? groupIds : [groupIds])
+			.map((id) => String(id ?? '').trim())
+			.filter(Boolean)
+	);
+	const kept = normalized.filter((id) => !removing.has(id));
+	return {
+		scope: kept.length > 0 ? kept : null,
+		changed: kept.length !== normalized.length,
+		emptied: kept.length === 0,
+		global: false,
+	};
+}
+
+// 把范围解析为"本次真正要操作的配置群列表"。范围里已被移除的群自动被过滤掉。
+function resolveScopeTargetGroupIds(scope) {
+	const normalized = normalizeBlacklistScope(scope);
+	if (normalized === null) return [...GROUP_IDS];
+	return GROUP_IDS.filter((groupId) => normalized.includes(String(groupId)));
+}
+
+function describeBlacklistScope(scope) {
+	const normalized = normalizeBlacklistScope(scope);
+	if (normalized === null) return '全部配置群（全局）';
+	return `仅 ${normalized.length} 个群：${normalized.join('、')}`;
+}
+
+// 带群名的范围描述（给人看的回执用，如 /check）。拉群名失败时回落纯 ID，不影响主流程。
+async function describeBlacklistScopeWithTitles(scope) {
+	const normalized = normalizeBlacklistScope(scope);
+	if (normalized === null) return '全部配置群（全局）';
+	const labels = [];
+	for (const groupId of normalized) {
+		const configured = isConfiguredGroup(groupId);
+		let title = '';
+		if (configured) {
+			try {
+				const info = await getChatInfoFromId(groupId);
+				title = String(info?.title || '').trim();
+			} catch (_) {}
+		}
+		const suffix = configured ? '' : '（已不在 GROUP_ID 配置）';
+		labels.push(title ? `${title} ${groupId}${suffix}` : `${groupId}${suffix}`);
+	}
+	return `仅 ${normalized.length} 个群：${labels.join('、')}`;
+}
+
 function normalizeD1BlacklistRow(row) {
 	if (!row) return null;
 	return {
@@ -852,7 +1090,8 @@ function normalizeD1BlacklistRow(row) {
 		reason: row.reason ?? null,
 		by: row.by_user ?? null,
 		at: row.at ?? null,
-		note: row.note ?? null
+		note: row.note ?? null,
+		scopeGroups: normalizeBlacklistScope(row.scope_groups ?? null)
 	};
 }
 
@@ -876,7 +1115,10 @@ async function d1TablesExist(env, tables) {
 }
 
 async function d1CoreTablesExist(env) {
-	return d1ColumnExists(env, 'blacklist', 'note');
+	// scope_groups 是"黑名单记录生效群范围"的载体，缺列时范围判定会整体退化成全局，
+	// 因此与 note 一样纳入核心结构判定，逼迫 ensureD1Table 走一次补列迁移。
+	if (!(await d1ColumnExists(env, 'blacklist', 'note'))) return false;
+	return d1ColumnExists(env, 'blacklist', 'scope_groups');
 }
 
 async function d1AdRelayTablesExist(env) {
@@ -954,7 +1196,10 @@ async function ensureD1Table(env) {
 
 			const tableStatements = [
 				['schema_meta', 'CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, updated_at TEXT);'],
-				['blacklist', 'CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT);'],
+				// scope_groups：该黑名单记录的【生效群范围】。NULL/空 = 全局（全部配置群）；
+				// 有值 = 逗号分隔的群 ID 列表，只在这些群内生效。/spam 写全局，
+				// 群内 /ban 与广告自动检测/投票/杀神只写当前群，误杀者仍可加入其它私密群。
+				['blacklist', 'CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT, scope_groups TEXT);'],
 				['ad_keywords', 'CREATE TABLE IF NOT EXISTS ad_keywords (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);'],
 				['ad_samples', 'CREATE TABLE IF NOT EXISTS ad_samples (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);'],
 				['recent_messages', 'CREATE TABLE IF NOT EXISTS recent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, chat_title TEXT, text TEXT, from_id TEXT, from_name TEXT, created_at TEXT);'],
@@ -981,6 +1226,19 @@ async function ensureD1Table(env) {
 			try {
 				if (!(await d1ColumnExists(env, 'blacklist', 'note'))) {
 					await runD1SchemaStatement(env, 'blacklist.note', 'ALTER TABLE blacklist ADD COLUMN note TEXT;');
+				}
+			} catch (error) {
+				const message = formatD1SchemaError(error).toLowerCase();
+				if (!message.includes('duplicate') && !message.includes('exists')) {
+					throw error;
+				}
+			}
+
+			// 旧库补列：历史记录 scope_groups 为 NULL，按"全局黑名单"解释，
+			// 与本次改动前的行为完全一致，零迁移。
+			try {
+				if (!(await d1ColumnExists(env, 'blacklist', 'scope_groups'))) {
+					await runD1SchemaStatement(env, 'blacklist.scope_groups', 'ALTER TABLE blacklist ADD COLUMN scope_groups TEXT;');
 				}
 			} catch (error) {
 				const message = formatD1SchemaError(error).toLowerCase();
@@ -1223,7 +1481,7 @@ async function removeDynamicGroup(env, chatId) {
 
 async function readD1Blacklist(env) {
 	await ensureD1Table(env);
-	const stmt = env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at ASC, id ASC');
+	const stmt = env.DB.prepare('SELECT id, reason, by_user, at, note, scope_groups FROM blacklist ORDER BY at ASC, id ASC');
 	const { results } = await stmt.all();
 	return (results || []).map(normalizeD1BlacklistRow).filter(Boolean);
 }
@@ -1232,7 +1490,7 @@ async function readD1BlacklistEntry(env, userId) {
 	await ensureD1Table(env);
 	const id = String(userId ?? '').trim();
 	if (!id) return null;
-	const row = await env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ? LIMIT 1')
+	const row = await env.DB.prepare('SELECT id, reason, by_user, at, note, scope_groups FROM blacklist WHERE id = ? LIMIT 1')
 		.bind(id)
 		.first();
 	return normalizeD1BlacklistRow(row);
@@ -1241,7 +1499,7 @@ async function readD1BlacklistEntry(env, userId) {
 async function readD1BlacklistRecent(env, limit) {
 	await ensureD1Table(env);
 	const safeLimit = Math.max(1, Math.min(Number(limit) || BLACKLIST_PAGE_LIMIT, 200));
-	const { results } = await env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at DESC, id DESC LIMIT ?')
+	const { results } = await env.DB.prepare('SELECT id, reason, by_user, at, note, scope_groups FROM blacklist ORDER BY at DESC, id DESC LIMIT ?')
 		.bind(safeLimit)
 		.all();
 	return (results || []).map(normalizeD1BlacklistRow).filter(Boolean);
@@ -1301,7 +1559,7 @@ async function readD1BlacklistWindow(env, offset, limit, reasons = null) {
 
 	const filter = buildD1BlacklistReasonFilter(reasons);
 	const stmt = env.DB.prepare(`
-		SELECT id, reason, by_user, at, note
+		SELECT id, reason, by_user, at, note, scope_groups
 		FROM blacklist
 		${filter.where}
 		ORDER BY at ASC, id ASC
@@ -1313,7 +1571,8 @@ async function readD1BlacklistWindow(env, offset, limit, reasons = null) {
 		reason: r.reason ?? null,
 		by: r.by_user ?? null,
 		at: r.at ?? null,
-		note: r.note ?? null
+		note: r.note ?? null,
+		scopeGroups: normalizeBlacklistScope(r.scope_groups ?? null)
 	}));
 }
 
@@ -1331,6 +1590,8 @@ async function getBlacklist(env) {
 }
 
 // 检查用户是否在黑名单中
+// options.chatId：只在该群判定命中（范围外的记录视为"未命中"，让误杀者仍能加入其它群）。
+//   不传 chatId = 只问"库里有没有这条记录"，用于自助解封硬闸门与 /check 查询展示。
 async function checkBlacklist(userId, env, options = {}) {
 	if (!env.DB) {
 		if (options.strict) {
@@ -1347,10 +1608,18 @@ async function checkBlacklist(userId, env, options = {}) {
 	try {
 		const hit = await readD1BlacklistEntry(env, userId);
 		if (hit) {
+			const scopeCovers = options.chatId === undefined || options.chatId === null
+				? true
+				: blacklistScopeCoversGroup(hit.scopeGroups, options.chatId);
+			if (!scopeCovers) {
+				// 有记录但本群不在生效范围内：本群完全不拦，等同于没这条记录。
+				return { isBlacklisted: false, message: null, entry: hit, scopeCovers: false };
+			}
 			return {
 				isBlacklisted: true,
 				message: '❌ 您的TGID在黑名单中，请自行联系管理员解封。',
-				entry: hit
+				entry: hit,
+				scopeCovers: true
 			};
 		}
 
@@ -1399,6 +1668,9 @@ async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, option
 }
 
 // 添加用户到黑名单（核心实现）
+// options.scopeGroups：生效群范围。省略 / null = 全局（仅 /spam 使用）；
+//   数组或逗号串 = 只在这些群生效（群内 /ban、广告自动检测、/ad 投票、杀神库）。
+// 记录已存在时不覆盖原有 reason/note，但会把新范围【并入】旧范围（范围只放大不收窄）。
 async function addToBlacklistCore(userId, env, options = {}) {
 	if (!env.DB) {
 		return { success: false, code: 'NO_DB', message: '❌ 未绑定 D1 存储空间' };
@@ -1410,19 +1682,50 @@ async function addToBlacklistCore(userId, env, options = {}) {
 	const noteRaw = options.note != null ? String(options.note).trim() : '';
 	const note = noteRaw ? noteRaw : null;
 	const at = new Date().toISOString();
+	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
+	const scopeValue = serializeBlacklistScope(scopeGroups);
 
 	try {
 		await ensureD1Table(env);
 		const result = await env.DB
-			.prepare('INSERT OR IGNORE INTO blacklist (id, reason, by_user, at, note) VALUES (?, ?, ?, ?, ?)')
-			.bind(userIdStr, reason, by, at, note)
+			.prepare('INSERT OR IGNORE INTO blacklist (id, reason, by_user, at, note, scope_groups) VALUES (?, ?, ?, ?, ?, ?)')
+			.bind(userIdStr, reason, by, at, note, scopeValue)
 			.run();
 		const changed = result?.meta?.changes ?? result?.changes ?? 0;
 		if (!changed) {
-			return { success: false, code: 'EXISTS', message: '⚠️ 该用户已在黑名单中' };
+			// 已存在：把本次范围并进旧范围（例如先在 A 群 /ban，再 /spam 就升级为全局）。
+			const existing = await readD1BlacklistEntry(env, userIdStr);
+			const mergedScope = mergeBlacklistScopes(existing?.scopeGroups ?? null, scopeGroups);
+			const mergedValue = serializeBlacklistScope(mergedScope);
+			const previousValue = serializeBlacklistScope(existing?.scopeGroups ?? null);
+			if (mergedValue !== previousValue) {
+				await env.DB
+					.prepare('UPDATE blacklist SET scope_groups = ? WHERE id = ?')
+					.bind(mergedValue, userIdStr)
+					.run();
+				return {
+					success: false,
+					code: 'EXISTS',
+					scopeExpanded: true,
+					scopeGroups: mergedScope,
+					message: `⚠️ 该用户已在黑名单中，本次已把生效范围扩展为${describeBlacklistScope(mergedScope)}`
+				};
+			}
+			return {
+				success: false,
+				code: 'EXISTS',
+				scopeExpanded: false,
+				scopeGroups: existing?.scopeGroups ?? null,
+				message: '⚠️ 该用户已在黑名单中'
+			};
 		}
 
-		return { success: true, code: 'ADDED', message: `✅ 已将用户 <code>${userId}</code> 添加到黑名单` };
+		return {
+			success: true,
+			code: 'ADDED',
+			scopeGroups,
+			message: `✅ 已将用户 <code>${userId}</code> 添加到黑名单（${describeBlacklistScope(scopeGroups)}）`
+		};
 	} catch (error) {
 		console.error('添加黑名单时出错:', error);
 		return { success: false, code: 'ERROR', message: '❌ 添加黑名单失败: ' + error.message };
@@ -1436,15 +1739,67 @@ async function addToBlacklist(userId, env, options = {}) {
 }
 
 // 从黑名单中移除用户（核心实现）
-async function removeFromBlacklistCore(userId, env) {
+// options.scopeGroups：只解除这些群的范围（群管理员本群 /unban）。
+//   省略 = 整条删除（主人/副主人/超管的全局 /unban）。
+//   目标记录是全局记录时，范围移除一律拒绝：全局语义不允许被"部分放行"偷偷破坏。
+async function removeFromBlacklistCore(userId, env, options = {}) {
 	if (!env.DB) {
 		return { success: false, code: 'NO_DB', message: '❌ 未绑定 D1 存储空间' };
 	}
 
 	const userIdStr = String(userId);
+	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
 
 	try {
 		await ensureD1Table(env);
+
+		if (scopeGroups !== null) {
+			const existing = await readD1BlacklistEntry(env, userIdStr);
+			if (!existing) {
+				return { success: false, code: 'NOT_FOUND', message: '⚠️ 该用户不在黑名单中' };
+			}
+			const next = removeGroupsFromBlacklistScope(existing.scopeGroups, scopeGroups);
+			if (next.global) {
+				return {
+					success: false,
+					code: 'GLOBAL_SCOPE',
+					entry: existing,
+					message: '⛔ 该记录是<b>全局黑名单</b>（由 /spam 写入），不能只解除单个群。请联系主人、副主人或超级管理员执行全局 <code>/unban</code>。'
+				};
+			}
+			if (!next.changed) {
+				return {
+					success: false,
+					code: 'SCOPE_MISS',
+					entry: existing,
+					message: '⚠️ 该用户的黑名单记录不包含本群，本群无需解除。'
+				};
+			}
+			if (next.emptied) {
+				const deleted = await env.DB.prepare('DELETE FROM blacklist WHERE id = ?').bind(userIdStr).run();
+				const removed = deleted?.meta?.changes ?? deleted?.changes ?? 0;
+				if (!removed) {
+					return { success: false, code: 'NOT_FOUND', message: '⚠️ 该用户不在黑名单中' };
+				}
+				return {
+					success: true,
+					code: 'REMOVED',
+					scopeEmptied: true,
+					message: `✅ 已解除本群限制，且该用户已无其它生效群，黑名单记录已删除`
+				};
+			}
+			await env.DB
+				.prepare('UPDATE blacklist SET scope_groups = ? WHERE id = ?')
+				.bind(serializeBlacklistScope(next.scope), userIdStr)
+				.run();
+			return {
+				success: true,
+				code: 'SCOPE_REDUCED',
+				scopeGroups: next.scope,
+				message: `✅ 已解除本群限制；该记录仍在其它群生效（${describeBlacklistScope(next.scope)}）`
+			};
+		}
+
 		const result = await env.DB
 			.prepare('DELETE FROM blacklist WHERE id = ?')
 			.bind(userIdStr)
@@ -1462,18 +1817,21 @@ async function removeFromBlacklistCore(userId, env) {
 }
 
 // 从黑名单中移除用户（薄包装）
-async function removeFromBlacklist(userId, env) {
-	const result = await removeFromBlacklistCore(userId, env);
+async function removeFromBlacklist(userId, env, options = {}) {
+	const result = await removeFromBlacklistCore(userId, env, options);
 	return result;
 }
 
-// 对目标用户执行所有配置群的 Telegram 封禁/预封，逐群结果数组返回。
+// 对指定群列表执行 Telegram 封禁/预封，逐群结果数组返回。
 // 用户在群内时 banChatMember 会把人移出并封禁；用户不在群内但 Telegram 可识别时，会加入群封禁列表（预封）。
 // bot 不在群 / 没权限 / Telegram 无法识别用户时，单群失败不影响其它群；串行避免 Telegram API 限流。
 // 返回 [{ groupId, userId, ok, error, memberProbe }]
-async function banUserFromAllGroups(userId, options = {}) {
+async function banUserFromGroups(userId, groupIds, options = {}) {
 	const results = [];
-	for (const groupId of GROUP_IDS) {
+	const targets = (Array.isArray(groupIds) ? groupIds : [groupIds])
+		.map((id) => String(id ?? '').trim())
+		.filter(Boolean);
+	for (const groupId of targets) {
 		const memberProbe = options.probeMembership
 			? await probeTargetMemberBeforeBan(groupId, userId)
 			: null;
@@ -1483,12 +1841,20 @@ async function banUserFromAllGroups(userId, options = {}) {
 	return results;
 }
 
-// 把用户从所有配置群解除 Telegram 原生/手动封禁，逐群结果数组返回。
-// 调用方必须先确认目标不在 D1 黑名单；管理层命中 D1 时应先成功移除记录。
+// 全群封禁：只有真人 /spam（以及主人私聊 /ban 的全局通道）才使用。
+async function banUserFromAllGroups(userId, options = {}) {
+	return banUserFromGroups(userId, GROUP_IDS, options);
+}
+
+// 把用户从指定群列表解除 Telegram 原生/手动封禁，逐群结果数组返回。
+// 调用方必须先确认目标在这些群不再受 D1 黑名单约束；管理层命中 D1 时应先成功移除/收窄记录。
 // 本函数本身不修改 D1，也绝不调用封禁接口。
-async function unbanUserFromAllGroups(userId) {
+async function unbanUserFromGroups(userId, groupIds) {
 	const results = [];
-	for (const groupId of GROUP_IDS) {
+	const targets = (Array.isArray(groupIds) ? groupIds : [groupIds])
+		.map((id) => String(id ?? '').trim())
+		.filter(Boolean);
+	for (const groupId of targets) {
 		try {
 			const r = await unbanUser(userId, groupId);
 			results.push({
@@ -1502,6 +1868,10 @@ async function unbanUserFromAllGroups(userId) {
 		}
 	}
 	return results;
+}
+
+async function unbanUserFromAllGroups(userId) {
+	return unbanUserFromGroups(userId, GROUP_IDS);
 }
 
 // 渲染单个用户多群踢人结果为简短 HTML 文案
@@ -2170,8 +2540,10 @@ function chunkBatchItems(items, size = D1_BATCH_MUTATION_SIZE) {
 }
 
 // 批量添加：每 20 个 TGID 一条多行 SQL；RETURNING 精确区分新增与已存在。
+// options.scopeGroups：本批记录的生效群范围（null = 全局，仅 /spam 批量走这里）。
+// 已存在的记录不改 reason/note，但会把本次范围并入旧范围（范围只放大不收窄）。
 async function addManyToBlacklist(ids, env, options = {}) {
-	const results = { success: [], exists: [], failed: [] };
+	const results = { success: [], exists: [], failed: [], scopeExpanded: [] };
 	const uniqueIds = normalizeBatchMutationIds(ids);
 	if (!env.DB) {
 		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间' })));
@@ -2184,13 +2556,15 @@ async function addManyToBlacklist(ids, env, options = {}) {
 	const by = options.by != null ? String(options.by) : null;
 	const note = normalizeActionNote(options.note) || null;
 	const at = new Date().toISOString();
+	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
+	const scopeValue = serializeBlacklistScope(scopeGroups);
 
-	for (const chunk of chunkBatchItems(uniqueIds)) {
+	for (const chunk of chunkBatchItems(uniqueIds, D1_BLACKLIST_INSERT_BATCH_SIZE)) {
 		try {
-			const valuesSql = chunk.map(() => '(?, ?, ?, ?, ?)').join(', ');
-			const params = chunk.flatMap((id) => [id, reason, by, at, note]);
+			const valuesSql = chunk.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
+			const params = chunk.flatMap((id) => [id, reason, by, at, note, scopeValue]);
 			const response = await env.DB
-				.prepare(`INSERT OR IGNORE INTO blacklist (id, reason, by_user, at, note) VALUES ${valuesSql} RETURNING id`)
+				.prepare(`INSERT OR IGNORE INTO blacklist (id, reason, by_user, at, note, scope_groups) VALUES ${valuesSql} RETURNING id`)
 				.bind(...params)
 				.all();
 			const inserted = new Set((response?.results || []).map((row) => String(row.id)));
@@ -2203,15 +2577,62 @@ async function addManyToBlacklist(ids, env, options = {}) {
 			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 添加黑名单失败: ${error.message || error}` })));
 		}
 	}
+
+	if (results.exists.length > 0) {
+		const expanded = await expandManyBlacklistScopes(results.exists, env, scopeGroups);
+		results.scopeExpanded = expanded;
+	}
 	return results;
+}
+
+// 把一批已存在记录的生效范围并入 scopeGroups；返回真正被扩大的 TGID 列表。
+// scopeGroups = null（全局）时一条 UPDATE 就能把整批升级为全局，无需逐条读。
+async function expandManyBlacklistScopes(ids, env, scopeGroups) {
+	const uniqueIds = normalizeBatchMutationIds(ids);
+	if (uniqueIds.length === 0) return [];
+	const expanded = [];
+	for (const chunk of chunkBatchItems(uniqueIds)) {
+		const placeholders = chunk.map(() => '?').join(', ');
+		try {
+			if (scopeGroups === null) {
+				const response = await env.DB
+					.prepare(`UPDATE blacklist SET scope_groups = NULL WHERE id IN (${placeholders}) AND scope_groups IS NOT NULL RETURNING id`)
+					.bind(...chunk)
+					.all();
+				expanded.push(...(response?.results || []).map((row) => String(row.id)));
+				continue;
+			}
+			const current = await env.DB
+				.prepare(`SELECT id, scope_groups FROM blacklist WHERE id IN (${placeholders})`)
+				.bind(...chunk)
+				.all();
+			for (const row of current?.results || []) {
+				const id = String(row.id);
+				const previous = normalizeBlacklistScope(row.scope_groups ?? null);
+				const merged = mergeBlacklistScopes(previous, scopeGroups);
+				const mergedValue = serializeBlacklistScope(merged);
+				if (mergedValue === serializeBlacklistScope(previous)) continue;
+				await env.DB
+					.prepare('UPDATE blacklist SET scope_groups = ? WHERE id = ?')
+					.bind(mergedValue, id)
+					.run();
+				expanded.push(id);
+			}
+		} catch (error) {
+			console.error('批量扩展黑名单生效范围时出错:', error);
+		}
+	}
+	return expanded;
 }
 
 // 批量 /unban 资格检查：
 // - 普通权限只读检查，D1 命中即拒绝；
 // - 第一主人、副主人、超级管理员可显式传 allowD1Removal，先移除 D1 再允许 Telegram 解封。
+// - options.scopeGroups：群管理员本群解封。只判定/只解除这些群的范围；
+//   记录本来就不覆盖这些群 → 视为无阻碍；记录是全局（/spam 写入）→ 一律拒绝，落入 globalScoped。
 // 查询或移除失败时严格拒绝对应目标，任何分支都不调用 Telegram 封禁接口。
 async function checkManyUnbanEligibility(ids, env, options = {}) {
-	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [], d1RemovalFailed: [] };
+	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [], d1RemovalFailed: [], globalScoped: [] };
 	const uniqueIds = normalizeBatchMutationIds(ids);
 	if (!env.DB) {
 		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间，无法确认解封资格' })));
@@ -2226,17 +2647,30 @@ async function checkManyUnbanEligibility(ids, env, options = {}) {
 		return results;
 	}
 
+	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
+
 	for (const chunk of chunkBatchItems(uniqueIds)) {
 		try {
 			const placeholders = chunk.map(() => '?').join(', ');
 			const response = await env.DB
-				.prepare(`SELECT id FROM blacklist WHERE id IN (${placeholders})`)
+				.prepare(`SELECT id, scope_groups FROM blacklist WHERE id IN (${placeholders})`)
 				.bind(...chunk)
 				.all();
-			const blocked = new Set((response?.results || []).map((row) => String(row.id)));
+			const rows = new Map(
+				(response?.results || []).map((row) => [String(row.id), normalizeBlacklistScope(row.scope_groups ?? null)])
+			);
 			for (const id of chunk) {
-				if (blocked.has(id)) results.blacklisted.push(id);
-				else results.eligible.push(id);
+				if (!rows.has(id)) {
+					results.eligible.push(id);
+					continue;
+				}
+				const scope = rows.get(id);
+				// 本群解封场景：记录不覆盖本群 → 本群本来就没被这条记录封，不构成阻碍。
+				if (scopeGroups !== null && !scopeGroups.some((groupId) => blacklistScopeCoversGroup(scope, groupId))) {
+					results.eligible.push(id);
+					continue;
+				}
+				results.blacklisted.push(id);
 			}
 		} catch (error) {
 			console.error('批量检查 /unban D1 资格时出错:', error);
@@ -2247,12 +2681,14 @@ async function checkManyUnbanEligibility(ids, env, options = {}) {
 		return results;
 	}
 
-	const removal = await removeManyFromBlacklist(results.blacklisted, env);
+	const removal = await removeManyFromBlacklist(results.blacklisted, env, { scopeGroups });
 	const eligibleSet = new Set([...results.eligible, ...removal.success, ...removal.notFound]);
 	results.d1Removed = [...removal.success];
 	results.d1RemovalFailed = removal.failed.map((item) => String(item.id));
 	results.eligible = uniqueIds.filter((id) => eligibleSet.has(id));
-	results.blacklisted = [];
+	results.globalScoped = [...removal.globalScoped];
+	// 全局记录在本群解封场景下仍然是"被封"状态，必须留在 blacklisted 里被拒绝。
+	results.blacklisted = [...removal.globalScoped];
 	for (const failure of removal.failed) {
 		results.failed.push({
 			id: String(failure.id),
@@ -2263,8 +2699,11 @@ async function checkManyUnbanEligibility(ids, env, options = {}) {
 }
 
 // 批量移除：每 20 个 TGID 一条 DELETE ... RETURNING，无需逐条预查询。
-async function removeManyFromBlacklist(ids, env) {
-	const results = { success: [], notFound: [], failed: [] };
+// options.scopeGroups：只解除这些群的生效范围（群管理员本群 /unban）。
+//   范围清空 → 整条删除并计入 success；仍有其它群 → 收窄并计入 success（本群已放行）；
+//   记录是全局 → 计入 globalScoped 并拒绝，绝不把全局封禁悄悄降级。
+async function removeManyFromBlacklist(ids, env, options = {}) {
+	const results = { success: [], notFound: [], failed: [], globalScoped: [], scopeReduced: [] };
 	const uniqueIds = normalizeBatchMutationIds(ids);
 	if (!env.DB) {
 		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间' })));
@@ -2273,9 +2712,49 @@ async function removeManyFromBlacklist(ids, env) {
 	if (uniqueIds.length === 0) return results;
 
 	await ensureD1Table(env);
+	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
+
 	for (const chunk of chunkBatchItems(uniqueIds)) {
 		try {
 			const placeholders = chunk.map(() => '?').join(', ');
+
+			if (scopeGroups !== null) {
+				const current = await env.DB
+					.prepare(`SELECT id, scope_groups FROM blacklist WHERE id IN (${placeholders})`)
+					.bind(...chunk)
+					.all();
+				const rows = new Map(
+					(current?.results || []).map((row) => [String(row.id), normalizeBlacklistScope(row.scope_groups ?? null)])
+				);
+				for (const id of chunk) {
+					if (!rows.has(id)) {
+						results.notFound.push(id);
+						continue;
+					}
+					const next = removeGroupsFromBlacklistScope(rows.get(id), scopeGroups);
+					if (next.global) {
+						results.globalScoped.push(id);
+						continue;
+					}
+					if (!next.changed) {
+						results.notFound.push(id);
+						continue;
+					}
+					if (next.emptied) {
+						await env.DB.prepare('DELETE FROM blacklist WHERE id = ?').bind(id).run();
+						results.success.push(id);
+						continue;
+					}
+					await env.DB
+						.prepare('UPDATE blacklist SET scope_groups = ? WHERE id = ?')
+						.bind(serializeBlacklistScope(next.scope), id)
+						.run();
+					results.success.push(id);
+					results.scopeReduced.push(id);
+				}
+				continue;
+			}
+
 			const response = await env.DB
 				.prepare(`DELETE FROM blacklist WHERE id IN (${placeholders}) RETURNING id`)
 				.bind(...chunk)
@@ -2345,13 +2824,18 @@ function renderBatchUnbanEligibilityResult(results, invalid, userProfiles = null
 
 	lines.push('', '<b>详情</b>:');
 	const removedIds = new Set(results.d1Removed || []);
+	const globalScopedIds = new Set((results.globalScoped || []).map((id) => String(id)));
 	for (const id of results.eligible) {
 		const status = removedIds.has(id)
-			? 'D1 黑名单记录已移除，可执行群解封'
-			: '不在 D1 黑名单，可执行群解封';
+			? 'D1 黑名单记录已移除/收窄，可执行群解封'
+			: '不在 D1 黑名单（或本群不在生效范围），可执行群解封';
 		lines.push(`✅ ${formatBatchUserTarget(id, userProfiles)} ${status}`);
 	}
-	for (const id of results.blacklisted) lines.push(`⛔ ${formatBatchUserTarget(id, userProfiles)} 在 D1 黑名单，拒绝解封（记录已保留）`);
+	for (const id of results.blacklisted) {
+		lines.push(globalScopedIds.has(String(id))
+			? `⛔ ${formatBatchUserTarget(id, userProfiles)} 全局黑名单（/spam 写入），本群无法单独解封，需主人层全局 /unban`
+			: `⛔ ${formatBatchUserTarget(id, userProfiles)} 在 D1 黑名单，拒绝解封（记录已保留）`);
+	}
 	for (const id of invalid) lines.push(`❌ <code>${escapeHtml(id)}</code> 格式错误`);
 	for (const f of results.failed) lines.push(`❌ ${formatBatchUserTarget(f.id, userProfiles)} ${escapeHtml(f.msg)}`);
 
@@ -2484,7 +2968,7 @@ function estimateBulkTaskSubrequests(userCount, groupCount, options = {}) {
 	const profileRequests = options.probeMembership === true && users === 1 ? groups : users;
 	const telegramMutationAttempts = 2 * operations;
 	const groupInfoRequests = groups;
-	const d1MutationBatches = Math.ceil(users / D1_BATCH_MUTATION_SIZE);
+	const d1MutationBatches = Math.ceil(users / D1_BLACKLIST_INSERT_BATCH_SIZE);
 	return {
 		fixedReserve: BULK_TASK_FIXED_SUBREQUEST_RESERVE,
 		authorizationRequests,
@@ -2524,10 +3008,14 @@ function estimateBulkAuthorizationRequests(message) {
 	return message?.chat?.type !== 'private' && isConfiguredGroup(message?.chat?.id) ? 1 : 0;
 }
 
-function createBulkJobPayload(action, ids, invalid, note, message) {
+// options.scopeGroups：本任务的生效群范围。null = 全局（/spam、私聊 /ban、全局 /unban）；
+//   数组 = 只在这些群写入 D1 范围并只对这些群执行 Telegram 操作（群内 /ban、群管理员本群 /unban）。
+function createBulkJobPayload(action, ids, invalid, note, message, options = {}) {
 	const now = new Date().toISOString();
 	const operator = formatMessageActorMention(message);
-	const groupIds = GROUP_IDS.map((id) => String(id));
+	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
+	// 范围内的群才是本任务真正要操作的群：估算、切片、回执统计全部据此对齐。
+	const groupIds = resolveScopeTargetGroupIds(scopeGroups).map((id) => String(id));
 	const normalizedAction = normalizeBulkJobAction(action);
 	const isUnban = normalizedAction === 'unban';
 	const budget = shouldUseBulkQueue(ids.length, groupIds.length, {
@@ -2545,8 +3033,12 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 		invalid: (invalid || []).map((id) => String(id)),
 		note: normalizeActionNote(note),
 		groupIds,
+		// scopeGroups 随任务持久化：Queue 续跑时不再依赖创建时的命令上下文。
+		scopeGroups: scopeGroups ? [...scopeGroups] : null,
 		createdBy: getMessageActorId(message),
-		unbanAllowD1Removal: isUnban && isPrivilegedManager(getMessageActorId(message)),
+		// 范围解封（群管理员本群 /unban）也需要写 D1：把本群从范围里摘掉。
+		// 全局记录仍会被 removeManyFromBlacklist 挡在 globalScoped 里，不会被降级。
+		unbanAllowD1Removal: isUnban && (isPrivilegedManager(getMessageActorId(message)) || scopeGroups !== null),
 		operator,
 		operatorRole: classifyMessageOperatorRole(message, message.chat?.type === 'private' ? '管理员' : '群管理员'),
 		sourceChatId: String(message.chat?.id ?? ''),
@@ -2596,12 +3088,12 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 	return job;
 }
 
-async function createBulkJob(env, action, ids, invalid, note, message) {
+async function createBulkJob(env, action, ids, invalid, note, message, options = {}) {
 	if (!env.DB) {
 		throw new Error('大批量任务需要绑定 D1 存储空间');
 	}
 	await ensureD1Table(env);
-	const job = createBulkJobPayload(action, ids, invalid, note, message);
+	const job = createBulkJobPayload(action, ids, invalid, note, message, options);
 	await env.DB
 		.prepare('INSERT INTO batch_jobs (id, type, status, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
 		.bind(job.id, job.action, job.status, JSON.stringify(job), job.createdAt, job.updatedAt)
@@ -2621,6 +3113,9 @@ function pushBulkJobFailure(job, failure) {
 
 function formatBulkJobFailureLine(failure) {
 	const groupText = failure.groupId ? ` 群 <code>${escapeHtml(failure.groupId)}</code>` : '';
+	if (failure.phase === 'unban_blocked_global') {
+		return `⛔ <code>${escapeHtml(failure.userId || '')}</code>: 该记录是<b>全局黑名单</b>（/spam 写入），本群无法单独解封，需主人/副主人/超级管理员执行全局 <code>/unban</code>`;
+	}
 	if (failure.phase === 'unban_blocked') {
 		return `⛔ <code>${escapeHtml(failure.userId || '')}</code>: D1 黑名单拒绝解封，记录已保留，未调用 Telegram`;
 	}
@@ -2684,6 +3179,7 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 		...formatStoredBulkJobContext(job),
 		'',
 		`目标用户:${totalUsers}`,
+		`生效范围:${describeBlacklistScope(getBulkJobScopeGroups(job))}`,
 		`配置群数:${totalGroups}`,
 		`总操作数:${totalOps}`,
 		`已处理用户:${cursor}/${totalUsers} (${percent}%)`,
@@ -2798,17 +3294,24 @@ function incrementBulkJobStat(job, key, amount = 1) {
 	job.stats[key] = (Number(job.stats[key]) || 0) + amount;
 }
 
+// 任务的生效群范围。旧任务（无 scopeGroups 字段）按全局解释，行为与改动前一致。
+function getBulkJobScopeGroups(job) {
+	return normalizeBlacklistScope(job?.scopeGroups ?? null);
+}
+
 async function performBulkJobD1Mutation(job, env, ids) {
 	let lastResults = null;
+	const scopeGroups = getBulkJobScopeGroups(job);
 	const allowD1Removal = job.unbanAllowD1Removal === true
 		|| (job.unbanAllowD1Removal == null && isPrivilegedManager(job.createdBy));
 	for (let attempt = 0; attempt <= BULK_TASK_D1_RETRY_LIMIT; attempt += 1) {
 		lastResults = job.action === 'unban'
-			? await checkManyUnbanEligibility(ids, env, { allowD1Removal })
+			? await checkManyUnbanEligibility(ids, env, { allowD1Removal, scopeGroups })
 			: await addManyToBlacklist(ids, env, {
 				reason: job.reason,
 				by: job.createdBy,
-				note: job.note
+				note: job.note,
+				scopeGroups
 			});
 		if (!lastResults.failed.length) return lastResults;
 		if (attempt < BULK_TASK_D1_RETRY_LIMIT) {
@@ -2847,10 +3350,12 @@ async function prepareBulkJobActiveBatch(job, env) {
 	if (isUnban) {
 		incrementBulkJobStat(job, 'unbanEligible', results.eligible.length);
 		incrementBulkJobStat(job, 'unbanBlacklisted', results.blacklisted.length);
+		const globalScoped = new Set((results.globalScoped || []).map((id) => String(id)));
 		for (const id of results.blacklisted) {
 			pushBulkJobFailure(job, {
 				userId: id,
-				phase: 'unban_blocked'
+				// 本群解封遇到全局记录：单独标记，回执要说清"只有主人层能全局解封"。
+				phase: globalScoped.has(String(id)) ? 'unban_blocked_global' : 'unban_blocked'
 			});
 		}
 	} else {
@@ -3089,7 +3594,11 @@ async function runBulkModerationJob(env, jobId, options = {}) {
 
 async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 	const { action, valid, invalid, note, isInGroup } = options;
-	const budget = shouldUseBulkQueue(valid.length, GROUP_IDS.length, {
+	// scopeGroups：null = 全局；数组 = 只操作这些群。预算估算必须按真实目标群数算，
+	// 否则群内 /ban 这种"1 个群"的任务会被按全群规模误判成需要排队。
+	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
+	const targetGroupIds = resolveScopeTargetGroupIds(scopeGroups);
+	const budget = shouldUseBulkQueue(valid.length, targetGroupIds.length, {
 		probeMembership: action !== 'unban' && valid.length === 1,
 		authorizationRequests: estimateBulkAuthorizationRequests(message)
 	});
@@ -3108,7 +3617,7 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 		});
 		return true;
 	}
-	const job = await createBulkJob(env, action, valid, invalid, note, message);
+	const job = await createBulkJob(env, action, valid, invalid, note, message, { scopeGroups });
 	const autoQueueAvailable = Boolean(getBulkQueue(env));
 	if (!autoQueueAvailable) {
 		job.autoContinue = false;
@@ -3196,9 +3705,16 @@ async function handleExport(env, url) {
 			const s = v === null || v === undefined ? '' : String(v);
 			return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 		};
-		const lines = ['id,reason,by,at'];
+		const lines = ['id,reason,scope_groups,by,at'];
 		for (const e of sorted) {
-			lines.push([csvEscape(e.id), csvEscape(e.reason), csvEscape(e.by), csvEscape(e.at)].join(','));
+			const scope = normalizeBlacklistScope(e.scopeGroups ?? null);
+			lines.push([
+				csvEscape(e.id),
+				csvEscape(e.reason),
+				csvEscape(scope === null ? 'global' : scope.join('|')),
+				csvEscape(e.by),
+				csvEscape(e.at)
+			].join(','));
 		}
 		// UTF-8 BOM 让 Excel 自动识别中文不乱码
 		const body = '\uFEFF' + lines.join('\r\n');
@@ -3216,10 +3732,13 @@ async function handleExport(env, url) {
 	const reasonLabels = BLACKLIST_REASON_LABELS || {};
 	const rows = sorted.map((e, i) => {
 		const reasonText = e.reason ? (reasonLabels[e.reason] || e.reason) : '—';
+		const scope = normalizeBlacklistScope(e.scopeGroups ?? null);
+		const scopeText = scope === null ? '全局' : scope.join('、');
 		return `<tr>
 			<td class="num">${i + 1}</td>
 			<td class="id"><code>${escapeHtml(e.id)}</code></td>
 			<td>${escapeHtml(reasonText)}</td>
+			<td>${escapeHtml(scopeText)}</td>
 			<td>${e.by ? `<code>${escapeHtml(e.by)}</code>` : '—'}</td>
 			<td class="at">${escapeHtml(e.at || '—')}</td>
 		</tr>`;
@@ -3267,9 +3786,9 @@ async function handleExport(env, url) {
 	</div>
 	<div class="box">
 		${sorted.length === 0 ? '<div class="empty">黑名单为空</div>' : `
-		<div class="search"><input id="q" type="text" placeholder="🔍 输入 TGID / 原因 / 操作人 过滤..." autocomplete="off"></div>
+		<div class="search"><input id="q" type="text" placeholder="🔍 输入 TGID / 原因 / 生效范围 / 操作人 过滤..." autocomplete="off"></div>
 		<table>
-			<thead><tr><th>#</th><th>TGID</th><th>原因</th><th>操作人</th><th>时间</th></tr></thead>
+			<thead><tr><th>#</th><th>TGID</th><th>原因</th><th>生效范围</th><th>操作人</th><th>时间</th></tr></thead>
 			<tbody id="tb">${rows}</tbody>
 		</table>`}
 	</div>
@@ -3789,6 +4308,7 @@ async function handlePurge(env, url) {
 		next_url: nextCursor === null ? null : buildPurgeNextUrl(url, nextCursor, limit),
 		已踢出: 0,
 		不在群: 0,
+		范围外跳过: 0,
 		失败: 0,
 		详情: []
 	};
@@ -3822,6 +4342,11 @@ async function handlePurge(env, url) {
 				type: 'failed',
 				detail: { 游标: cursor, 群ID: groupId, 结果: '黑名单行不存在', 错误: '清扫期间黑名单发生变化，请从 cursor=0 重新开始' }
 			};
+		}
+
+		// 每条记录只在自己的生效范围内清扫：单群封禁的人不会被 /purge 顺手踢出其它群。
+		if (!blacklistScopeCoversGroup(entry.scopeGroups, groupId)) {
+			return { type: 'out_of_scope' };
 		}
 
 		let status = null;
@@ -3862,6 +4387,8 @@ async function handlePurge(env, url) {
 			summary.详情.push(result.detail);
 		} else if (result?.type === 'left') {
 			summary.不在群 += 1;
+		} else if (result?.type === 'out_of_scope') {
+			summary.范围外跳过 += 1;
 		} else {
 			summary.失败 += 1;
 			if (result?.detail) {
@@ -3895,6 +4422,11 @@ function renderBlacklist(blacklist, options = {}) {
 		if (entry.reason) {
 			parts.push(`原因：${escapeHtml(reasonLabels[entry.reason] || entry.reason)}`);
 		}
+		// 生效范围：全局记录标「全局」，单群记录列出群 ID，便于一眼分辨跨群封禁与单群封禁。
+		const scopeGroups = normalizeBlacklistScope(entry.scopeGroups ?? null);
+		parts.push(scopeGroups === null
+			? '范围：全局'
+			: `范围：${escapeHtml(scopeGroups.join('、'))}`);
 		if (entry.by) {
 			parts.push(`操作人：<code>${escapeHtml(entry.by)}</code>`);
 		}
@@ -4278,6 +4810,8 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	let localCheck = { isBlacklisted: false, entry: null };
 	let localBlacklistInfo = '';
 	if (options.env) {
+		// /check 是"查库"，不传 chatId：无论范围如何都要把记录展示出来，
+		// 生效范围单独一行呈现，让管理员能判断自己这个群到底受不受影响。
 		localCheck = await checkBlacklist(queryTgid, options.env);
 		if (localCheck.isBlacklisted) {
 			const entry = localCheck.entry;
@@ -4285,12 +4819,14 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 			const operator = await translateBlacklistOperator(entry?.by);
 			const addedAt = entry?.at || '未知';
 			const noteText = String(entry?.note || '').trim();
+			const scopeGroups = entry?.scopeGroups ?? null;
 			localBlacklistInfo = `\n🚫 <b>本地黑名单:在黑名单中</b>\n` +
 				`├ 加黑方式:${reason}\n`;
 			if (noteText) {
 				localBlacklistInfo += `├ 执行原因:${escapeHtml(noteText)}\n`;
 			}
-			localBlacklistInfo += `├ 操作人:${operator}\n` +
+			localBlacklistInfo += `├ 生效范围:${escapeHtml(await describeBlacklistScopeWithTitles(scopeGroups))}\n` +
+				`├ 操作人:${operator}\n` +
 				`└ 时间:${escapeHtml(addedAt)}\n`;
 		} else {
 			localBlacklistInfo = `\n✅ <b>本地黑名单:不在黑名单中</b>\n`;
@@ -4541,30 +5077,35 @@ async function checkGkyGlobalBanAndPunish(userId, chat, env, ctx, options = {}) 
 			await deleteMessage(chat.id, options.messageId);
 		}
 		// 杀神库与本项目 D1 黑名单是两套独立状态,默认【不合并】:
-		//   命中仍照常全群封禁/预封(保护群),但不写 D1 —— D1 的唯一来源仍是真人 /ban /spam /ad 投票。
+		//   命中仍照常封禁/预封(保护群),但不写 D1 —— D1 的唯一来源仍是真人 /ban /spam /ad 投票。
 		//   第三方误标不会变成本项目的永久黑名单,也不会再触发"复入群拦截"重复通知。
 		//   显式设 GKY_SYNC_BLACKLIST=true 才并入 D1。
+		// 处置范围 = 命中的那个群：第三方数据只用于保护当前群，不做跨群连坐，
+		//   否则第三方误标会让一个正常用户同时失去全部私密群的入群资格。
+		const gkyScopeGroups = isConfiguredGroup(chat?.id) ? [String(chat.id)] : null;
 		let syncedToBlacklist = false;
 		if (GKY_SYNC_BLACKLIST) {
 			const addResult = await addToBlacklist(userIdStr, env, {
 				reason: 'gky_global',
 				by: 'system',
 				note: `杀神全局库命中${data.reason ? ':' + data.reason : ''}`,
+				scopeGroups: gkyScopeGroups,
 			});
 			syncedToBlacklist = addResult?.success === true || addResult?.code === 'EXISTS';
 		}
-		const banResults = await banUserFromAllGroups(userIdStr);
+		const banResults = await banUserFromGroups(userIdStr, resolveScopeTargetGroupIds(gkyScopeGroups));
 		// 通知主人
 		if (OWNER_IDS.length) {
 			const okCount = banResults.filter((r) => r.ok).length;
 			const target = options.user
 				? (formatUserMention(options.user) || `<code>${escapeHtml(userIdStr)}</code>`)
 				: `<code>${escapeHtml(userIdStr)}</code>`;
+			const scopeText = describeBlacklistScope(gkyScopeGroups);
 			const blacklistLine = GKY_SYNC_BLACKLIST
-				? `🚫 已加黑(gky_global) + 全群封禁 ${okCount}/${banResults.length}`
-				: `🚫 全群封禁/预封 ${okCount}/${banResults.length}\n`
+				? `🚫 已加黑(gky_global) + 封禁 ${okCount}/${banResults.length}\n📍 生效范围:${escapeHtml(scopeText)}`
+				: `🚫 封禁/预封 ${okCount}/${banResults.length}（${escapeHtml(scopeText)}）\n`
 					+ `📂 未写入本地 D1 黑名单(杀神库独立记账)\n`
-					+ `ℹ️ 如确认是广告号需永久加黑,请手动 <code>/ban ${escapeHtml(userIdStr)}</code>`;
+					+ `ℹ️ 如确认是广告号需跨群永久加黑,请在群内 <code>/spam ${escapeHtml(userIdStr)}</code>`;
 			const auditText = `🌐 <b>杀神全局库命中处置</b>\n` +
 				`🎬 触发:${escapeHtml(options.trigger || '新成员进群')}\n` +
 				`🎯 用户:${target}\n` +
@@ -4633,7 +5174,9 @@ async function handleChatMemberUpdate(chatMember, env) {
 		oldStatusEarly !== 'administrator' &&
 		oldStatusEarly !== 'creator';
 	if (enteredGroup) {
-		const blacklistCheck = await checkBlacklist(targetIdStr, env);
+		// 只有"本群在该记录的生效范围内"才拦截：被单群封禁的人仍可自由加入其它配置群，
+		// 这正是需求 2 的目的 —— 误杀不再连带阻断私密群。
+		const blacklistCheck = await checkBlacklist(targetIdStr, env, { chatId: chat.id });
 		if (blacklistCheck.isBlacklisted) {
 			const banResult = await banUserFromGroup(chat.id, targetIdStr);
 			console.log('[chat_member] 黑名单用户复入群，立即踢回:', JSON.stringify({
@@ -4669,15 +5212,16 @@ async function handleChatMemberUpdate(chatMember, env) {
 
 	if (newStatus === 'kicked') {
 		// 群内手动封禁（真人点 Telegram 封禁按钮 / 任何作为管理员的机器人执行封禁）一律【不再】同步进 D1 黑名单。
-		// D1 全局黑名单的唯一来源 = 真人管理员的 /ban、/spam 指令（含 /ban 123、/spam 123、引用消息 /spam）。
+		// D1 黑名单的唯一来源 = 真人管理员的 /ban、/spam 指令（含 /ban 123、/spam 123、引用消息 /spam）。
 		// 这里仅发审计通知告知主人群里发生了手动封禁；notifyOwnerChatMemberAction 内部已自动过滤机器人操作，机器人封禁不会打扰主人。
 		console.log('[chat_member] 群内手动封禁，按规则不同步加黑:', JSON.stringify(logCommon));
-		await notifyOwnerChatMemberAction(chatMember, '封禁（未加入全局黑名单）', oldStatus, newStatus);
+		await notifyOwnerChatMemberAction(chatMember, '封禁（未写入 D1 黑名单）', oldStatus, newStatus);
 	} else if (oldStatus === 'kicked') {
 		// 群内原生手动解封：D1 黑名单是权威封禁，禁止普通管理员经此绕过或清除。
-		// 管理层必须通过 /unban TGID 先移除 D1 再解封；该命令路径不会进入这里的封回逻辑。
+		// 管理层必须通过 /unban TGID 先移除/收窄 D1 再解封；该命令路径不会进入这里的封回逻辑。
 		// 普通管理员直接使用 Telegram 原生解封时，D1 仍在，因此继续由独立保护链封回。
-		const blacklistCheck = await checkBlacklist(targetIdStr, env);
+		// 仅当记录在【本群】生效时才封回：范围外的记录对本群没有约束力。
+		const blacklistCheck = await checkBlacklist(targetIdStr, env, { chatId: chat.id });
 		if (blacklistCheck.isBlacklisted) {
 			// 仍在 D1 黑名单 → 撤销本次群内手动解封，立即封回，绝不删除黑名单记录
 			const banResult = await banUserFromGroup(chat.id, targetIdStr);
@@ -7359,16 +7903,19 @@ async function notifyOwnerSelfUnban(fromUser, perGroupResults) {
 	await notifyAllOwners(lines.join('\n'), null);
 }
 
+// options.scopeGroups：加黑与封禁的生效群范围。自动检测一律只作用于【触发群】——
+// 误杀的正常用户仍能加入其它私密群，不会被一条自动判定连坐到全部群。
 async function enforceAutomaticAdTarget(candidate, env, options = {}) {
 	const id = String(candidate?.id || '').trim();
 	if (!/^\d+$/.test(id)) return { ...candidate, id, error: 'TGID 无效', banResults: [] };
+	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
 	try {
 		if (!options.skipAdminCheck && await checkIfUserIsAdmin(id)) {
 			return { ...candidate, id, skipped: '管理员豁免', banResults: [] };
 		}
-		const blacklistResult = await addToBlacklist(id, env, { reason: 'ad_auto', by: 'system' });
-		const banResults = await banUserFromAllGroups(id);
-		return { ...candidate, id, blacklistResult, banResults };
+		const blacklistResult = await addToBlacklist(id, env, { reason: 'ad_auto', by: 'system', scopeGroups });
+		const banResults = await banUserFromGroups(id, resolveScopeTargetGroupIds(scopeGroups));
+		return { ...candidate, id, blacklistResult, banResults, scopeGroups };
 	} catch (error) {
 		console.error(`[广告联动处理] TGID=${id} 失败:`, error);
 		return { ...candidate, id, error: error.message || String(error), banResults: [] };
@@ -7387,8 +7934,9 @@ async function appendAutomaticAdTargetDetail(lines, label, result) {
 		return;
 	}
 	const addResult = result?.blacklistResult;
-	if (addResult?.success) lines.push('   ✅ 已写入 D1 全局黑名单');
-	else if (addResult?.code === 'EXISTS') lines.push('   ℹ️ 已在 D1 全局黑名单，本次继续执行全群封禁');
+	const scopeText = describeBlacklistScope(result?.scopeGroups ?? null);
+	if (addResult?.success) lines.push(`   ✅ 已写入 D1 黑名单（${escapeHtml(scopeText)}）`);
+	else if (addResult?.code === 'EXISTS') lines.push(`   ℹ️ 已在 D1 黑名单，本次继续执行封禁（${escapeHtml(scopeText)}）`);
 	else if (addResult) lines.push(`   ⚠️ D1 写入:${escapeHtml(addResult.message || '失败')}`);
 	lines.push(await renderBanResultsDetail(result?.banResults || [], null, { userId: result?.id, retryCommand: '/ban 或 /spam' }));
 }
@@ -7489,8 +8037,8 @@ function buildAdVoteMessageText(state) {
 	let status = '<i>进行中，1 小时后截止。</i>';
 	if (state.finalized && state.result === 'approved') {
 		status = state.enforcementComplete
-			? '💀 <b>举报通过，已加入 D1 全局黑名单、执行全部 GROUP_ID 群封禁，并请求撤回其各群全部历史发言。</b>'
-			: '💀 <b>举报通过，正在执行 D1 加黑、全群封禁与历史发言撤回。</b>';
+			? '💀 <b>举报通过，已加入 D1 黑名单（仅本群生效）、执行本群封禁，并请求撤回其本群全部历史发言。</b>'
+			: '💀 <b>举报通过，正在执行 D1 加黑、本群封禁与历史发言撤回。</b>';
 	} else if (state.finalized && state.result === 'rejected') {
 		status = '❎ <b>投票已被否决，目标未处理。</b>';
 	} else if (state.finalized && state.result === 'expired') {
@@ -7708,16 +8256,16 @@ async function resolveAdVoteTargetProtection(message, target) {
 	return { protected: false, memberStatus: member?.status || null, member };
 }
 
-// 重复举报预检：目标【已在本群被封禁/禁言】且【已在 D1 全局黑名单】时，本次举报没有任何
+// 重复举报预检：目标【已在本群被封禁/禁言】且【D1 黑名单已在本群生效】时，本次举报没有任何
 // 增量意义，直接跳过，避免群里刷出一张注定通过的投票卡片。
 // 必须两个条件同时成立才跳过 —— 只满足其一说明处置还不完整（例如已加黑但没踢掉、
-// 或群内踢了但没进全局黑名单），仍应走投票把处置补齐。
+// 或群内踢了但 D1 在本群不生效），仍应走投票把处置补齐。
 // memberStatus 复用 resolveAdVoteTargetProtection 已查到的结果，不额外调用 Telegram。
-async function isRedundantAdVoteTarget(env, targetUserId, memberStatus) {
+async function isRedundantAdVoteTarget(env, targetUserId, memberStatus, chatId) {
 	const status = String(memberStatus || '').toLowerCase();
 	const bannedOrMuted = status === 'kicked' || status === 'restricted';
 	if (!bannedOrMuted) return false;
-	const blacklistCheck = await checkBlacklist(targetUserId, env);
+	const blacklistCheck = await checkBlacklist(targetUserId, env, { chatId });
 	return blacklistCheck.isBlacklisted === true;
 }
 
@@ -7796,9 +8344,9 @@ async function handleAdCommand(message, env, ctx) {
 	if (protection.protected) {
 		return deleteAndReply('⚠️ ' + escapeHtml(protection.reason));
 	}
-	// 已被封禁/禁言且已在全局黑名单 → 本次举报无增量意义，直接跳过不刷投票卡片。
-	if (await isRedundantAdVoteTarget(env, target.targetUserId, protection.memberStatus)) {
-		logIgnoredAdVoteCommand(message, '目标已被本群封禁/禁言且已在 D1 全局黑名单，无需重复举报');
+	// 已被封禁/禁言且 D1 黑名单已在本群生效 → 本次举报无增量意义，直接跳过不刷投票卡片。
+	if (await isRedundantAdVoteTarget(env, target.targetUserId, protection.memberStatus, message.chat.id)) {
+		logIgnoredAdVoteCommand(message, '目标已被本群封禁/禁言且 D1 黑名单已在本群生效，无需重复举报');
 		await deleteAuthorizedGroupCommandMessage(message, '/ad');
 		return true;
 	}
@@ -7935,14 +8483,15 @@ async function notifyOwnerAdVoteApproved(state, blacklistResult, banResults, del
 		'📝 举报原因:' + escapeHtml(state.reason || '未填写'),
 		'',
 	];
-	if (blacklistResult?.success) lines.push('✅ 已写入 D1 全局黑名单，原因:ad_vote');
-	else if (blacklistResult?.code === 'EXISTS') lines.push('ℹ️ 目标已在 D1 黑名单，本次仍继续执行全群封禁');
+	if (blacklistResult?.success) lines.push('✅ 已写入 D1 黑名单（仅本群生效），原因:ad_vote');
+	else if (blacklistResult?.code === 'EXISTS') lines.push('ℹ️ 目标已在 D1 黑名单，本次仍继续执行本群封禁');
 	else lines.push('⚠️ D1 写入失败:' + escapeHtml(blacklistResult?.message || '未知错误'));
 	lines.push(await renderBanResultsDetail(banResults || [], null, {
 		userId: state.targetUserId,
 		retryCommand: '/ban 或 /spam',
 	}));
-	lines.push('🧹 历史发言:全部 GROUP_ID 封禁请求均启用 revoke_messages=true；封禁成功的群由 Telegram 撤回该用户全部历史发言。');
+	lines.push('🧹 历史发言:本群封禁请求启用 revoke_messages=true；封禁成功后由 Telegram 撤回该用户在本群的历史发言。');
+	lines.push('ℹ️ 本次仅封禁发起投票的群；确需跨群封禁请由管理员在群内使用 <code>/spam</code>。');
 	if (state.reportedMessageId) {
 		const outcome = classifyAdDeleteOutcome(deleteResult);
 		lines.push('🧹 被举报消息:' + escapeHtml(outcome.summary));
@@ -7960,23 +8509,23 @@ async function notifyOwnerAdVoteClosed(state) {
 		rejected: {
 			title: '广告举报投票已被否决',
 			result: '反对方胜出',
-			action: '目标未写入 D1、未执行全群封禁、未删除被举报消息。',
+			action: '目标未写入 D1、未执行本群封禁、未删除被举报消息。',
 		},
 		cancelled: {
 			title: '广告举报投票已取消',
 			result: '投票被有权限的用户取消',
-			action: '目标未写入 D1、未执行全群封禁、未删除被举报消息。',
+			action: '目标未写入 D1、未执行本群封禁、未删除被举报消息。',
 		},
 		expired: {
 			title: '广告举报投票已过期',
 			result: '超过 1 小时截止时间',
-			action: '目标未写入 D1、未执行全群封禁、未删除被举报消息。',
+			action: '目标未写入 D1、未执行本群封禁、未删除被举报消息。',
 		},
 	};
 	const meta = resultMeta[state.result] || {
 		title: '广告举报投票已结束',
 		result: String(state.result || '未知结果'),
-		action: '本次未执行 D1 写入或全群封禁。',
+		action: '本次未执行 D1 写入或本群封禁。',
 	};
 	const lines = [
 		'🗳️ <b>' + escapeHtml(meta.title) + '</b>',
@@ -8007,12 +8556,20 @@ async function notifyOwnerAdVoteClosed(state) {
 
 async function enforceApprovedAdVote(env, state) {
 	if (state.enforcementComplete) return;
+	// /ad 投票是【本群】管理员与成员对本群一条广告的判定，处置范围随之限定为发起投票的群，
+	// 不再跨群封禁；跨群封禁的唯一入口是真人 /spam。
+	const voteScopeGroups = [String(state.chatId)];
 	const blacklistResult = await addToBlacklist(state.targetUserId, env, {
 		reason: 'ad_vote',
 		by: state.creatorUserId,
 		note: ('群内 /ad 举报投票通过' + (state.reason ? '：' + state.reason : '')).slice(0, 500),
+		scopeGroups: voteScopeGroups,
 	});
-	const banResults = await banUserFromAllGroups(state.targetUserId, { probeMembership: true, revokeMessages: true });
+	const banResults = await banUserFromGroups(
+		state.targetUserId,
+		resolveScopeTargetGroupIds(voteScopeGroups),
+		{ probeMembership: true, revokeMessages: true }
+	);
 	const historyFallback = state.reportedMessageId
 		? null
 		: await cleanupAdVoteSourceChatMessages(env, state.chatId, state.targetUserId);
@@ -8210,8 +8767,8 @@ async function notifyOwnerAdRelayObservation(message, adResult, context = {}) {
 	let disposition = '弱证据引用：不封当前传播者';
 	if (context.currentResult) {
 		disposition = observation
-			? '误触型引用达到重复阈值，已升级为 D1 全局黑名单并遍历全部 GROUP_ID 封禁'
-			: '高置信广告传播，第一次已加入 D1 全局黑名单并遍历全部 GROUP_ID 封禁';
+			? '误触型引用达到重复阈值，已升级为 D1 当前群黑名单并封禁本群'
+			: '高置信广告传播，第一次已加入 D1 当前群黑名单并封禁本群';
 	} else if (relayDecision.mode === 'normal_context') {
 		disposition = '明确举报/询问/警告语境保护：不封当前回复者，不累计观察';
 	} else if (relayDecision.mode === 'accidental_observation') {
@@ -8233,7 +8790,7 @@ async function notifyOwnerAdRelayObservation(message, adResult, context = {}) {
 		lines.push(`🧾 观察次数:${observation.ok ? observation.occurrences : '写入失败'}`);
 		if (!observation.ok) lines.push(`⚠️ D1 观察记录失败:${escapeHtml(observation.error || '未知错误')}`);
 		else if (observation.duplicate) lines.push('ℹ️ 同一 Telegram 消息重试，观察次数未重复累计');
-		else if (!context.currentResult) lines.push('✅ 第一次误触保护已留档；当前回复者本次未加入全局黑名单');
+		else if (!context.currentResult) lines.push('✅ 第一次误触保护已留档；当前回复者本次未加入当前群黑名单');
 	}
 	lines.push(
 		`💬 外层内容:${escapeHtml(String(wrapper).slice(0, 100))}`,
@@ -8349,12 +8906,14 @@ async function handleAutomaticAdDecision(message, adResult, env) {
 			id: currentId,
 			user: message.from,
 			source,
-		}, env, { skipAdminCheck: true });
+		}, env, { skipAdminCheck: true, scopeGroups: [String(message.chat.id)] });
 	}
 
 	const originalResults = [];
 	for (const candidate of originalMap.values()) {
-		originalResults.push(await enforceAutomaticAdTarget(candidate, env));
+		originalResults.push(await enforceAutomaticAdTarget(candidate, env, {
+			scopeGroups: [String(message.chat.id)]
+		}));
 	}
 
 	if (quoteAd && !directAd) {
@@ -8442,13 +9001,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 黑名单兜底：已黑用户在配置群里发言 → 删消息 + 立即踢出
 	// 必须先于消息缓存执行，避免已黑用户刷消息继续产生 D1 写入。
 	// 排除 bot 自身 / 私聊 / 群管理员（避免误伤误加黑的管理员）
+	// 只在"记录对本群生效"时拦截：被单群封禁的人在其它群发言不受影响。
 	// 命令命中后 return，不进入后续命令分发
 	if (
 		isConfiguredGroup(chatId) &&
 		message.from &&
 		!message.from.is_bot
 	) {
-		const blacklistCheck = await checkBlacklist(userId, env);
+		const blacklistCheck = await checkBlacklist(userId, env, { chatId });
 		if (blacklistCheck.isBlacklisted) {
 			// 双保险：管理员豁免，避免误加黑导致管理员被踢
 			const isAdmin = await checkIfUserIsAdmin(userId);
@@ -8601,18 +9161,21 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			// 单条
 			if (valid.length === 1 && invalid.length === 0) {
+				// /spam 是唯一的跨群封禁通道：scopeGroups 省略即全局（全部配置群）。
 				const result = await addToBlacklist(valid[0], env, { reason: 'spam', by: operatorId, note });
 				const alreadyExists = result.code === 'EXISTS';
 				let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
-				const lines = [`🎬 操作:举报加黑(/spam)`];
+				const lines = [`🎬 操作:举报加黑(/spam，跨群封禁)`];
 				let flashText;
 				if (result.success || alreadyExists) {
 					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
 					targetMention = formatTargetFromBanResults(valid[0], banResults);
 					lines.push(`🎯 目标用户:${targetMention}`);
+					lines.push(`📍 生效范围:${describeBlacklistScope(null)}`);
 					lines.push('');
 					if (alreadyExists) {
 						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
+						if (result.scopeExpanded) lines.push('ℹ️ 该记录原为单群范围，本次已升级为全局生效。');
 					}
 					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/spam' }));
 					flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
@@ -8648,9 +9211,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				else banSummary.banPartial += 1;
 			}
 			const failedCount = invalid.length + results.failed.length;
-			const flashText = `✅ 批量加黑(/spam)：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+			const flashText = `✅ 批量加黑(/spam，跨群)：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
 			const baseDetail = renderBatchAddResult(results, invalid, banSummary, userProfiles);
-			let fullDetail = baseDetail;
+			let fullDetail = `📍 生效范围:${describeBlacklistScope(null)}${results.scopeExpanded?.length ? `\nℹ️ 其中 ${results.scopeExpanded.length} 条原为单群范围，本次已升级为全局生效。` : ''}\n\n${baseDetail}`;
 			if (perUserBanResults.length > 0) {
 				const perUserBlocks = [];
 				const chatInfoCache = new Map();
@@ -8696,12 +9259,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const cleanupResult = await cleanupCurrentChatUserMessages(env, chatId, repliedUserId, [repliedMsg.message_id]);
 
 			const lines = [
-				`🎬 操作:举报加黑(/spam)`,
+				`🎬 操作:举报加黑(/spam，跨群封禁)`,
 				`🎯 目标用户:${linkedUserId} <code>${escapeHtml(String(repliedUserId))}</code>`,
+				`📍 生效范围:${describeBlacklistScope(null)}`,
 				'',
 				result.success
 					? `✅ 已将用户 ${linkedUserId} 添加到黑名单`
-					: `⚠️ 用户 ${linkedUserId} 已在黑名单中,本次已继续执行 Telegram 群封禁/预封`,
+					: `⚠️ 用户 ${linkedUserId} 已在黑名单中,本次已继续执行 Telegram 群封禁/预封${result.scopeExpanded ? '，并已把生效范围升级为全局' : ''}`,
 				await renderBanResultsDetail(banResults, null, { userId: repliedUserId, retryCommand: '/spam' }),
 			];
 			lines.push(renderCurrentChatCleanupResult(cleanupResult));
@@ -8868,15 +9432,16 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const checkArg = text.trim().replace(/^\/check(?:@[^\s]+)?\s*/i, '').trim();
 		const hasTgidArg = /^\d+$/.test(checkArg);
 
-		// /check 属于高级管理命令，普通 Telegram 群管理员不开放。
-		const isAdmin = isPrivilegedManager(userId);
+		// /check 属于主人层命令：只有主人与副主人（高级管理员）可用，
+		// SUPER_ADMINS 与普通群管理员一律不开放，菜单里也不会出现。
+		const isAdmin = isOwner(userId);
 		const quietGroupCommand = isInGroup && isConfiguredSourceGroup && !isPrimaryOwner(userId);
 
 		if (hasTgidArg) {
 			// 带 TGID 参数:私聊 / 群内均可
 			if (!isAdmin) {
 				if (message.chat.type === 'private') {
-					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
+					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/check 仅限主人与副主人使用。');
 				}
 				return;
 			}
@@ -8906,7 +9471,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 无参数:沿用原"群内回复消息"用法
 		if (!isInGroup) {
 			if (!isAdmin) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/check 仅限主人与副主人使用。');
 				return;
 			}
 			await sendTelegramMessage(chatId, 'ℹ️ 私聊查询请用:<code>/check TGID</code>\n例:<code>/check 993005028</code>\n群内可回复某条消息发 <code>/check</code> 查该用户。');
@@ -9000,10 +9565,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 普通的 /start 命令在后面的欢迎消息分支统一处理
 	}
 
-	// 处理 /blacklist 命令 - 私聊管理员查看 D1 黑名单
+	// 处理 /blacklist 命令 - 主人层查看 D1 黑名单（仅主人与副主人）
 	if (text && /^\/blacklist(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		if (message.chat.type !== 'private') {
-			const isAdmin = isPrivilegedManager(userId);
+			const isAdmin = isOwner(userId);
 			if (isAdmin) {
 				await deleteAuthorizedGroupCommandMessage(message, '/blacklist');
 			}
@@ -9028,9 +9593,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 
-		const isAdmin = isPrivilegedManager(userId);
+		const isAdmin = isOwner(userId);
 		if (!isAdmin) {
-			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
+			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/blacklist 仅限主人与副主人使用。');
 			return;
 		}
 
@@ -9086,7 +9651,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'<code>/ad [原因]</code> 回复目标消息发起；或 <code>/ad TGID [原因]</code>。主人/副主人/超级管理员、当前群管理员或 /add_ad_admin 白名单成员可发起',
 			'• 发起后自动置顶；发起人自动计 1 票；赞成或反对达到 6 票结束；当前群管理员点击可一票通过或一票否决',
 			'• 发起人、当前群管理员或高级管理员可点“取消投票”；通过/否决/过期/取消后均自动取消置顶',
-			'• 通过后写入 D1 全局黑名单并遍历全部 GROUP_ID 封禁，revoke_messages=true 撤回各群历史发言；不写广告学习库',
+			'• 通过后写入 D1 当前群黑名单并封禁本群，revoke_messages=true 撤回本群历史发言；不写广告学习库。如需跨群封禁请改用 <code>/spam</code>',
 			'<code>/add_ad_admin TGID</code> / <code>/del_ad_admin TGID</code> 管理 /ad 发起白名单（仅第一主人）；普通成员和助推者只能参与投票',
 			'',
 			'<b>━━ 样本库管理(私聊)━━</b>',
@@ -9340,7 +9905,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				'',
 				`📊 当前生效群组:${totalGroups} 个（环境变量 ${ENV_GROUP_IDS.length} + 指令添加 ${DYNAMIC_GROUP_IDS.length + 1}）`,
 				'',
-				'ℹ️ 该群已纳入全套治理:黑名单拦截、复入群踢回、广告自动检测、/ban /spam 全群封禁、/purge 清扫、批量任务。',
+				'ℹ️ 该群已纳入全套治理:黑名单拦截、复入群踢回、广告自动检测、/ban 本群封禁、/spam 跨群封禁、/purge 清扫、批量任务。',
 				'⚠️ 群数增加会线性放大全群操作的耗时与请求数，批量任务会更早转为异步执行。',
 			].filter(Boolean).join('\n'),
 		);
@@ -9787,6 +10352,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 		await deleteAuthorizedGroupCommandMessage(message, '/ban');
 
+		// 封禁范围：群内 /ban 只封当前群（避免非广告的普通违规被跨群连坐，
+		// 误判者仍能加入其它私密群）；私聊 /ban 是主人层通道，保持全群封禁。
+		const banScopeGroups = isInGroup ? [String(chatId)] : null;
+		const banTargetGroupIds = resolveScopeTargetGroupIds(banScopeGroups);
+		const banScopeLabel = isInGroup ? '仅当前群' : '全部配置群';
+
 		// 提取参数（支持单个 / 批量；开头 TGID 列表之后的文本作为执行原因）
 		// 用正则提取,与 /spam 完全对称:兼容 /ban、/ban@机器人名、多空格;彻底不依赖命令长度,
 		// 根除早期 slice(5) 吃掉参数首字符那类"命令一改短就错位"的隐患。
@@ -9810,6 +10381,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			invalid,
 			note,
 			isInGroup,
+			scopeGroups: banScopeGroups,
 			requestUrl
 		})) {
 			return;
@@ -9817,22 +10389,29 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 		// 单条且无格式错误
 		if (valid.length === 1 && invalid.length === 0) {
-			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: operatorId, note });
+			const result = await addToBlacklist(valid[0], env, {
+				reason: 'manual',
+				by: operatorId,
+				note,
+				scopeGroups: banScopeGroups
+			});
 			const alreadyExists = result.code === 'EXISTS';
 			// 统一详情格式:无论成功失败都展示完整字段
 			let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
-			const lines = [`🎬 操作:加入黑名单`];
+			const lines = [`🎬 操作:加入黑名单（${banScopeLabel}）`];
 			let flashText;
 			if (result.success || alreadyExists) {
-				const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
+				const banResults = await banUserFromGroups(valid[0], banTargetGroupIds, { probeMembership: true });
 				targetMention = formatTargetFromBanResults(valid[0], banResults);
 				lines.push(`🎯 目标用户:${targetMention}`);
+				lines.push(`📍 生效范围:${describeBlacklistScope(result.scopeGroups ?? banScopeGroups)}`);
 				lines.push('');
 				if (alreadyExists) {
 					lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
+					if (result.scopeExpanded) lines.push('ℹ️ 已把本群并入该记录的生效范围。');
 				}
 				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/ban' }));
-				flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
+				flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>（${banScopeLabel}）\n` + renderBanResults(banResults);
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
 				lines.push(`🎯 目标用户:${targetMention}`);
@@ -9850,15 +10429,20 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		// 批量
-		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: operatorId, note });
+		const results = await addManyToBlacklist(valid, env, {
+			reason: 'manual',
+			by: operatorId,
+			note,
+			scopeGroups: banScopeGroups
+		});
 		const idsToKick = [...results.success, ...results.exists];
 		const userProfiles = await resolveBatchUserProfiles(idsToKick, chatId);
 		const banSummary = { success: idsToKick.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
-		// 每次最多并发 3 个用户；每个用户内部仍按配置群串行，避免连接与 Telegram 限流突增。
+		// 每次最多并发 3 个用户；每个用户内部仍按目标群串行，避免连接与 Telegram 限流突增。
 		const perUserBanResults = await mapWithConcurrency(
 			idsToKick,
 			BULK_TASK_CONCURRENCY,
-			async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id) })
+			async (id) => ({ userId: id, banResults: await banUserFromGroups(id, banTargetGroupIds) })
 		);
 		for (const { banResults } of perUserBanResults) {
 			const okCount = banResults.filter((r) => r.ok).length;
@@ -9867,10 +10451,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			else banSummary.banPartial += 1;
 		}
 		const failedCount = invalid.length + results.failed.length;
-		const flashText = `✅ 批量加黑：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+		const flashText = `✅ 批量加黑（${banScopeLabel}）：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
 		// 详细 detailText：批量汇总 + 每个用户的逐群明细
 		const baseDetail = renderBatchAddResult(results, invalid, banSummary, userProfiles);
-		let fullDetail = baseDetail;
+		let fullDetail = `📍 生效范围:${describeBlacklistScope(banScopeGroups)}\n\n${baseDetail}`;
 		if (perUserBanResults.length > 0) {
 			const perUserBlocks = [];
 			const chatInfoCache = new Map();
@@ -9905,15 +10489,29 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (rest.trim()) {
 			const isInGroup = message.chat.type !== 'private';
 
-			// /unban 只能由主人、副主人或超级管理员执行。
-			const isAdmin = isPrivilegedManager(userId);
+			// /unban 分两层：
+			// - 主人/副主人/超级管理员：全局解封，删除整条 D1 记录并解封全部配置群；
+			// - 当前群管理员（含匿名管理员）：只能解除【本群】——把本群从记录的生效范围里摘掉，
+			//   仅解封本群。若记录是 /spam 写入的全局黑名单，一律拒绝，不允许被降级。
+			const isPrivileged = isPrivilegedManager(userId);
+			const isCurrentGroupManager = !isPrivileged
+				&& isInGroup
+				&& isConfiguredGroup(chatId)
+				&& !isBotOperator(message.from)
+				&& await checkMessageOperatorCanBan(message, userId);
+			const isAdmin = isPrivileged || isCurrentGroupManager;
 			if (!isAdmin) {
 				if (!isInGroup) {
-					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/unban 仅限主人、副主人或超级管理员使用。');
+					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n私聊 /unban 仅限主人、副主人或超级管理员；群管理员请在自己管理的配置群内使用，且只能解除本群。');
 				}
 				return;
 			}
 			await deleteAuthorizedGroupCommandMessage(message, '/unban');
+
+			// 群管理员 → 只作用于当前群；主人层 → null 表示全局。
+			const unbanScopeGroups = isPrivileged ? null : [String(chatId)];
+			const unbanTargetGroupIds = resolveScopeTargetGroupIds(unbanScopeGroups);
+			const unbanScopeLabel = isPrivileged ? '全部配置群' : '仅当前群';
 
 			const { valid, invalid } = parseBatchTgids(rest);
 
@@ -9933,6 +10531,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				invalid,
 				note: '',
 				isInGroup,
+				scopeGroups: unbanScopeGroups,
 				requestUrl
 			})) {
 				return;
@@ -9941,14 +10540,30 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 单条且无格式错误
 			if (valid.length === 1 && invalid.length === 0) {
 				const targetId = valid[0];
-				const eligibility = await checkManyUnbanEligibility([targetId], env, { allowD1Removal: isAdmin });
+				const eligibility = await checkManyUnbanEligibility([targetId], env, {
+					allowD1Removal: true,
+					scopeGroups: unbanScopeGroups
+				});
 				const userProfiles = await resolveBatchUserProfiles([targetId], chatId);
 				const targetMention = formatBatchUserTarget(targetId, userProfiles);
 				const lines = [
-					`🎬 操作:D1 黑名单资格检查 + Telegram 原生群解封`,
+					`🎬 操作:D1 黑名单资格检查 + Telegram 原生群解封（${unbanScopeLabel}）`,
 					`🎯 目标用户:${targetMention}`,
 					'',
 				];
+
+				if (eligibility.globalScoped.includes(targetId)) {
+					lines.push(
+						'⛔ <b>该记录是全局黑名单（/spam 写入），已拒绝本群解封</b>',
+						'ℹ️ 全局记录不允许被单群降级；请联系主人、副主人或超级管理员执行全局 <code>/unban</code>。'
+					);
+					await replyToAdmin(message, ctx, {
+						flashText: `⛔ <code>${targetId}</code> 是全局黑名单，本群无法单独解封`,
+						detailText: lines.join('\n'),
+						isInGroup
+					});
+					return;
+				}
 
 				if (eligibility.blacklisted.includes(targetId)) {
 					lines.push('⛔ <b>目标仍在 D1 黑名单，已拒绝解封</b>', 'ℹ️ D1 记录保持不变，未调用 Telegram 解封接口。');
@@ -9973,35 +10588,42 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				}
 
 				const d1RecordRemoved = eligibility.d1Removed.includes(targetId);
-				const unbanResults = await unbanUserFromAllGroups(targetId);
+				const unbanResults = await unbanUserFromGroups(targetId, unbanTargetGroupIds);
 				lines.push(
 					d1RecordRemoved
-						? '✅ <b>目标原在 D1 黑名单，已由管理层移除记录并允许解封</b>'
+						? (isPrivileged
+							? '✅ <b>目标原在 D1 黑名单，已由管理层移除记录并允许解封</b>'
+							: '✅ <b>已把本群从该记录的生效范围中移除，并允许本群解封</b>')
 						: '✅ <b>目标不在 D1 黑名单，允许执行 Telegram 原生解封</b>',
 					d1RecordRemoved
-						? 'ℹ️ D1 黑名单记录已删除；本次仅调用 Telegram 原生解封接口。'
+						? (isPrivileged
+							? 'ℹ️ D1 黑名单记录已删除；本次仅调用 Telegram 原生解封接口。'
+							: 'ℹ️ 该记录若在其它群仍有范围则继续生效；范围清空时记录已整条删除。')
 						: 'ℹ️ 本次未修改任何 D1 记录。',
 					'',
 					'<b>Telegram 群解封结果</b>:',
 					await renderUnbanResultsDetail(unbanResults, null, { userId: targetId, retryCommand: '/unban' })
 				);
 				await replyToAdmin(message, ctx, {
-					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封\n${renderUnbanResults(unbanResults)}`,
+					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封（${unbanScopeLabel}）\n${renderUnbanResults(unbanResults)}`,
 					detailText: lines.join('\n'),
 					isInGroup
 				});
 				return;
 			}
 
-			// 批量：管理层先移除命中的 D1 记录，再对全部资格通过目标执行群解封。
-			const results = await checkManyUnbanEligibility(valid, env, { allowD1Removal: isAdmin });
+			// 批量：先按范围移除/收窄命中的 D1 记录，再对全部资格通过目标执行群解封。
+			const results = await checkManyUnbanEligibility(valid, env, {
+				allowD1Removal: true,
+				scopeGroups: unbanScopeGroups
+			});
 			const idsToUnban = [...results.eligible];
 			const userProfiles = await resolveBatchUserProfiles(valid, chatId);
 			const unbanSummary = { okAll: 0, partial: 0, failedAll: 0 };
 			const perUserUnbanResults = await mapWithConcurrency(
 				idsToUnban,
 				BULK_TASK_CONCURRENCY,
-				async (id) => ({ userId: id, unbanResults: await unbanUserFromAllGroups(id) })
+				async (id) => ({ userId: id, unbanResults: await unbanUserFromGroups(id, unbanTargetGroupIds) })
 			);
 			for (const { unbanResults } of perUserUnbanResults) {
 				const okCount = unbanResults.filter((r) => r.ok).length;
@@ -10010,8 +10632,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				else unbanSummary.partial += 1;
 			}
 			const failedCount = invalid.length + results.failed.length;
-			const flashText = `🔓 批量解封：允许 ${results.eligible.length}${results.blacklisted.length ? ` / D1拒绝 ${results.blacklisted.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
-			let detailText = renderBatchUnbanEligibilityResult(results, invalid, userProfiles);
+			const flashText = `🔓 批量解封（${unbanScopeLabel}）：允许 ${results.eligible.length}${results.blacklisted.length ? ` / D1拒绝 ${results.blacklisted.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+			let detailText = `📍 解封范围:${describeBlacklistScope(unbanScopeGroups)}\n\n${renderBatchUnbanEligibilityResult(results, invalid, userProfiles)}`;
 			if (idsToUnban.length > 0) {
 				const unbanHeaderLines = ['<b>Telegram 群解封结果</b>:', `✅ 全部群解封成功: ${unbanSummary.okAll}`];
 				if (unbanSummary.partial) unbanHeaderLines.push(`⚠️ 部分群解封: ${unbanSummary.partial}`);

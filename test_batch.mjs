@@ -59,6 +59,8 @@ const exposeNames = [
 	'splitTelegramHtmlBlocks',
 	'telegramMessageLength',
 	'BATCH_LIMIT',
+	'D1_BLACKLIST_INSERT_BATCH_SIZE',
+	'D1_BATCH_MUTATION_SIZE',
 ];
 const tail =
 	'\nglobalThis.__exports = {' +
@@ -103,6 +105,8 @@ const {
 	splitTelegramHtmlBlocks,
 	telegramMessageLength,
 	BATCH_LIMIT,
+	D1_BLACKLIST_INSERT_BATCH_SIZE,
+	D1_BATCH_MUTATION_SIZE,
 } = sandbox.__exports;
 
 // ---------- 伪 D1 ----------
@@ -132,14 +136,25 @@ function makeFakeDB(options = {}) {
 						const id = String(bound[0]);
 						return rows.has(id) ? { id } : null;
 					}
+					if (sql.startsWith('SELECT id, reason, by_user, at, note, scope_groups FROM blacklist WHERE id = ?')) {
+						const id = String(bound[0]);
+						return rows.has(id) ? { ...rows.get(id) } : null;
+					}
 					return null;
 				},
 				async run() {
 					if (sql.startsWith('INSERT OR IGNORE INTO blacklist')) {
-						const [rawId, reason, by, at, note] = bound;
+						const [rawId, reason, by, at, note, scopeGroups] = bound;
 						const id = String(rawId);
 						if (rows.has(id)) return { meta: { changes: 0 } };
-						rows.set(id, { id, reason, by_user: by, at, note: note ?? null });
+						rows.set(id, { id, reason, by_user: by, at, note: note ?? null, scope_groups: scopeGroups ?? null });
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith('UPDATE blacklist SET scope_groups = ? WHERE id = ?')) {
+						const [scopeGroups, rawId] = bound;
+						const id = String(rawId);
+						if (!rows.has(id)) return { meta: { changes: 0 } };
+						rows.get(id).scope_groups = scopeGroups ?? null;
 						return { meta: { changes: 1 } };
 					}
 					if (sql.startsWith('DELETE FROM blacklist WHERE id = ?')) {
@@ -150,13 +165,13 @@ function makeFakeDB(options = {}) {
 					return { meta: { changes: 0 } };
 				},
 				async all() {
-					if (sql.startsWith('PRAGMA table_info(blacklist)')) { 						return { results: ['id', 'reason', 'by_user', 'at', 'note'].map((name) => ({ name })) }; 					}
+					if (sql.startsWith('PRAGMA table_info(blacklist)')) { 						return { results: ['id', 'reason', 'by_user', 'at', 'note', 'scope_groups'].map((name) => ({ name })) }; 					}
 					if (sql.startsWith('INSERT OR IGNORE INTO blacklist') && sql.includes('RETURNING id')) {
 						mutationCallIndex += 1;
 						mutationCalls.push({ index: mutationCallIndex, type: 'insert', sql, bound: [...bound] });
 						if (failMutationCalls.has(mutationCallIndex)) throw new Error(`forced mutation failure ${mutationCallIndex}`);
 						const results = [];
-						for (let i = 0; i < bound.length; i += 5) {
+						for (let i = 0; i < bound.length; i += 6) {
 							const id = String(bound[i]);
 							if (rows.has(id)) continue;
 							rows.set(id, {
@@ -165,10 +180,32 @@ function makeFakeDB(options = {}) {
 								by_user: bound[i + 2] ?? null,
 								at: bound[i + 3] ?? null,
 								note: bound[i + 4] ?? null,
+								scope_groups: bound[i + 5] ?? null,
 							});
 							results.push({ id });
 						}
 						return { results: options.reverseReturning ? results.reverse() : results };
+					}
+					// 批量升级为全局范围：只命中当前仍是"限定群"的记录
+					if (sql.startsWith('UPDATE blacklist SET scope_groups = NULL WHERE id IN') && sql.includes('RETURNING id')) {
+						const results = [];
+						for (const rawId of bound) {
+							const id = String(rawId);
+							const row = rows.get(id);
+							if (!row || row.scope_groups === null || row.scope_groups === undefined) continue;
+							row.scope_groups = null;
+							results.push({ id });
+						}
+						return { results };
+					}
+					if (sql.startsWith('SELECT id, scope_groups FROM blacklist WHERE id IN')) {
+						const results = [];
+						for (const rawId of bound) {
+							const id = String(rawId);
+							if (!rows.has(id)) continue;
+							results.push({ id, scope_groups: rows.get(id).scope_groups ?? null });
+						}
+						return { results };
 					}
 					if (sql.startsWith('DELETE FROM blacklist WHERE id IN') && sql.includes('RETURNING id')) {
 						mutationCallIndex += 1;
@@ -369,7 +406,7 @@ for (const total of [20, 21, 50]) {
 	const ids = Array.from({ length: total }, (_, i) => String(10000 + i));
 	const result = await addManyToBlacklist(ids, { DB: db }, { reason: 'manual', by: '1', note: '批量' });
 	assert(`${total} 人全部写入`, result.success.length === total && db._rows.size === total);
-	assert(`${total} 人 mutation SQL 数正确`, db._mutationCalls.length === Math.ceil(total / 20));
+	assert(`${total} 人 mutation SQL 数正确`, db._mutationCalls.length === Math.ceil(total / D1_BLACKLIST_INSERT_BATCH_SIZE));
 	assert(`${total} 人每条 INSERT 最多绑定 100 参数`, db._mutationCalls.every((call) => call.bound.length <= 100));
 }
 {
@@ -384,10 +421,12 @@ for (const total of [20, 21, 50]) {
 	db._rows.set('19999', { id: '19999', reason: 'manual', by_user: '1', at: 'old' });
 	const freshIds = Array.from({ length: 40 }, (_, i) => String(20000 + i));
 	const result = await addManyToBlacklist(['19999', ...freshIds], { DB: db }, { reason: 'manual', by: '1' });
-	assert('同一调用正确分类新增', eq(result.success, [...freshIds.slice(0, 19), freshIds[39]]));
+	// 41 条按 D1_BLACKLIST_INSERT_BATCH_SIZE(16) 分 3 批：[16(含19999), 16(失败), 9]
+	const firstChunkFresh = D1_BLACKLIST_INSERT_BATCH_SIZE - 1;
+	assert('同一调用正确分类新增', eq(result.success, [...freshIds.slice(0, firstChunkFresh), ...freshIds.slice(D1_BLACKLIST_INSERT_BATCH_SIZE * 2 - 1)]));
 	assert('同一调用正确分类已存在', eq(result.exists, ['19999']));
-	assert('同一调用正确分类失败', eq(result.failed.map((item) => item.id), freshIds.slice(19, 39)));
-	assert('失败 chunk 不影响前后 chunk 且不产生脏写入', db._mutationCalls.length === 3 && db._rows.size === 21);
+	assert('同一调用正确分类失败', eq(result.failed.map((item) => item.id), freshIds.slice(firstChunkFresh, D1_BLACKLIST_INSERT_BATCH_SIZE * 2 - 1)));
+	assert('失败 chunk 不影响前后 chunk 且不产生脏写入', db._mutationCalls.length === 3 && db._rows.size === 1 + firstChunkFresh + (freshIds.length - (D1_BLACKLIST_INSERT_BATCH_SIZE * 2 - 1)));
 }
 {
 	const db = makeFakeDB();
@@ -403,11 +442,11 @@ for (const total of [20, 21, 50]) {
 console.log('\n[11] 同步请求预算');
 {
 	const cases = [
-		[19, 1, false, 69],
+		[19, 1, false, 70],
 		[12, 2, false, 73],
 		[3, 8, false, 70],
 		[4, 7, true, 78],
-		[20, 1, true, 72],
+		[20, 1, true, 73],
 	];
 	for (const [users, groups, useQueue, expected] of cases) {
 		const budget = shouldUseBulkQueue(users, groups);
@@ -424,7 +463,7 @@ console.log('\n[11] 同步请求预算');
 	const ordinaryAdminBudget = shouldUseBulkQueue(1, 18, { probeMembership: true, authorizationRequests: 18 });
 	assert('普通管理员逐群鉴权计入 100 请求预算', ordinaryAdminBudget.useQueue && ordinaryAdminBudget.operations === 18 && ordinaryAdminBudget.estimate.total === 101);
 	assert('预算单独记录普通管理员鉴权请求', ordinaryAdminBudget.estimate.authorizationRequests === 18);
-	assert('D1 批处理估算按每 20 人一批', estimateBulkTaskSubrequests(41, 1).d1MutationBatches === 3);
+	assert(`D1 黑名单 INSERT 按每 ${D1_BLACKLIST_INSERT_BATCH_SIZE} 人一批`, estimateBulkTaskSubrequests(41, 1).d1MutationBatches === Math.ceil(41 / D1_BLACKLIST_INSERT_BATCH_SIZE));
 	assert('网络异常允许重试', shouldRetryTelegramMutationFailure({ networkError: true }));
 	assert('HTTP 429 允许重试', shouldRetryTelegramMutationFailure({ httpStatus: 429 }));
 	assert('Telegram 429 允许重试', shouldRetryTelegramMutationFailure({ errorCode: 429 }));

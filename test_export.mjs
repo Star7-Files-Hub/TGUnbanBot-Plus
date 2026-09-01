@@ -63,12 +63,13 @@ function makeFakeDB(seed = []) {
 				},
 				async run() { return { meta: { changes: 0 } }; },
 				async all() {
-					if (sql.startsWith('PRAGMA table_info(blacklist)')) { 						return { results: ['id', 'reason', 'by_user', 'at', 'note'].map((name) => ({ name })) }; 					}
+					if (sql.startsWith('PRAGMA table_info(blacklist)')) { 						return { results: ['id', 'reason', 'by_user', 'at', 'note', 'scope_groups'].map((name) => ({ name })) }; 					}
 					const results = [...rows.values()].map((r) => ({
 						id: String(r.id),
 						reason: r.reason ?? null,
 						by_user: r.by ?? r.by_user ?? null,
-						at: r.at ?? null
+						at: r.at ?? null,
+						scope_groups: r.scope_groups ?? null,
 					}));
 					results.sort((a, b) => String(a.at).localeCompare(String(b.at)));
 					return { results };
@@ -164,7 +165,7 @@ console.log('\n[4] CSV 下载');
 		`实际首三字节 = ${buf[0]?.toString(16)} ${buf[1]?.toString(16)} ${buf[2]?.toString(16)}`
 	);
 	const body = await res.text();
-	assert('含表头', body.includes('id,reason,by,at'));
+	assert('含表头', body.includes('id,reason,scope_groups,by,at'));
 	assert('含 1001', body.includes('1001'));
 	assert('含 1003', body.includes('1003'));
 	const lines = body.split('\r\n');
