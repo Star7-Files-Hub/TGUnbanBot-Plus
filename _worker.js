@@ -8,7 +8,34 @@
 //    环境变量名：SELF_UNBAN_KEYWORD
 const DEFAULT_SELF_UNBAN_KEYWORD = '我不是广告狗，我是误封的，希望可以解封。';
 
-// 2) /unban、/start 命令收到时返回的欢迎/检查清单。
+// 2) /start 收到时返回的机器人介绍欢迎语（仅 /start，不含解封确认整句）。
+//    为什么和下面的 SELF_UNBAN_PROMPT 拆开：/start 是 Telegram 在用户首次打开 bot 时
+//    自动发送的命令，任何人第一眼看到的就是它；而解封清单里含 {keyword} 确认整句，
+//    第一主人在群里发 /start 会把这句口令明文贴进群，等于公开教学如何触发解封。
+//    拆开后 /start 只做自我介绍并把用户引导到 /unban，群里发也无害。
+//    支持 HTML 子集（<b>、换行等）。占位符：{userId}、{title}。
+//    {title} 会替换成主群名称，默认文案刻意不使用它（主群可能是私密群，会泄漏群名）。
+//    /unban 写成裸文本而非 <code>：Telegram 只对纯文本里的 /xxx 给「点一下直接发送」。
+//    环境变量名：START_WELCOME
+const DEFAULT_START_WELCOME = `👋 <b>你好，{userId}</b>
+
+我是 <b>杀神搭配专用解封</b> 的自助解封机器人。
+
+<b>━━ 我是做什么的 ━━</b>
+如果你在群里被封禁或被禁言，又确认自己没有违规，
+可以在这里自己完成解封，不需要等管理员处理。
+
+<b>━━ 你现在可以做什么 ━━</b>
+🔓 被封禁 / 被禁言了 → 发送 /unban 开始自助解封
+💬 解封后仍无法发言 → 请到群内联系管理员
+
+<b>━━ 请注意 ━━</b>
+• 我不会主动私聊任何人，也不会索要账号、验证码或任何信息
+• 自助解封仅限「误封」情形；确实违规的账号会被拒绝
+• 恶意重复尝试会被记入全局黑名单，届时无法再自助解封`;
+
+// 3) /unban 收到时返回的自助解封检查清单。
+//    仅 /unban 使用（/start 已改用上面的 START_WELCOME）。
 //    支持 HTML 子集（<b>、换行等）。占位符：{userId}、{title}、{keyword}。
 //    {keyword} 会自动填入当前生效的 SELF_UNBAN_KEYWORD（来自环境变量或默认值）。
 //    {title} 仍可用（会被替换成主群名称），但默认文案刻意【不使用】它 ——
@@ -26,7 +53,7 @@ const DEFAULT_SELF_UNBAN_PROMPT = `🤖 <b>亲爱的 {userId}</b>，我是 <b>�
 ✅ <b>如果你确定没有违反以上内容，请输入以下内容：</b>
 	<code>{keyword}</code>`;
 
-// 3) 用户输入正确确认句、解封请求被同意时回复的提示。
+// 4) 用户输入正确确认句、解封请求被同意时回复的提示。
 //    本项目解封走全群、封禁也走全群，bot 无法知道用户原本在哪个群被封，
 //    因此不再说"返回某个群"，而是告知"全部群组限制已解除"，并把主群定位为【联系管理员的入口】。
 //    占位符：
@@ -45,7 +72,7 @@ const DEFAULT_SELF_UNBAN_APPROVED = `✅ 已同意给予解封
 
 ⚠️ 请注意：解封后请遵守群规，避免再次被封禁。`;
 
-// 3.1) 拿不到主群链接时使用的降级文案（不含"点击下方按钮"字样，也不会附带按钮）。
+// 4.1) 拿不到主群链接时使用的降级文案（不含"点击下方按钮"字样，也不会附带按钮）。
 //    环境变量名：SELF_UNBAN_APPROVED_NOLINK
 const DEFAULT_SELF_UNBAN_APPROVED_NOLINK = `✅ 已同意给予解封
 
@@ -56,10 +83,10 @@ const DEFAULT_SELF_UNBAN_APPROVED_NOLINK = `✅ 已同意给予解封
 
 ⚠️ 请注意：解封后请遵守群规，避免再次被封禁。`;
 
-// 3.2) 主群联系入口按钮的文字前缀（emoji）。按钮完整文字 = 该前缀 + 群名。
+// 4.2) 主群联系入口按钮的文字前缀（emoji）。按钮完整文字 = 该前缀 + 群名。
 const SELF_UNBAN_CONTACT_BUTTON_PREFIX = '💬 ';
 
-// 4) /blacklist 命令单次最多展示多少条（按时间倒序，最新在前）。
+// 5) /blacklist 命令单次最多展示多少条（按时间倒序，最新在前）。
 //    环境变量名：BLACKLIST_PAGE_LIMIT （要求是正整数）
 const DEFAULT_BLACKLIST_PAGE_LIMIT = 30;
 
@@ -72,7 +99,7 @@ const PURGE_RUN_DELAY_MS = 250;
 const PURGE_DEFAULT_REASONS = ['manual', 'sa', 'spam', 'ad_vote'];
 const TG_MUTATION_RETRY_DELAY_MS = 350;
 
-// 5) /blacklist 列表中"原因"字段的中文映射。
+// 6) /blacklist 列表中"原因"字段的中文映射。
 //    spam 表示 /spam 举报，manual 表示 /ban 手动添加；历史 reason=sa 继续按 /spam 展示。
 //    环境变量名：BLACKLIST_REASON_LABELS （要求是 JSON 字符串，例如 {"spam":"群内举报"}）
 const DEFAULT_BLACKLIST_REASON_LABELS = {
@@ -86,11 +113,11 @@ const DEFAULT_BLACKLIST_REASON_LABELS = {
 	gky_global: '🌐 杀神全局封禁库命中'
 };
 
-// 6) GKY 封禁记录查询后端。改动者请确保返回 HTML 与 parseBanlistHTML 兼容。
+// 7) GKY 封禁记录查询后端。改动者请确保返回 HTML 与 parseBanlistHTML 兼容。
 //    环境变量名：GKY_BANLIST_ENDPOINT
 const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
 
-// 7) 超级管理员 TGID 白名单。用于普通管理命令鉴权，支持多个 TGID。
+// 8) 超级管理员 TGID 白名单。用于普通管理命令鉴权，支持多个 TGID。
 //    环境变量名：SUPER_ADMINS （字符串形式，逗号分隔）
 //    例：'123456,789012'
 //    硬编码这里写数组形式，留空数组表示默认无超管。
@@ -99,7 +126,7 @@ const DEFAULT_SUPER_ADMINS = [
 	// '987654321',
 ];
 
-// 8) 主人 TGID(项目所有者),用于"主人审计通知"系统
+// 9) 主人 TGID(项目所有者),用于"主人审计通知"系统
 //    所有管理员/超管在群里使用 /ban /unban /spam 命令、
 //    群内手动 ban/unban 时,主人会收到一份带操作人标记的私聊审计通知
 //    环境变量 OWNER_IDS(逗号分隔,中英文逗号均可):第一个是主人,后续是副主人
@@ -108,7 +135,7 @@ const DEFAULT_SUPER_ADMINS = [
 //    填了主人/副主人ID但账号从未私聊过 bot → 通知会投递失败,Worker 日志可见
 const DEFAULT_OWNER_IDS = [];
 
-// 9) 广告自动检测(多维度评分 + 强特征直杀),命中 → 删消息 + 加黑 + 全群踢 + 通知主人
+// 10) 广告自动检测(多维度评分 + 强特征直杀),命中 → 删消息 + 加黑 + 全群踢 + 通知主人
 //    优先级:环境变量 > 这里的硬编码默认值
 //    AD_FILTER_ENABLED 默认 false,需显式设环境变量 'true' 才启用(避免刚部署误伤)
 const DEFAULT_AD_FILTER_ENABLED = false;
@@ -163,7 +190,7 @@ const DEFAULT_SELF_UNBAN_CONTACT_GROUP = '';
 // 仅在主人执行 /importdefault 时一次性写入 D1,不默认生效
 const RECOMMENDED_AD_KEYWORDS = {
 	finance: ['us' + 'dt', 'u' + '商', '承' + '兑', '刷' + '单', '日' + '入', '出' + 'u', '接' + 'u', '搬' + '砖', '套' + '利', '包' + '网', '跑' + '分', '水' + '房', '料' + '子'],
-	porn: ['约' + '炮', '萝' + '莉', '福利' + '姬', '看' + '片', '裸' + '聊', '乱' + '伦', '不雅' + '视频', '色' + '色', '一夜' + '情', '免费' + '看', '萝' + '控',
+	porn: ['约' + '炮', '萝' + '莉', '黄' + '毛', '福利' + '姬', '看' + '片', '裸' + '聊', '乱' + '伦', '不雅' + '视频', '色' + '色', '一夜' + '情', '免费' + '看', '萝' + '控',
 		'性' + '爱', '不' + '雅', '完整' + '版', '免费' + '观看', '在线' + '观看', '楼' + '凤', '上门' + '服务', '空' + '降', '嫩' + '模', '探' + '花'],
 	spam: [],
 	fraud: ['假' + '钞', '假' + '币', '代开' + '发票', '黑客' + '接单', '网' + '赚', '菠' + '菜',
@@ -241,6 +268,7 @@ const AD_STOPWORDS = [
 
 // 运行期生效的可配置项（每次请求开始时由 loadRequiredConfig 写入）
 let SELF_UNBAN_KEYWORD;
+let START_WELCOME;
 let SELF_UNBAN_PROMPT;
 let SELF_UNBAN_APPROVED;
 let SELF_UNBAN_APPROVED_NOLINK;
@@ -319,6 +347,7 @@ function applyRuntimeConfig(config) {
 	MSG_CACHE_ENABLED = config.MSG_CACHE_ENABLED;
 	MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
 	SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
+	START_WELCOME = config.START_WELCOME;
 	SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
 	SELF_UNBAN_APPROVED = config.SELF_UNBAN_APPROVED;
 	SELF_UNBAN_APPROVED_NOLINK = config.SELF_UNBAN_APPROVED_NOLINK;
@@ -495,6 +524,7 @@ function loadRequiredConfig(env) {
 	};
 
 	const selfUnbanKeyword = pickStr(env.SELF_UNBAN_KEYWORD, DEFAULT_SELF_UNBAN_KEYWORD);
+	const startWelcome = pickStr(env.START_WELCOME, DEFAULT_START_WELCOME);
 	const selfUnbanPrompt = pickStr(env.SELF_UNBAN_PROMPT, DEFAULT_SELF_UNBAN_PROMPT);
 	const selfUnbanApproved = pickStr(env.SELF_UNBAN_APPROVED, DEFAULT_SELF_UNBAN_APPROVED);
 	const selfUnbanApprovedNoLink = pickStr(env.SELF_UNBAN_APPROVED_NOLINK, DEFAULT_SELF_UNBAN_APPROVED_NOLINK);
@@ -583,6 +613,7 @@ function loadRequiredConfig(env) {
 		MSG_CACHE_ENABLED: msgCacheEnabled,
 		MSG_CACHE_SIZE: msgCacheSize,
 		SELF_UNBAN_KEYWORD: selfUnbanKeyword,
+		START_WELCOME: startWelcome,
 		SELF_UNBAN_PROMPT: selfUnbanPrompt,
 		SELF_UNBAN_APPROVED: selfUnbanApproved,
 		SELF_UNBAN_APPROVED_NOLINK: selfUnbanApprovedNoLink,
@@ -4400,7 +4431,137 @@ async function handlePurge(env, url) {
 	return jsonResponse({ 成功: true, ...summary });
 }
 
+// 把 ISO 时间戳压成 "2026-09-02 23:40:47"（去掉 T、毫秒与结尾 Z）。
+// 保留到秒：同一分钟内批量加黑的多条记录靠秒数才能分出先后顺序。
+// 时区仍是 UTC（写入用的是 new Date().toISOString()），由渲染函数在末尾统一标注一次。
+function formatBlacklistTime(at) {
+	const raw = String(at || '').trim();
+	if (!raw) return '';
+	const m = raw.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+	return m ? `${m[1]} ${m[2]}` : raw;
+}
+
+// ===== /blacklist 操作人用户名解析 =====
+// 为什么需要：操作人原本只输出 <a href="tg://user?id=X">X</a>，而 Telegram 官方在
+// ChatFullInfo.has_private_forwards 里写明——对方若把「隐私和安全 → 转发消息」设为
+// 非「所有人」，tg://user?id= 链接【只在与该用户本人的聊天里】才生效，别处退化成灰色
+// 纯文本点不动。管理员出于隐私常改这个设置，于是出现「被封的广告号能点、管理员点不动」。
+// 解法照搬 /admins：纯文本 @username 由 Telegram 自动识别为用户链接，不受该设置约束。
+//
+// 成本控制（这是关键，否则 30 条记录会打爆子请求配额）：
+//   ① 先对操作人集合【去重】——30 条记录通常只有 2~5 个不同操作人；
+//   ② 用 getChatAdministrators 【按群】拉取，一次拿回该群全部管理员，
+//      而不是按人逐个 getChat。操作人几乎必然是管理员，G 次调用即可全部解析；
+//   ③ 结果进运行期缓存，同一 isolate 内重复执行 /blacklist 不再查；
+//   ④ 全程 try/catch 静默降级：查不到就回落 tg://user?id=，绝不因此让命令失败。
+const BLACKLIST_OPERATOR_CACHE = new Map();
+const BLACKLIST_OPERATOR_CACHE_TTL_MS = 10 * 60 * 1000;
+const BLACKLIST_OPERATOR_CACHE_MAX = 200;
+
+function readBlacklistOperatorCache(id) {
+	const hit = BLACKLIST_OPERATOR_CACHE.get(id);
+	if (!hit) return undefined;
+	if (Date.now() - hit.at > BLACKLIST_OPERATOR_CACHE_TTL_MS) {
+		BLACKLIST_OPERATOR_CACHE.delete(id);
+		return undefined;
+	}
+	return hit.username;
+}
+
+function writeBlacklistOperatorCache(id, username) {
+	// 简单 LRU：超上限时丢掉最早写入的一批，避免 isolate 长期存活后无限增长
+	if (BLACKLIST_OPERATOR_CACHE.size >= BLACKLIST_OPERATOR_CACHE_MAX) {
+		for (const key of [...BLACKLIST_OPERATOR_CACHE.keys()].slice(0, 50)) {
+			BLACKLIST_OPERATOR_CACHE.delete(key);
+		}
+	}
+	BLACKLIST_OPERATOR_CACHE.set(id, { username: username || '', at: Date.now() });
+}
+
+// 返回 Map<TGID, username>；username 为空串表示查过但该账号没设用户名。
+async function resolveBlacklistOperatorUsernames(entries) {
+	const wanted = new Set();
+	for (const entry of entries || []) {
+		const raw = String(entry?.by || '').trim();
+		// system / anonymous_admin:-100xxx 不是用户 ID，不需要查
+		if (/^\d+$/.test(raw)) wanted.add(raw);
+	}
+	const result = new Map();
+	for (const id of wanted) {
+		const cached = readBlacklistOperatorCache(id);
+		if (cached !== undefined) result.set(id, cached);
+	}
+	const missing = [...wanted].filter((id) => !result.has(id));
+	if (missing.length === 0) return result;
+
+	// 按群批量拉管理员：一次调用覆盖该群所有管理员，远比按人查省
+	for (const groupId of GROUP_IDS) {
+		if (missing.every((id) => result.has(id))) break;
+		try {
+			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ chat_id: groupId }),
+			});
+			const data = await response.json();
+			if (!response.ok || !data?.ok || !Array.isArray(data.result)) continue;
+			for (const member of data.result) {
+				const uid = member?.user?.id ? String(member.user.id) : '';
+				if (!uid || !wanted.has(uid) || result.has(uid)) continue;
+				const username = member.user.username ? String(member.user.username) : '';
+				result.set(uid, username);
+				writeBlacklistOperatorCache(uid, username);
+			}
+		} catch (error) {
+			console.error(`[黑名单] 拉取群管理员失败 group=${groupId}:`, error);
+		}
+	}
+
+	// 仍没解析到的（如已被降权、已退群）记成空串，避免下次再白查一轮
+	for (const id of missing) {
+		if (!result.has(id)) {
+			result.set(id, '');
+			writeBlacklistOperatorCache(id, '');
+		}
+	}
+	return result;
+}
+
+// 把 by_user 字段翻译成可读的操作人标签。
+// usernames 由 resolveBlacklistOperatorUsernames 预先解析好后传入（同步渲染，不在这里发请求）；
+// 不传则退化为纯本地渲染，行为与解析失败时一致。
+function renderBlacklistOperator(byId, usernames) {
+	const raw = String(byId || '').trim();
+	if (!raw) return '未知';
+	if (raw === 'system') return '🤖 系统自动';
+
+	const anonymous = raw.match(/^anonymous_admin:(-?\d+)$/);
+	if (anonymous) {
+		return `🕵️ 匿名管理员（来源群 <code>${escapeHtml(anonymous[1])}</code>）`;
+	}
+
+	// 纯数字才是真实用户 ID，才能做 tg://user 跳转；其它形态原样展示避免生成死链接。
+	if (!/^\d+$/.test(raw)) return `<code>${escapeHtml(raw)}</code>`;
+
+	let roleTag = '👤 群管理员';
+	if (isPrimaryOwner(raw)) roleTag = '👑 主人';
+	else if (isSecondaryOwner(raw)) roleTag = '👤 副主人';
+	else if (SUPER_ADMINS.includes(raw)) roleTag = '🛡️ 超级管理员';
+
+	// 有用户名就用纯文本 @xxx：Telegram 自动识别为用户链接，不受对方隐私设置影响。
+	// TGID 仍然照常给出，方便直接复制去 /check、/unban。
+	const username = usernames?.get?.(raw);
+	if (username) {
+		return `${roleTag} @${escapeHtml(username)}（<code>${escapeHtml(raw)}</code>）`;
+	}
+	return `${roleTag} <a href="tg://user?id=${escapeHtml(raw)}">${escapeHtml(raw)}</a>`;
+}
+
 // 渲染黑名单为 HTML 文本（用于 /blacklist 命令展示）
+// 排版为「每条记录一段、字段各占一行」：旧版把 4 个字段用 " · " 拼成一行，
+// Telegram 按屏宽随机折行，长的 anonymous_admin:-100xxx 一出现整行就被撑爆，读起来很乱。
+// 竖排后折行位置固定，且记录之间的空行正好是 splitTelegramHtmlBlocks 的切分点，
+// 条数调大触发分块时不会把某一条记录劈成两半。
 function renderBlacklist(blacklist, options = {}) {
 	const limit = options.limit ?? BLACKLIST_PAGE_LIMIT;
 	const alreadyRecent = Boolean(options.alreadyRecent);
@@ -4411,31 +4572,37 @@ function renderBlacklist(blacklist, options = {}) {
 	}
 
 	const reasonLabels = BLACKLIST_REASON_LABELS;
+	const usernames = options.operatorUsernames;
 	const visible = alreadyRecent ? blacklist.slice(0, limit) : blacklist.slice(-limit).reverse(); // 最近添加的排前面
-	const limitedText = total > visible.length ? `，仅显示最近 ${visible.length} 条` : '';
+	const limitedText = total > visible.length ? ` · 显示最近 ${visible.length} 条` : '';
+	// 序号右对齐：两位数与一位数混排时左侧不会参差。
+	const indexWidth = String(visible.length).length;
 
-	let lines = [`📋 <b>当前黑名单</b>（共 ${total} 条${limitedText}）`, ''];
+	const lines = [`📋 <b>当前黑名单</b>（共 ${total} 条${limitedText}）`, ''];
 
-	for (const entry of visible) {
+	visible.forEach((entry, index) => {
+		const seq = String(index + 1).padStart(indexWidth, ' ');
 		const idLink = `<a href="tg://user?id=${escapeHtml(entry.id)}">${escapeHtml(entry.id)}</a>`;
-		const parts = [`• ${idLink}`];
+		const block = [`${seq}. TGID：${idLink}`];
 		if (entry.reason) {
-			parts.push(`原因：${escapeHtml(reasonLabels[entry.reason] || entry.reason)}`);
+			block.push(`　　原因：${escapeHtml(reasonLabels[entry.reason] || entry.reason)}`);
 		}
 		// 生效范围：全局记录标「全局」，单群记录列出群 ID，便于一眼分辨跨群封禁与单群封禁。
 		const scopeGroups = normalizeBlacklistScope(entry.scopeGroups ?? null);
-		parts.push(scopeGroups === null
-			? '范围：全局'
-			: `范围：${escapeHtml(scopeGroups.join('、'))}`);
+		block.push(scopeGroups === null
+			? '　　范围：全局'
+			: `　　范围：${escapeHtml(scopeGroups.join('、'))}`);
 		if (entry.by) {
-			parts.push(`操作人：<code>${escapeHtml(entry.by)}</code>`);
+			block.push(`　　操作人：${renderBlacklistOperator(entry.by, usernames)}`);
 		}
-		if (entry.at) {
-			parts.push(`时间：${escapeHtml(entry.at)}`);
+		const at = formatBlacklistTime(entry.at);
+		if (at) {
+			block.push(`　　时间：${escapeHtml(at)}`);
 		}
-		lines.push(parts.join(' · '));
-	}
+		lines.push(block.join('\n'), '');
+	});
 
+	lines.push('ℹ️ 时间为 UTC · 点 TGID 或操作人可打开该用户；操作人显示为灰色数字说明对方隐私设置不允许跳转，可复制 TGID 用 /check 查');
 	return lines.join('\n');
 }
 
@@ -4512,8 +4679,18 @@ function isSuperAdmin(userId) {
 	return SUPER_ADMINS.some((id) => id === idStr);
 }
 
+// 清掉会让 Telegram 直接返回 400 的非法字符。
+// 旧实现是 replace(/[\uD800-\uDFFF]/g, '')，把【所有】代理对码元一律删除 —— 但合法的
+// 星平面字符（U+10000 以上，几乎所有 emoji）在 JS 里正是以「高位代理 + 低位代理」这一对
+// 码元存储的，于是 📋🔐🗂️🤖🕵️🌐 等 emoji 会被整体抹掉，只在原位留下一个多余空格，
+// 而 ✅❌ℹ️ 这些落在 BMP 内的符号却安然无恙 —— 表现为 emoji 时有时无。
+// 真正非法的只有【孤立代理】：高位后面没跟低位，或低位前面没有高位。成对的必须保留。
 function sanitizeTelegramText(value) {
-	return String(value ?? '').replace(/[\uD800-\uDFFF]/g, '');
+	return String(value ?? '')
+		// 高位代理（U+D800~U+DBFF）后面没有紧跟低位代理 → 孤立，删掉
+		.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
+		// 低位代理（U+DC00~U+DFFF）前面不是高位代理 → 孤立，删掉（保留前一个字符）
+		.replace(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '$1');
 }
 
 function truncateTelegramText(value, maxLength) {
@@ -4835,6 +5012,9 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 
 	let responseMessage = '';
 	let canCopyGkyCommand = false;
+	// 记录是否属于本部署的 GROUP_ID 配置群：决定 GKY 代码的语义是「移出本群黑名单」
+	// 还是「加 GKY 全局白名单」，两者影响面差别很大，必须在提示里说清。
+	let gkyRecordInConfiguredGroup = false;
 
 	if (!banlistData.success) {
 		responseMessage = `❌ <b>GKY 查询失败</b>\n\n${escapeHtml(banlistData.error || '未知错误')}${localBlacklistInfo}`;
@@ -4872,14 +5052,16 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 
 		const recordTgid = String(banlistData.tgid || '');
 		if (recordTgid !== queryTgid) {
+			// 这道门必须留：GKY 返回的记录与查询目标不是同一个人，此时给按钮会给错人加白名单。
 			responseMessage += '\n\n⚠️ 当前 GKY 返回记录的 TGID 无法与查询目标核对，因此不提供 GKY 复制按钮。请稍后重新使用 <code>/check</code>。';
 		} else {
-			const recordChatId = String(banlistData.chatId || '');
-			if (!isConfiguredGroup(recordChatId)) {
-				responseMessage += '\n\n⚠️ 此 GKY 封禁记录不属于当前 <b>GROUP_ID</b> 配置群，因此不提供 GKY 复制按钮。请使用 GKY 官方网页处理全局解封。';
-			} else {
-				canCopyGkyCommand = true;
-			}
+			// 与源项目对齐：只要 GKY 判定被封就提供复制按钮，chatId 只决定"移出黑名单"还是
+			// "添加白名单"两种语义，而不是决定给不给按钮。
+			// 早前版本在这里加了"记录必须属于 GROUP_ID 配置群"的门，导致查到别群记录时
+			// 按钮被整个吞掉、只能去 GKY 官网操作 —— 而 GKYbotSave 本就是发给 GKYbot 的
+			// 全局指令，别群记录同样能处理，没有拦的必要。
+			canCopyGkyCommand = true;
+			gkyRecordInConfiguredGroup = isConfiguredGroup(String(banlistData.chatId || ''));
 		}
 	}
 
@@ -4895,11 +5077,25 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 
 	const inlineKeyboard = [];
 	if (canCopyGkyCommand) {
-		responseMessage += '\n\nℹ️ GKY 与本地 D1 黑名单相互独立。下方按钮只复制 GKY 添加白名单代码，必须由真人管理员在封禁记录对应的配置群发送。';
-		inlineKeyboard.push([{
-			text: '📋 点击复制 GKY 添加白名单代码',
-			copy_text: { text: `GKYbotSave\n${queryTgid}` }
-		}]);
+		if (gkyRecordInConfiguredGroup) {
+			// 记录就在自己的配置群：语义是把该号从该群的 GKY 黑名单里移出。
+			responseMessage += '\n\nℹ️ GKY 与本地 D1 黑名单相互独立。下方按钮只复制 GKY 移出黑名单代码，必须由真人管理员在封禁记录对应的配置群发送。';
+			inlineKeyboard.push([{
+				text: '📋 点击复制 GKY 移出黑名单代码',
+				copy_text: { text: `GKYbotSave\n${queryTgid}` }
+			}]);
+		} else {
+			// 记录来自别的群：GKYbotSave 此时的效果是给该号加 GKY【全局】白名单，
+			// 该号在所有接入 GKYbot 的群都会被放行 —— 影响面远大于"解封我这个群"，
+			// 按钮文字四个字说不清，必须在提示里写明，否则容易被当成本地白名单。
+			responseMessage += '\n\n⚠️ 此 GKY 封禁记录<b>不属于</b>你的 <b>GROUP_ID</b> 配置群（来源群 <code>'
+				+ escapeHtml(String(banlistData.chatId || '未知'))
+				+ '</code>）。下方代码的效果是给该号加 <b>GKY 全局白名单</b> —— 对所有接入 GKYbot 的群生效，不只是你的群，请确认后再发送。'
+				+ '\nℹ️ GKY 与本地 D1 黑名单相互独立，此代码不会改动你的 D1 黑名单；需由真人管理员发送才生效。';
+			inlineKeyboard.push([{
+				text: '📋 点击复制 GKY 添加全局白名单代码',
+				copy_text: { text: `GKYbotSave\n${queryTgid}` }
+			}]);
 	}
 
 	if (localCheck.isBlacklisted) {
@@ -7852,7 +8048,12 @@ async function notifyOwnerBlacklistIntercept(targetUser, chat, action, blacklist
 }
 
 // 黑名单用户尝试自助解封时通知主人（申诉提醒）
-async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo) {
+// 通知主人：黑名单用户在跟 bot 互动。
+// kind 区分两种信号强度，避免主人分不清对方到底做了什么：
+//   'appeal'（默认）—— 发了 /unban 或粘贴确认整句，是【真的在尝试解封】并被闸门拒绝；
+//   'start'         —— 只是打开了 bot（Telegram 自动发 /start），可能只是误触，
+//                      /start 现在只回自我介绍、不拒绝，所以这条纯属知情通报。
+async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo, kind = 'appeal') {
 	if (!OWNER_IDS.length) return;
 	const target = fromUser
 		? formatUserMention(fromUser)
@@ -7863,15 +8064,18 @@ async function notifyOwnerBlacklistAppeal(fromUser, blacklistInfo) {
 	const reason = translateBlacklistReason(entry?.reason);
 	const operator = await translateBlacklistOperator(entry?.by);
 	const addedAt = entry?.at ? escapeHtml(entry.at) : '未知';
+	const isStart = kind === 'start';
 
 	const lines = [
-		`📢 <b>黑名单用户申诉</b>`,
+		isStart ? '📬 <b>黑名单用户打开了机器人</b>' : '📢 <b>黑名单用户申诉</b>',
 		`👤 用户:${target} <code>${escapeHtml(targetId)}</code>`,
 		`📋 加黑方式:${reason}`,
 		`🔧 加黑操作人:${operator}`,
 		`🕐 加黑时间:${addedAt}`,
 		'',
-		`该用户正尝试自助解封但被黑名单阻止。`,
+		isStart
+			? '该用户刚发送 /start 打开机器人，只收到了自我介绍，尚未尝试解封。'
+			: '该用户正尝试自助解封但被黑名单阻止。',
 		`如确认误封，请执行: <code>/unban ${escapeHtml(targetId)}</code>`,
 	];
 
@@ -9608,7 +9812,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			getD1BlacklistCount(env),
 			readD1BlacklistRecent(env, BLACKLIST_PAGE_LIMIT)
 		]);
-		await sendTelegramMessage(chatId, renderBlacklist(blacklist, { total, alreadyRecent: true }));
+		const operatorUsernames = await resolveBlacklistOperatorUsernames(blacklist);
+		// 保持单条发送：分块函数的 sanitizeTelegramText 会剥离全部代理对码元（📋👑🕵️ 等
+		// emoji 全没），且阈值按 HTML 原文长度算（30 条原文 4823 字符 > 3500），会把本来
+		// 发得出去的一条消息无谓拆成两条。默认 30 条可见字符仅约 2790，远低于 Telegram
+		// 的 4096 上限，单条足够。若把 BLACKLIST_PAGE_LIMIT 调到 45 条以上再考虑分块。
+		await sendTelegramMessage(chatId, renderBlacklist(blacklist, { total, alreadyRecent: true, operatorUsernames }));
 		return;
 	}
 
@@ -9630,47 +9839,51 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await sendFlashMessage(chatId, 'ℹ️ 请私聊我发送 /help 查看 OWNER_IDS 专属指令。', ctx, 6000);
 			return;
 		}
+		// /help 命令改为裸文本可点击发送：Telegram 对纯文本里的 /xxx 识别为 bot_command 实体、
+		// 渲染成蓝色链接并支持点一下直接发送。<code> 包裹的只给「点击复制」。
 		const helpLines = [
-			'🔐 <b>第一主人专属隐藏指令索引</b>(仅 OWNER_IDS[0] 可展开；其他角色群内静默，私聊仅提示权限不足)',
+			'🔐 <b>第一主人专属指令</b>（其他人无反应，也不出现在命令菜单里）',
 			'',
 			'<b>━━ 广告词库热更新(私聊)━━</b>',
-			'<code>/importdefault</code> 一键导入推荐词库(金融/色情/引流/诈骗/身份引流)',
-			'<code>/addword [分类] 词1 词2</code> 加词。分类:finance/porn/spam/fraud/general/identity/whitelist,默认 general',
-			'<code>/addword whitelist example.com</code> 加正常域名白名单(该域名链接永不被杀)',
-			'<code>/addword identity 卡网 车队</code> 加身份引流词(只查发言人名字/简介,不碰正文)',
-			'<code>/delword 词1 词2</code> 从所有分类删词',
-			'<code>/listwords</code> 查看当前 D1 词库全部内容',
+			'/importdefault　一键导入推荐词库(金融/色情/引流/诈骗/身份引流)',
+			'/addword [分类] 词1 词2　加词。分类:finance/porn/spam/fraud/general/identity/whitelist,默认 general',
+			'/addword whitelist example.com　加正常域名白名单(该域名链接永不被杀)',
+			'/addword identity 卡网 车队　加身份引流词(只查发言人名字/简介,不碰正文)',
+			'/delword 词1 词2　从所有分类删词',
+			'/listwords　查看当前 D1 词库全部内容',
 			'',
 			'<b>━━ 广告样本学习(两步私聊复核)━━</b>',
-			'<code>/spam</code>(群内回复广告)仅第一主人额外学习可信指纹；副主人/超管/群管理员只执行封禁、不学习',
-			'<code>/learn 广告文本</code> 直接粘贴文字学习指纹(只入库,不踢人)',
-			'<code>/recent [N]</code> 拉取疑似广告并冻结快照,带序号推到私聊(群/私聊均可,最多50条)',
-			'<code>/learnlast 序号</code> <b>仅私聊</b>,按快照序号学指纹(只入库,不踢人)。如 /learnlast 1,3',
+			'/spam(群内回复广告)仅第一主人额外学习可信指纹；副主人/超管/群管理员只执行封禁、不学习',
+			'/learn 广告文本　直接粘贴文字学习指纹(只入库,不踢人)',
+			'/recent [N]　拉取疑似广告并冻结快照,带序号推到私聊(群/私聊均可,最多50条)',
+			'/learnlast 序号　<b>仅私聊</b>,按快照序号学指纹(只入库,不踢人)。如 /learnlast 1,3',
 			'',
-			'<b>━━ 群内广告举报投票 ━━</b>',
-			'<code>/ad [原因]</code> 回复目标消息发起；或 <code>/ad TGID [原因]</code>。主人/副主人/超级管理员、当前群管理员或 /add_ad_admin 白名单成员可发起',
-			'• 发起后自动置顶；发起人自动计 1 票；赞成或反对达到 6 票结束；当前群管理员点击可一票通过或一票否决',
-			'• 发起人、当前群管理员或高级管理员可点“取消投票”；通过/否决/过期/取消后均自动取消置顶',
-			'• 通过后写入 D1 当前群黑名单并封禁本群，revoke_messages=true 撤回本群历史发言；不写广告学习库。如需跨群封禁请改用 <code>/spam</code>',
-			'<code>/add_ad_admin TGID</code> / <code>/del_ad_admin TGID</code> 管理 /ad 发起白名单（仅第一主人）；普通成员和助推者只能参与投票',
+			'<b>━━ 人工封禁 ━━</b>',
+			'/ban TGID [原因]　加入全局黑名单 + 全群封禁',
+			'/spam　回复广告使用：删消息 + 全群封禁 + 撤回其历史发言',
+			'/unban TGID　移出黑名单 + 全群解封（裸发 /unban 是自己走自助解封，不是解封别人）',
+			'',
+			'<b>━━ 广告举报投票 ━━</b>',
+			'/ad [原因]　回复目标消息发起；或 /ad TGID [原因]。主人/副主人/超级管理员、当前群管理员或 /add_ad_admin 白名单成员可发起',
+			'/add_ad_admin TGID　允许该成员发起 /ad 投票',
+			'/del_ad_admin TGID　取消该成员的发起权限',
 			'',
 			'<b>━━ 样本库管理(私聊)━━</b>',
-			'<code>/listsamples</code> 查看已学指纹(最近50条+总数)',
-			'<code>/delsample 序号|关键词</code> 删样本',
-			'<code>/clearsamples confirm</code> 清空全部样本',
+			'/listsamples　查看已学指纹(最近50条+总数)',
+			'/delsample 序号|关键词　删样本',
+			'/clearsamples confirm　清空全部样本',
 			'',
-			'<b>━━ 权限名单查询(仅主人私聊)━━</b>',
-			'<code>/admins</code> 查看当前主人/副主人/超级管理员名单,显示 TGID、昵称、用户名、群内身份',
-			'<code>/groups</code> 查看当前 GROUP_ID 配置群组,显示群名、ChatID、类型、用户名',
-			'<code>/leavegroup -1001234567890</code> 让 bot 退出指定群组(仅主人私聊)',
+			'<b>━━ 动态群组（仅私聊）━━</b>',
+			'/addgroup -100xxx [备注]　新增治理群组，不用改环境变量',
+			'/delgroup -100xxx　不再治理该群，bot 仍留在群里',
+			'/listgroups　列出全部生效群组',
 			'',
-			'<b>━━ 说明 ━━</b>',
-			'• 非 OWNER_IDS 用户在群内使用以上指令时静默；私聊会提示权限不足；<code>/admins</code>/<code>/groups</code>/<code>/leavegroup</code> 只允许主人私聊使用',
-			'• 学习一律<b>只入库不踢人</b>;要踢发广告的人,用回执里给的 TGID 发 <code>/ban TGID</code>',
-			'• 学习只写整句指纹,<b>不再自动往词库加词</b>(避免误杀正常消息);建议词需你手动 /addword',
-			'• <b>链接识别</b>:github/google 等正常域名链接永不被杀;含链接的样本只精确匹配不扩散;可疑短链(bit.ly等)才加分',
+			'<b>━━ 查询与退群（仅私聊）━━</b>',
+			'/admins　查看主人 / 副主人 / 超级管理员名单',
+			'/groups　查看当前生效群组信息',
+			'/leavegroup -100xxx　让 bot 退出该群',
 		];
-		await sendTelegramMessage(chatId, helpLines.join('\n'));
+		await sendTelegramMessageChunks(chatId, helpLines.join('\n'));
 		return;
 	}
 
@@ -10402,6 +10615,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			let flashText;
 			if (result.success || alreadyExists) {
 				const banResults = await banUserFromGroups(valid[0], banTargetGroupIds, { probeMembership: true });
+				// 与 /spam 对齐：Telegram 的 revoke_messages 只对【仍在群里】的成员生效，
+				// 目标若已退群/已被别人踢过就变成预封，历史发言一条都撤不掉。
+				// 这里补一层兜底：从 moderation_messages 捞出该 TGID 在【当前群】缓存的消息 ID
+				// 逐条 deleteMessage。仅群内执行时做 —— 私聊没有"当前群"的概念；
+				// 批量路径也不做，N 个目标 × 最多 200 条会直接撞 Cloudflare 子请求上限。
+				const cleanupResult = isInGroup
+					? await cleanupCurrentChatUserMessages(env, chatId, valid[0])
+					: null;
 				targetMention = formatTargetFromBanResults(valid[0], banResults);
 				lines.push(`🎯 目标用户:${targetMention}`);
 				lines.push(`📍 生效范围:${describeBlacklistScope(result.scopeGroups ?? banScopeGroups)}`);
@@ -10411,6 +10632,16 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					if (result.scopeExpanded) lines.push('ℹ️ 已把本群并入该记录的生效范围。');
 				}
 				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/ban' }));
+				if (cleanupResult) {
+					lines.push(renderCurrentChatCleanupResult(cleanupResult));
+					if (cleanupResult.failed > 0 && cleanupResult.errors.length > 0) {
+						const previews = cleanupResult.errors.slice(0, 3).map((item) => {
+							const { 中文, 建议 } = translateTelegramError(item.error);
+							return `<code>${escapeHtml(String(item.messageId))}</code>:${escapeHtml(中文)}；建议:${escapeHtml(建议)}`;
+						});
+						lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
+					}
+				}
 				flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>（${banScopeLabel}）\n` + renderBanResults(banResults);
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
@@ -10662,16 +10893,47 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 	}
 
-	// 处理 /start 和 /unban 命令 - 显示欢迎消息
-	if (
-		(startCommand.head === '/start' && !startCommand.rest) ||
-		(unbanCommand.head === '/unban' && !unbanCommand.rest)
-	) {
+	// ===== 无参 /start —— 机器人介绍欢迎语 =====
+	// 与下面 /unban 的自助解封清单【刻意拆开】：/start 是 Telegram 在用户首次打开 bot 时
+	// 自动发送的命令，任何人第一眼看到的就是它；而解封清单含 {keyword} 确认整句，
+	// 第一主人在群里发 /start 会把这句口令明文贴进群，等于公开教学如何触发解封。
+	// 拆开后 /start 只做自我介绍并引导用户去 /unban，群里发也无害。
+	if (startCommand.head === '/start' && !startCommand.rest) {
+		// 群聊权限与拆分前完全一致：只有第一主人能触发，其他任何人（普通成员、群管理员、
+		// 超级管理员、副主人、匿名管理员）一律【纯静默】—— 不回、不撤回、不通知主人、
+		// 零 Telegram 请求。私聊不进此判定，任何人都能看到介绍语。
+		if (message.chat.type !== 'private' && !isPrimaryOwner(getMessageActorId(message))) {
+			return;
+		}
+		// 刻意【不】走 blockSelfUnbanIfBlacklisted：这段只是自我介绍，黑名单用户也该看得到
+		// "这是什么 bot"；等他发 /unban 时再由那道闸门拒绝，闸门本身一点没削弱。
+		// 但「黑名单用户来了」这个信号不能丢，仍要报给主人 —— 用 kind='start' 区分文案，
+		// 主人一眼就能分清对方只是打开了 bot，还是真的在尝试解封。
+		// 查询失败（checkFailed）不通报：那是 D1 异常而非用户行为，报了只会误导。
+		try {
+			const startCheck = await checkBlacklist(userId, env, { strict: true });
+			if (startCheck.isBlacklisted && !startCheck.checkFailed) {
+				// 用 waitUntil 异步投递：通知失败不该拖慢或阻断介绍语的回复
+				ctx.waitUntil(notifyOwnerBlacklistAppeal(message.from, startCheck, 'start'));
+			}
+		} catch (error) {
+			console.error('[/start] 黑名单知情通报失败:', error);
+		}
+		// {title} 需要额外一次 getChat，默认文案并不使用它，所以按需才查。
+		const startTitle = START_WELCOME.includes('{title}') ? (await getGroupInfo()).title : '';
+		await sendTelegramMessage(chatId, START_WELCOME
+			.replaceAll('{userId}', String(userId))
+			.replaceAll('{title}', startTitle));
+		return;
+	}
+
+	// 处理无参 /unban - 自助解封检查清单
+	if (unbanCommand.head === '/unban' && !unbanCommand.rest) {
 		// 群聊里的自助解封入口只对第一主人开放：任何其他人（普通成员、群管理员、
-		// 超级管理员、副主人、匿名管理员）在配置群发无参 /start 或 /unban 一律【纯静默】——
+		// 超级管理员、副主人、匿名管理员）在配置群发无参 /unban 一律【纯静默】——
 		// 不回欢迎语、不撤回命令、不私聊主人、不产生任何 Telegram 请求。
-		// 原因：这段欢迎语是给「被封禁用户私聊 bot」用的自助流程，任何人都能在群里
-		// 把它刷出来会污染群消息流，且欢迎语里含解封确认整句，等于公开教学如何触发解封。
+		// 原因：这段清单是给「被封禁用户私聊 bot」用的自助流程，任何人都能在群里
+		// 把它刷出来会污染群消息流，且清单里含解封确认整句，等于公开教学如何触发解封。
 		// 私聊完全不进此判定，权限与行为保持原样。
 		if (message.chat.type !== 'private' && !isPrimaryOwner(getMessageActorId(message))) {
 			return;
@@ -10679,7 +10941,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 		const quietManagerCommand = await isNonPrimaryConfiguredGroupManager(message, userId);
 		if (quietManagerCommand) {
-			await deleteAuthorizedGroupCommandMessage(message, startCommand.head === '/start' ? '/start' : '/unban');
+			await deleteAuthorizedGroupCommandMessage(message, '/unban');
 		}
 		// D1 全局黑名单是自助解封的硬闸门：命中任何 reason 都拒绝，且不自动移除黑名单。
 		if (await blockSelfUnbanIfBlacklisted(userId, chatId, message.from, env, {
