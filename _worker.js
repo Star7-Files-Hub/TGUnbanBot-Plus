@@ -5097,6 +5097,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 				copy_text: { text: `GKYbotSave\n${queryTgid}` }
 			}]);
 	}
+	}
 
 	if (localCheck.isBlacklisted) {
 		responseMessage += '\n\nℹ️ 下方按钮只复制本地解封命令，不会直接修改 D1；仍需由有权限的管理员发送执行。';
@@ -6655,6 +6656,16 @@ function collectOriginalAuthors(message, mode = 'quote') {
 	if (mode === 'forward') {
 		addOrigin(message?.forward_origin, '转发原作者');
 		add(message?.forward_from, '转发原作者');
+		// 频道转发的原作者在 forward_from_chat 里（频道身份）
+		if (message?.forward_from_chat?.id) {
+			const fc = message.forward_from_chat;
+			add({
+				id: String(fc.id),
+				first_name: fc.title || fc.username || String(fc.id),
+				last_name: '',
+				username: fc.username || null,
+			}, '转发原频道');
+		}
 		return [...found.values()];
 	}
 
@@ -7604,6 +7615,44 @@ async function detectAdLegacy(message, env) {
 				strong: '引用@引流泛滥',
 				source: '引用内容',
 				quotePreview: quoteText.slice(0, 100)
+			};
+		}
+	}
+
+	// 强特征 1.6:引用频道内容检测（专治"转发频道帖子"和"分享频道链接"类广告）。
+	//   两种子判据：
+	//     甲:手动转发频道帖子 —— forward_from_chat 存在（频道身份转发，非 is_automatic_forward）、
+	//        且 forward_origin 类型为 channel。频道是广告投放的主阵地，真人手动转频道帖到群里
+	//        绝大多数是引流广告（正常用户不会手动转频道帖到群里）。
+	//     乙:正文含频道链接 —— 文本里出现 t.me/xxx 或 @xxx 格式的频道链接，且同时出现诱导词
+	//        （进群/频道/关注/订阅/领取/免费/福利）→ 典型的"分享频道引流广告"。
+	//   误杀防线：
+	//     - 自动转发帖（is_automatic_forward）由 isChannelAutoForward 早退排除，不进入此判据；
+	//     - 纯频道链接无诱导词不加分（避免误伤正常分享）；
+	//     - 严格模式下只kill手动转频道帖（甲），不kill含链接+诱导词（乙）。
+	const forwardFromChat = message?.forward_from_chat;
+	const isManualChannelForward = Boolean(forwardFromChat && message?.forward_origin?.type === 'channel' && !message?.is_automatic_forward);
+	if (isManualChannelForward) {
+		const channelTitle = forwardFromChat.title || forwardFromChat.username || String(forwardFromChat.id);
+		return {
+			isAd: true,
+			score: 99,
+			hits: [`手动转发频道帖:频道 ${channelTitle}${forwardFromChat.username ? ' @' + forwardFromChat.username : ''}`],
+			strong: '手动转发频道帖(频道引流广告)',
+			source: '频道转发',
+		};
+	}
+	if (!AD_STRICT_MODE && !urlsAllWhite) {
+		// 检测正文中的频道链接（t.me/xxx 或 @xxx）+ 诱导词
+		const hasChannelLink = /(?:t\.me\/[a-zA-Z0-9_]+|@[a-zA-Z0-9_]{4,})\b/i.test(fullText);
+		const hasChannelLure = /(进群|加群|频道|关注|订阅|领取|免费|福利|资源|入群|扫码进|点击加入|看更多|完整版在)/i.test(fullText);
+		if (hasChannelLink && hasChannelLure) {
+			return {
+				isAd: true,
+				score: 99,
+				hits: [`频道链接+诱导词:正文含频道链接且出现引流诱导词`],
+				strong: '频道链接引流广告',
+				source: '正文',
 			};
 		}
 	}
