@@ -441,6 +441,11 @@ export default {
 		console.log('[Cron] 定时任务触发:', new Date().toISOString(), 'cron:', event.cron);
 		await applyRuntimeConfig(loadRequiredConfig(env));
 		await mergeDynamicGroupsFromD1(env);
+		const enabled = await getAutoCleanEnabled(env);
+		if (!enabled) {
+			console.log('[Cron] 自动清理已关闭，跳过');
+			return;
+		}
 		const result = await cleanDeletedAccountsFromBlacklist(env);
 		console.log('[Cron] 清理完成:', JSON.stringify(result));
 	},
@@ -8982,6 +8987,52 @@ async function finalizeAdVote(env, state, result, decisionBy = null) {
 
 async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 	const data = String(callbackQuery?.data || '');
+
+	// 自动销号清理开关（内联按钮）
+	if (data.startsWith('clean_switch:')) {
+		const action = data.slice('clean_switch:'.length);
+		const voterId = String(callbackQuery?.from?.id || '');
+		if (!isPrimaryOwner(voterId)) {
+			await answerAdVoteCallback(callbackQuery?.id, '仅限第一主人操作', true);
+			return;
+		}
+		const toggle = action === 'on';
+		await setAutoCleanEnabled(env, toggle);
+		const statusText = toggle ? '✅ 已开启' : '❌ 已关闭';
+		const statusEmoji = toggle ? '🟢' : '🔴';
+		await answerAdVoteCallback(callbackQuery?.id, `自动销号清理已${toggle ? '开启' : '关闭'}`, false);
+		// 编辑消息更新按钮状态
+		try {
+			const chatId = callbackQuery?.message?.chat?.id;
+			const messageId = callbackQuery?.message?.message_id;
+			if (chatId && messageId) {
+				await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						chat_id: chatId,
+						message_id: messageId,
+						text:
+							`🔧 <b>自动销号清理</b>\n\n` +
+							`状态: ${statusEmoji} ${statusText}\n\n` +
+							`每天凌晨 4 点自动检测黑名单中的销号用户并移除。\n` +
+							`当前状态: <b>${toggle ? '开启' : '关闭'}</b>`,
+						parse_mode: 'HTML',
+						reply_markup: {
+							inline_keyboard: [[
+								{ text: '✅ 开启', callback_data: 'clean_switch:on' },
+								{ text: '❌ 关闭', callback_data: 'clean_switch:off' },
+							]],
+						},
+					}),
+				});
+			}
+		} catch (error) {
+			console.error('[clean_switch] 编辑消息失败:', error);
+		}
+		return;
+	}
+
 	if (!data.startsWith(AD_VOTE_BUTTON_PREFIX)) return;
 	const match = data.slice(AD_VOTE_BUTTON_PREFIX.length).match(/^([ARC]):(.+)$/);
 	if (!match) {
@@ -9475,6 +9526,36 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			result.failedIds.forEach((id) => lines.push(`  • <code>${escapeHtml(id)}</code>`));
 		}
 		await sendTelegramMessage(chatId, lines.join('\n'));
+		return;
+	}
+
+	// /clean_switch：第一主人切换自动销号清理开关（每天凌晨4点定时任务）。
+	// 通过内联按钮菜单操作，无需记忆命令。
+	if (text && /^\/clean_switch(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		if (!isPrimaryOwner(userId)) {
+			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/clean_switch 仅限第一主人使用。');
+			return;
+		}
+		const enabled = await getAutoCleanEnabled(env);
+		const toggle = !enabled;
+		await setAutoCleanEnabled(env, toggle);
+		const statusText = toggle ? '✅ 已开启' : '❌ 已关闭';
+		const statusEmoji = toggle ? '🟢' : '🔴';
+		await sendTelegramMessage(chatId,
+			`🔧 <b>自动销号清理</b>\n\n` +
+			`状态: ${statusEmoji} ${statusText}\n\n` +
+			`每天凌晨 4 点自动检测黑名单中的销号用户并移除。\n` +
+			`当前状态: <b>${toggle ? '开启' : '关闭'}</b>`,
+			{
+				reply_markup: {
+					inline_keyboard: [[
+						{ text: '✅ 开启', callback_data: 'clean_switch:on' },
+						{ text: '❌ 关闭', callback_data: 'clean_switch:off' },
+					]],
+				},
+			}
+		);
 		return;
 	}
 
@@ -12080,6 +12161,61 @@ async function setAdTestMode(env, ownerId, enabled) {
 		return true;
 	} catch (error) {
 		console.error('[ad_test] 写入状态失败:', error.message);
+		return false;
+	}
+}
+
+// ===== 自动销号清理开关 =====
+// 全局开关（不区分 owner），存储在 auto_clean_settings 表中。
+// Cron 触发器每次执行前先读取此开关，关闭则跳过。
+
+const AUTO_CLEAN_TABLE = 'auto_clean_settings';
+
+async function ensureAutoCleanTable(env) {
+	if (!env.DB) return false;
+	try {
+		await env.DB.exec(
+			`CREATE TABLE IF NOT EXISTS ${AUTO_CLEAN_TABLE} (
+				key TEXT PRIMARY KEY,
+				value INTEGER NOT NULL DEFAULT 1,
+				updated_at INTEGER NOT NULL DEFAULT 0
+			)`
+		);
+		return true;
+	} catch (error) {
+		console.error('[auto_clean] 建表失败:', error.message);
+		return false;
+	}
+}
+
+async function getAutoCleanEnabled(env) {
+	if (!env.DB) return false;
+	try {
+		await ensureAutoCleanTable(env);
+		const row = await env.DB.prepare(
+			`SELECT value FROM ${AUTO_CLEAN_TABLE} WHERE key = 'enabled'`
+		).first();
+		// 默认开启（1），只有显式设为 0 才关闭
+		return row ? Boolean(row.value) : true;
+	} catch (error) {
+		console.error('[auto_clean] 读取开关失败:', error.message);
+		return true; // 默认开启
+	}
+}
+
+async function setAutoCleanEnabled(env, enabled) {
+	if (!env.DB) return false;
+	try {
+		await ensureAutoCleanTable(env);
+		const now = Math.floor(Date.now() / 1000);
+		await env.DB.prepare(
+			`INSERT INTO ${AUTO_CLEAN_TABLE} (key, value, updated_at)
+			 VALUES ('enabled', ?, ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+		).bind(enabled ? 1 : 0, now).run();
+		return true;
+	} catch (error) {
+		console.error('[auto_clean] 写入开关失败:', error.message);
 		return false;
 	}
 }
