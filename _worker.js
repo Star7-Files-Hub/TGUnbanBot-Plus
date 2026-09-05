@@ -9548,12 +9548,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			`每天凌晨 4 点自动检测黑名单中的销号用户并移除。\n` +
 			`当前状态: <b>${toggle ? '开启' : '关闭'}</b>`,
 			{
-				reply_markup: {
-					inline_keyboard: [[
-						{ text: '✅ 开启', callback_data: 'clean_switch:on' },
-						{ text: '❌ 关闭', callback_data: 'clean_switch:off' },
-					]],
-				},
+				inline_keyboard: [[
+					{ text: '✅ 开启', callback_data: 'clean_switch:on' },
+					{ text: '❌ 关闭', callback_data: 'clean_switch:off' },
+				]],
 			}
 		);
 		return;
