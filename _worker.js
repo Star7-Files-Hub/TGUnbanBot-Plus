@@ -9350,6 +9350,41 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 	}
 
+	// ===== /ad_test 广告检测测试模式 =====
+	// 主人转发或发送消息到私聊，机器人回复是否命中广告判据，不做任何数据库写入。
+	// 命令：/ad_test on | /ad_test off | /ad_test status
+	if (text && /^\/ad_test(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		if (!isPrimaryOwner(userId)) {
+			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/ad_test 仅限第一主人使用。');
+			return;
+		}
+		const argMatch = text.trim().match(/^\/ad_test(?:@[^\s]+)?\s*(\S*)/i);
+		const arg = argMatch ? argMatch[1].trim().toLowerCase() : 'status';
+		if (arg === 'on') {
+			await setAdTestMode(env, userId, true);
+			await sendTelegramMessage(chatId, '✅ <b>广告检测测试模式已开启</b>\n\n转发或发送消息到私聊，机器人会回复是否命中广告判据及依据。\n不会写入任何数据库（不加黑、不学习、不缓存）。\n发送 <code>/ad_test off</code> 关闭。');
+			return;
+		}
+		if (arg === 'off') {
+			await setAdTestMode(env, userId, false);
+			await sendTelegramMessage(chatId, '✅ <b>广告检测测试模式已关闭</b>');
+			return;
+		}
+		const enabled = await getAdTestMode(env, userId);
+		await sendTelegramMessage(chatId, `ℹ️ <b>广告检测测试模式</b>: ${enabled ? '✅ 已开启' : '❌ 已关闭'}\n\n用法：\n/ad_test on  — 开启\n/ad_test off — 关闭\n/ad_test 或 /ad_test status — 查看状态`);
+		return;
+	}
+
+	// 测试模式下的广告检测分析（不写入数据库）
+	if (message.chat.type === 'private' && message.from && !message.from.is_bot) {
+		const testMode = await getAdTestMode(env, userId);
+		if (testMode && !isTelegramServiceMessage(message) && !isTelegramSlashCommand(text)) {
+			await runAdTestAnalysis(message, env, ctx);
+			return;
+		}
+	}
+
 	// 广告自动检测：普通成员发的疑似广告 → 删消息 + 加黑 + 全群踢 + 通知主人
 	// 在黑名单拦截之后、命令分发之前；管理员豁免
 	// 服务消息（置顶/入群/改群名等）不是用户发言，不参与广告判定 ——
@@ -11827,6 +11862,149 @@ async function handleBanlist(chatId) {
 	const result = parseBanlistHTML(html, chatId);
 
 	return JSON.stringify(result);
+}
+
+// ===== /ad_test 广告检测测试模式 =====
+// 测试模式状态存储在 D1 的 ad_test_mode 表中（key=ownerId, value=on/off）。
+// 开启后，主人在私聊中转发/发送消息，机器人回复是否命中广告判据及依据。
+// 整个测试流程不写入任何数据库（不加黑、不学习样本、不缓存消息）。
+
+const AD_TEST_MODE_TABLE = 'ad_test_mode';
+
+// 确保测试模式表存在（幂等）
+async function ensureAdTestModeTable(env) {
+	if (!env.DB) return false;
+	try {
+		await env.DB.exec(
+			`CREATE TABLE IF NOT EXISTS ${AD_TEST_MODE_TABLE} (
+				owner_id TEXT PRIMARY KEY,
+				enabled INTEGER NOT NULL DEFAULT 0,
+				updated_at INTEGER NOT NULL DEFAULT 0
+			)`
+		);
+		return true;
+	} catch (error) {
+		console.error('[ad_test] 建表失败:', error.message);
+		return false;
+	}
+}
+
+async function getAdTestMode(env, ownerId) {
+	if (!env.DB) return false;
+	try {
+		await ensureAdTestModeTable(env);
+		const row = await env.DB.prepare(
+			`SELECT enabled FROM ${AD_TEST_MODE_TABLE} WHERE owner_id = ?`
+		).bind(String(ownerId)).first();
+		return Boolean(row?.enabled);
+	} catch (error) {
+		console.error('[ad_test] 读取状态失败:', error.message);
+		return false;
+	}
+}
+
+async function setAdTestMode(env, ownerId, enabled) {
+	if (!env.DB) return false;
+	try {
+		await ensureAdTestModeTable(env);
+		const now = Math.floor(Date.now() / 1000);
+		await env.DB.prepare(
+			`INSERT INTO ${AD_TEST_MODE_TABLE} (owner_id, enabled, updated_at)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT(owner_id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at`
+		).bind(String(ownerId), enabled ? 1 : 0, now).run();
+		return true;
+	} catch (error) {
+		console.error('[ad_test] 写入状态失败:', error.message);
+		return false;
+	}
+}
+
+// 分析消息是否命中广告判据（只分析，不写入数据库）
+async function runAdTestAnalysis(message, env, ctx) {
+	const chatId = message.chat.id;
+	const lines = ['🧪 <b>广告检测测试</b>', ''];
+
+	// 收集消息载体信息
+	const text = message.text || message.caption || '';
+	const hasForward = Boolean(message?.forward_origin || message?.forward_from || message?.forward_from_chat);
+	const hasContact = Boolean(message.contact);
+	const hasReply = Boolean(message.reply_to_message);
+
+	lines.push(`📝 消息类型:${hasForward ? ' 转发消息' : hasContact ? ' 名片' : hasReply ? ' 引用回复' : ' 普通消息'}`);
+	if (text) lines.push(`📄 正文长度:${text.length} 字符`);
+	lines.push('');
+
+	// 运行 detectAd（内部会调用 detectAdLegacy 和 detectQuotedAdEvidence）
+	// 注意：这里只用于分析，结果不会触发封禁/学习/缓存
+	await Promise.all([
+		mergeAdKeywordsFromD1(env),
+		mergeAdSamplesFromD1(env)
+	]).catch(() => {});
+
+	const adResult = await detectAd(message, env);
+
+	// 汇总检测结果
+	if (adResult.isAd) {
+		lines.push('🔴 <b>结果：命中广告判据</b>');
+		lines.push('');
+		if (adResult.strong) lines.push(`⚡ 强特征:${escapeHtml(adResult.strong)}`);
+		lines.push(`📊 评分:${adResult.score}`);
+		if (adResult.source) lines.push(`📍 命中来源:${escapeHtml(adResult.source)}`);
+		if (adResult.hits && adResult.hits.length > 0) {
+			lines.push('');
+			lines.push('<b>命中依据:</b>');
+			adResult.hits.forEach((hit, i) => lines.push(`  ${i + 1}. ${escapeHtml(hit)}`));
+		}
+	} else {
+		lines.push('🟢 <b>结果：未命中广告判据</b>');
+		lines.push('');
+		lines.push(`📊 评分:${adResult.score}${adResult.score > 0 ? '（未达阈值 ' + AD_SCORE_THRESHOLD + '）' : ''}`);
+		if (adResult.hits && adResult.hits.length > 0) {
+			lines.push('');
+			lines.push('<b>部分命中（未达阈值）:</b>');
+			adResult.hits.forEach((hit, i) => lines.push(`  ${i + 1}. ${escapeHtml(hit)}`));
+		}
+	}
+
+	// 引用内容检测
+	if (adResult.quoteAd) {
+		lines.push('');
+		lines.push('💬 <b>引用内容检测:</b>');
+		lines.push(`   ⚡ 强特征:${escapeHtml(adResult.quoteAd.strong || '无')}`);
+		lines.push(`   📊 评分:${adResult.quoteAd.score || 0}`);
+		if (adResult.quoteAd.hits && adResult.quoteAd.hits.length > 0) {
+			adResult.quoteAd.hits.forEach((hit, i) => lines.push(`   ${i + 1}. ${escapeHtml(hit)}`));
+		}
+	}
+
+	// 资料卡检测
+	if (adResult.identityEvidence && adResult.identityEvidence.length > 0) {
+		lines.push('');
+		lines.push('👤 <b>资料卡检测:</b>');
+		adResult.identityEvidence.forEach((hit, i) => lines.push(`  ${i + 1}. ${escapeHtml(hit)}`));
+	}
+
+	// 补充信息
+	lines.push('');
+	lines.push('ℹ️ <b>补充信息:</b>');
+	lines.push(`   • 自动广告检测:${AD_FILTER_ENABLED ? '✅ 已开启' : '❌ 已关闭'}`);
+	lines.push(`   • 严格模式:${AD_STRICT_MODE ? '✅ 已开启' : '❌ 已关闭'}`);
+	lines.push(`   • 词库数量:${AD_KEYWORDS.length + AD_KEYWORDS_FINANCE.length + AD_KEYWORDS_PORN.length + AD_KEYWORDS_SPAM.length + AD_KEYWORDS_FRAUD.length} 个`);
+	lines.push(`   • 样本数量:${AD_SAMPLE_FINGERPRINTS.length} 条`);
+	lines.push('');
+
+	// 预览原始内容（截断）
+	if (text) {
+		const preview = text.slice(0, 200);
+		lines.push('📋 <b>正文预览:</b>');
+		lines.push(`<code>${escapeHtml(preview)}${text.length > 200 ? '...' : ''}</code>`);
+	}
+
+	lines.push('');
+	lines.push('ℹ️ 测试模式不会写入任何数据库（不加黑、不学习、不缓存）。');
+
+	await sendTelegramMessage(chatId, lines.join('\n'));
 }
 
 // 通过群组ID获取群组信息
