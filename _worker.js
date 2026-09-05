@@ -436,6 +436,15 @@ export default {
 		return new Response('Method Not Allowed', { status: 405 });
 	},
 
+	// Cloudflare Cron Trigger：每天凌晨 4 点自动清理销号用户
+	async scheduled(event, env, ctx) {
+		console.log('[Cron] 定时任务触发:', new Date().toISOString(), 'cron:', event.cron);
+		await applyRuntimeConfig(loadRequiredConfig(env));
+		await mergeDynamicGroupsFromD1(env);
+		const result = await cleanDeletedAccountsFromBlacklist(env);
+		console.log('[Cron] 清理完成:', JSON.stringify(result));
+	},
+
 	async queue(batch, env, ctx) {
 		try {
 			applyRuntimeConfig(loadRequiredConfig(env));
@@ -1850,6 +1859,118 @@ async function removeFromBlacklistCore(userId, env, options = {}) {
 // 从黑名单中移除用户（薄包装）
 async function removeFromBlacklist(userId, env, options = {}) {
 	const result = await removeFromBlacklistCore(userId, env, options);
+	return result;
+}
+
+// ===== 销号清理功能 =====
+// 通过 getChat 判断 Telegram 用户是否已销号。
+// 返回: { status: 'alive'|'deleted'|'error', details?: string }
+// - alive: 用户存在
+// - deleted: 用户已销号（user is deleted / account was deactivated）
+// - error: 查询失败（网络问题、权限不足等）
+async function checkTelegramUserExists(env, userId) {
+	const id = String(userId ?? '').trim();
+	if (!id) return { status: 'error', details: 'TGID 为空' };
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: id }),
+		});
+		const data = await response.json();
+		if (response.ok && data?.ok && data.result) {
+			return { status: 'alive', details: data.result.first_name || data.result.title || data.result.username || '' };
+		}
+		// 解析错误信息判断是否销号
+		const desc = String(data?.description || '').toLowerCase();
+		const errorCode = data?.error_code;
+		// 400 + "user is deleted" / "account was deactivated" / "USER_DEACTIVAT" → 已销号
+		if (errorCode === 400 && (desc.includes('user is deleted') || desc.includes('account was deactivated') || desc.includes('user_deactivat'))) {
+			return { status: 'deleted', details: data.description || 'user is deleted' };
+		}
+		// 400 + "chat not found" 可能是销号或从未存在
+		if (errorCode === 400 && desc.includes('chat not found')) {
+			return { status: 'deleted', details: data.description || 'chat not found' };
+		}
+		// 403 + "bot was blocked by the user" → 用户存在但拉黑了 bot
+		if (errorCode === 403 && desc.includes('bot was blocked')) {
+			return { status: 'alive', details: 'bot was blocked (user exists)' };
+		}
+		// 其他错误（网络、限流等）
+		return { status: 'error', details: data.description || `HTTP ${response.status}` };
+	} catch (error) {
+		return { status: 'error', details: error.message || 'fetch failed' };
+	}
+}
+
+// 清理黑名单中已销号的 Telegram 账号。
+// 逐条调 getChat 判断是否已销号，命中则从黑名单删除。
+// 限流：每条之间间隔 200ms，避免 Telegram API 限流（30 次/秒）。
+// 返回统计结果供调用方展示。
+async function cleanDeletedAccountsFromBlacklist(env) {
+	const result = {
+		total: 0,
+		cleaned: 0,
+		failed: 0,
+		alive: 0,
+		cleanedIds: [],
+		failedIds: [],
+	};
+
+	if (!env.DB) {
+		console.error('[销号清理] 未绑定 D1');
+		return result;
+	}
+
+	// 获取全部黑名单用户（只取 id）
+	let blacklist;
+	try {
+		await ensureD1Table(env);
+		const { results } = await env.DB.prepare('SELECT id FROM blacklist ORDER BY id ASC').all();
+		blacklist = (results || []).map((r) => String(r.id)).filter(Boolean);
+	} catch (error) {
+		console.error('[销号清理] 读取黑名单失败:', error.message);
+		return result;
+	}
+
+	result.total = blacklist.length;
+	if (blacklist.length === 0) {
+		console.log('[销号清理] 黑名单为空，无需清理');
+		return result;
+	}
+
+	console.log(`[销号清理] 开始检测 ${blacklist.length} 个黑名单用户`);
+
+	// 逐条检测，带限流
+	for (const id of blacklist) {
+		const check = await checkTelegramUserExists(env, id);
+		if (check.status === 'deleted') {
+			// 已销号，从黑名单删除
+			try {
+				await env.DB.prepare('DELETE FROM blacklist WHERE id = ?').bind(id).run();
+				result.cleaned++;
+				result.cleanedIds.push(id);
+				console.log(`[销号清理] 已清理销号用户: ${id} (${check.details})`);
+			} catch (error) {
+				result.failed++;
+				result.failedIds.push(id);
+				console.error(`[销号清理] 删除失败: ${id} - ${error.message}`);
+			}
+		} else if (check.status === 'alive') {
+			result.alive++;
+			console.log(`[销号清理] 用户存活: ${id} (${check.details})`);
+		} else {
+			// 查询失败，不删除，记录到 failedIds
+			result.failed++;
+			result.failedIds.push(id);
+			console.error(`[销号清理] 检测失败: ${id} - ${check.details}`);
+		}
+
+		// 限流：每条之间间隔 200ms
+		await new Promise((resolve) => setTimeout(resolve, 200));
+	}
+
+	console.log(`[销号清理] 完成: 总计 ${result.total}, 清理 ${result.cleaned}, 失败 ${result.failed}, 存活 ${result.alive}`);
 	return result;
 }
 
@@ -9311,6 +9432,49 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			flashText: result.ok ? '✅ /ad 白名单已更新' : '❌ /ad 白名单更新失败',
 			detailText: detail,
 		});
+		return;
+	}
+
+	// /clean_blacklist：第一主人手动清理黑名单中已销号的 Telegram 账号。
+	// 逐条调 getChat 判断是否已销号，命中则从黑名单删除。限私聊，避免群内触发耗时操作。
+	if (text && /^\/clean_blacklist(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		if (!isPrimaryOwner(userId)) {
+			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/clean_blacklist 仅限第一主人使用。');
+			return;
+		}
+		if (isInGroup) {
+			await sendAuthorizedCommandResult(message, ctx, {
+				flashText: 'ℹ️ 请私聊操作',
+				detailText: '⚠️ /clean_blacklist 是耗时操作，仅限私聊使用。',
+			});
+			return;
+		}
+		if (!env.DB) {
+			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间。');
+			return;
+		}
+		await sendTelegramMessage(chatId, '⏳ 开始检测黑名单中的销号用户，请稍候...');
+		const result = await cleanDeletedAccountsFromBlacklist(env);
+		const lines = [
+			'🧹 <b>销号清理完成</b>',
+			'',
+			`📊 检测总数:${result.total}`,
+			`✅ 已清理销号:${result.cleaned}`,
+			`❌ 检测失败:${result.failed}`,
+			`📋 正常存活:${result.alive}`,
+		];
+		if (result.cleanedIds.length > 0) {
+			lines.push('');
+			lines.push('<b>已清理的销号用户:</b>');
+			result.cleanedIds.forEach((id) => lines.push(`  • <code>${escapeHtml(id)}</code>`));
+		}
+		if (result.failedIds.length > 0) {
+			lines.push('');
+			lines.push('<b>检测失败（可能已销号或网络问题）:</b>');
+			result.failedIds.forEach((id) => lines.push(`  • <code>${escapeHtml(id)}</code>`));
+		}
+		await sendTelegramMessage(chatId, lines.join('\n'));
 		return;
 	}
 
