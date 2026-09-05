@@ -1254,6 +1254,9 @@ async function ensureD1Table(env) {
 				// 动态群组：第一主人用 /addgroup 加进来的群。与 GROUP_ID 环境变量彻底分离
 				// （Worker 无法写自己的环境变量），合并时环境变量群永远在前，主群身份不受影响。
 				['dynamic_groups', 'CREATE TABLE IF NOT EXISTS dynamic_groups (chat_id TEXT PRIMARY KEY, title TEXT, added_by TEXT NOT NULL, added_at TEXT NOT NULL, note TEXT);'],
+				// 额外管理员：第一主人通过 /add_mod 添加的非管理员用户，可使用 /ban 和 /spam。
+				// 不需要是 Telegram 群管理员，只需是本项目认可的额外管理员。
+				['moderation_admins', 'CREATE TABLE IF NOT EXISTS moderation_admins (user_id TEXT PRIMARY KEY, added_by TEXT NOT NULL, added_at TEXT NOT NULL, note TEXT);'],
 			];
 			for (const [label, sql] of tableStatements) {
 				await runD1SchemaStatement(env, label, sql);
@@ -2463,10 +2466,13 @@ async function checkIfUserIsAdminInGroup(userId, groupId) {
 
 // /ban、/spam 专用权限：
 // - 主人/副主人/超级管理员保持原权限；
+// - 额外管理员（/add_mod 添加）可使用 /ban 和 /spam；
 // - 匿名管理员仅能在其当前配置群使用；
 // - 普通 Telegram 管理员必须是当前发令群的管理员，私聊不放行。
-async function checkMessageOperatorCanBan(message, userId) {
+async function checkMessageOperatorCanBan(message, userId, env = null) {
 	if (isPrivilegedManager(userId)) return true;
+	// 额外管理员（/add_mod 添加的非管理员用户）
+	if (env && (await isModerationAdmin(env, userId))) return true;
 	if (isAnonymousAdminMessage(message)) {
 		console.log(`[当前群鉴权] 匿名管理员在群 ${message.chat.id} 使用封禁命令 ✅`);
 		return true;
@@ -6327,6 +6333,69 @@ async function setAdVoteAllowlist(env, userId, enabled, byUser) {
 	}
 }
 
+// ===== 额外管理员（/ban /spam 权限）=====
+// 第一主人通过 /add_mod 添加的非管理员用户，可使用 /ban 和 /spam。
+// 不需要是 Telegram 群管理员，只需是本项目认可的额外管理员。
+
+async function isModerationAdmin(env, userId) {
+	if (!env.DB) return false;
+	const id = String(userId || '').trim();
+	if (!id) return false;
+	try {
+		await ensureD1Table(env);
+		const row = await env.DB.prepare('SELECT user_id FROM moderation_admins WHERE user_id = ?').bind(id).first();
+		return Boolean(row?.user_id);
+	} catch (error) {
+		console.error('[mod_admin] 查询失败:', error.message);
+		return false;
+	}
+}
+
+async function addModerationAdmin(env, userId, byUser, note = '') {
+	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
+	const id = String(userId || '').trim();
+	if (!/^\d+$/.test(id)) return { ok: false, error: 'TGID 必须是纯数字' };
+	try {
+		await ensureD1Table(env);
+		const now = new Date().toISOString();
+		await env.DB.prepare('INSERT OR REPLACE INTO moderation_admins (user_id, added_by, added_at, note) VALUES (?, ?, ?, ?)')
+			.bind(id, String(byUser || ''), now, String(note || ''))
+			.run();
+		return { ok: true };
+	} catch (error) {
+		console.error('[mod_admin] 添加失败:', error.message);
+		return { ok: false, error: error.message || String(error) };
+	}
+}
+
+async function removeModerationAdmin(env, userId) {
+	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
+	const id = String(userId || '').trim();
+	if (!id) return { ok: false, error: 'TGID 不能为空' };
+	try {
+		await ensureD1Table(env);
+		const result = await env.DB.prepare('DELETE FROM moderation_admins WHERE user_id = ?').bind(id).run();
+		const changed = d1MutationChanges(result);
+		if (!changed) return { ok: false, error: '该用户不在额外管理员列表中' };
+		return { ok: true };
+	} catch (error) {
+		console.error('[mod_admin] 移除失败:', error.message);
+		return { ok: false, error: error.message || String(error) };
+	}
+}
+
+async function listModerationAdmins(env) {
+	if (!env.DB) return [];
+	try {
+		await ensureD1Table(env);
+		const { results } = await env.DB.prepare('SELECT user_id, added_by, added_at, note FROM moderation_admins ORDER BY added_at ASC').all();
+		return results || [];
+	} catch (error) {
+		console.error('[mod_admin] 列表失败:', error.message);
+		return [];
+	}
+}
+
 
 // ===== /recent 冻结快照(供 /learnlast 按固定序号引用,根治序号漂移)=====
 // /recent 把当时的疑似广告列表(已按上下文过滤+排序)冻结写入 D1;
@@ -9486,6 +9555,57 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
+	// /add_mod、/del_mod：第一主人管理额外管理员（可使用 /ban 和 /spam 的非管理员用户）。
+	if (text && /^\/(add_mod|del_mod|list_mod)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		if (!isPrimaryOwner(userId)) {
+			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n额外管理员管理仅限第一主人。');
+			return;
+		}
+		if (!env.DB) {
+			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间。');
+			return;
+		}
+		const head = text.trim().match(/^\/(add_mod|del_mod|list_mod)(?:@[^\s]+)?/i)[1].toLowerCase();
+
+		// /list_mod：列出全部额外管理员
+		if (head === '/list_mod') {
+			const admins = await listModerationAdmins(env);
+			const lines = ['🛡️ <b>额外管理员列表</b>（可使用 /ban 和 /spam）', ''];
+			if (admins.length === 0) {
+				lines.push('（空）用 <code>/add_mod TGID</code> 添加。');
+			} else {
+				admins.forEach((a, i) => {
+					const note = a.note ? ` — ${escapeHtml(a.note)}` : '';
+					lines.push(`${i + 1}. <code>${escapeHtml(a.user_id)}</code>${note}`);
+				});
+			}
+			await sendTelegramMessage(chatId, lines.join('\n'));
+			return;
+		}
+
+		// /add_mod 和 /del_mod 需要 TGID 参数
+		const match = text.trim().match(/^\/(add_mod|del_mod)(?:@[^\s]+)?\s+(\d+)(?:\s+([\s\S]*))?$/i);
+		if (!match) {
+			await sendTelegramMessage(chatId, '❌ 用法：<code>/add_mod TGID [备注]</code> 或 <code>/del_mod TGID</code>');
+			return;
+		}
+		const targetId = match[2];
+		const note = match[3] ? match[3].trim() : '';
+		if (head === '/add_mod') {
+			const result = await addModerationAdmin(env, targetId, userId, note);
+			await sendTelegramMessage(chatId, result.ok
+				? `✅ 已将 <code>${escapeHtml(targetId)}</code> 添加为额外管理员${note ? '（' + escapeHtml(note) + '）' : ''}。\n可使用 /ban 和 /spam。`
+				: `❌ 添加失败：${escapeHtml(result.error || '未知错误')}`);
+		} else {
+			const result = await removeModerationAdmin(env, targetId);
+			await sendTelegramMessage(chatId, result.ok
+				? `✅ 已将 <code>${escapeHtml(targetId)}</code> 从额外管理员移除。`
+				: `❌ 移除失败：${escapeHtml(result.error || '未知错误')}`);
+		}
+		return;
+	}
+
 	// /clean_blacklist：第一主人手动清理黑名单中已销号的 Telegram 账号。
 	// 逐条调 getChat 判断是否已销号，命中则从黑名单删除。限私聊，避免群内触发耗时操作。
 	if (text && /^\/clean_blacklist(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
@@ -9651,7 +9771,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 仅真人可通过 /spam 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
 		if (isBotOperator(message.from)) return;
 
-		const isAdmin = await checkMessageOperatorCanBan(message, userId);
+		const isAdmin = await checkMessageOperatorCanBan(message, userId, env);
 		if (!isAdmin) {
 			if (!isInGroup) {
 				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /spam；私聊仅限主人、副主人或超级管理员。');
@@ -10882,7 +11002,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (isBotOperator(message.from)) return;
 
 		// 普通管理员必须是当前群管理员；高级管理员保持原有权限。
-		const isAdmin = await checkMessageOperatorCanBan(message, userId);
+		const isAdmin = await checkMessageOperatorCanBan(message, userId, env);
 		if (!isAdmin) {
 			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足
 			if (!isInGroup) {
@@ -11056,7 +11176,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				&& isInGroup
 				&& isConfiguredGroup(chatId)
 				&& !isBotOperator(message.from)
-				&& await checkMessageOperatorCanBan(message, userId);
+				&& await checkMessageOperatorCanBan(message, userId, env);
 			const isAdmin = isPrivileged || isCurrentGroupManager;
 			if (!isAdmin) {
 				if (!isInGroup) {
