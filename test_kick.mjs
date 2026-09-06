@@ -1117,8 +1117,12 @@ console.log('\n[4a] D1 高频路径低请求验证');
 	const steadyMessageSql = db._sql
 		.slice(sqlCountBeforeSteadyMessage)
 		.map((sql) => sql.replace(/\s+/g, ' ').trim());
-	// 稳定态 3 条：动态群组读取（15 秒运行时缓存，同请求只读一次）+ 黑名单主键查询 + 消息缓存写入
-	assert('稳定态普通群消息仅执行 3 条必要 D1 SQL', steadyMessageSql.length === 3, JSON.stringify(steadyMessageSql));
+	// 稳定态 3 条：动态群组读取（15 秒运行时缓存，同请求只读一次）+ 黑名单主键查询 + 消息缓存写入。
+	// 第 4 条来自广告检测层首次触发 ensureAdDetectionTables 时的表存在性探测
+	// （SELECT name FROM sqlite_master WHERE type='table' AND name=? LIMIT 1）。
+	// 该探测按 DB 实例只发生一次：成功则结果进 WeakMap 缓存，失败则进入 60 秒冷却，
+	// 两种情况都不会让后续消息重复探测，因此这里放宽到 4 条而不是逐条累加。
+	assert('稳定态普通群消息不超过 4 条必要 D1 SQL', steadyMessageSql.length <= 4, JSON.stringify(steadyMessageSql));
 	assert('稳定态 D1 SQL = 动态群组读取 + 黑名单主键查询 + 消息缓存写入', (
 		steadyMessageSql.some((sql) => sql.startsWith('INSERT INTO moderation_messages')) &&
 		steadyMessageSql.includes('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ? LIMIT 1') &&
@@ -4582,11 +4586,13 @@ console.log('\n[67] /help OWNER_IDS 专属');
 	];
 	const missingHelpCommands = expectedHelpCommands.filter((command) => !dm?.body?.text?.includes(command));
 	assert('主人 /help → 全部 8 个指令齐全', missingHelpCommands.length === 0, `缺少 ${missingHelpCommands.join(',')}`);
-	// 自动广告治理已整体移除：这批命令必须从 /help 索引里彻底消失，不能只是不可用还在宣传
+	// 旧版自动广告治理命令：这批必须从 /help 索引里彻底消失，不能只是不可用还在宣传。
+	// V2 广告检测方案重新提供了 /addword、/delword、/clearsamples 三个命令并挂进 /help，
+	// 故这三个从本清单移出；其余七个仍未恢复，必须保持不出现。
 	const purgedHelpCommands = [
-		'/importdefault', '/addword', '/delword', '/listwords',
+		'/importdefault', '/listwords',
 		'/learn', '/learnlast', '/recent',
-		'/listsamples', '/delsample', '/clearsamples',
+		'/listsamples', '/delsample',
 	];
 	const stillAdvertised = purgedHelpCommands.filter((command) => dm?.body?.text?.includes(command));
 	assert('主人 /help → 已移除的广告命令不再出现', stillAdvertised.length === 0, `仍在宣传 ${stillAdvertised.join(',')}`);
