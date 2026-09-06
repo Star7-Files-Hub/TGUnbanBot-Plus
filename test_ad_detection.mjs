@@ -1217,6 +1217,22 @@ section('[13] 回复学习端到端（管理层回复即判定，误触发必须
 	await flushWaits();
 	assert('回复学习 positive：回执被自动撤回', countCalls('deleteMessage') > deleteBeforeFlush, '撤回前 ' + deleteBeforeFlush + ' 次，撤回后 ' + countCalls('deleteMessage') + ' 次');
 
+	// 闪屏时长可配置：硬编码默认 5000ms，环境变量 FLASH_MESSAGE_TTL_MS 可覆盖。
+	// 校验规则与其它数值型配置一致 —— 空串/非整数/超范围一律回落默认值，
+	// 特殊点是允许 0（表示永不撤回），所以下界必须是 >= 0 而不是 > 0。
+	assert('闪屏时长：硬编码默认 5000ms', W.loadRequiredConfig(makeEnv()).FLASH_MESSAGE_TTL_MS === 5000, String(W.loadRequiredConfig(makeEnv()).FLASH_MESSAGE_TTL_MS));
+	assert('闪屏时长：环境变量可覆盖', W.loadRequiredConfig(makeEnv({ FLASH_MESSAGE_TTL_MS: '12000' })).FLASH_MESSAGE_TTL_MS === 12000);
+	assert('闪屏时长：允许 0 表示永不撤回', W.loadRequiredConfig(makeEnv({ FLASH_MESSAGE_TTL_MS: '0' })).FLASH_MESSAGE_TTL_MS === 0);
+	assert('闪屏时长：空串回落默认值', W.loadRequiredConfig(makeEnv({ FLASH_MESSAGE_TTL_MS: '' })).FLASH_MESSAGE_TTL_MS === 5000);
+	assert('闪屏时长：非数字回落默认值', W.loadRequiredConfig(makeEnv({ FLASH_MESSAGE_TTL_MS: 'abc' })).FLASH_MESSAGE_TTL_MS === 5000);
+	assert('闪屏时长：负数回落默认值', W.loadRequiredConfig(makeEnv({ FLASH_MESSAGE_TTL_MS: '-1' })).FLASH_MESSAGE_TTL_MS === 5000);
+	assert('闪屏时长：超上限回落默认值', W.loadRequiredConfig(makeEnv({ FLASH_MESSAGE_TTL_MS: '60001' })).FLASH_MESSAGE_TTL_MS === 5000);
+	assert('闪屏时长：上限 60000 有效', W.loadRequiredConfig(makeEnv({ FLASH_MESSAGE_TTL_MS: '60000' })).FLASH_MESSAGE_TTL_MS === 60000);
+	// ttl 为 0 时不能注册撤回任务，否则等于立即删掉刚发出的提示。
+	resetWaits();
+	await W.sendFlashMessage(GROUP_ID, '零时长提示', { waitUntil(p) { pendingWaits.push(Promise.resolve(p).catch(() => {})); } }, 0);
+	assert('闪屏时长：ttl=0 不注册撤回任务', pendingWaits.length === 0, '注册了 ' + pendingWaits.length + ' 个任务');
+
 	// 场景 2：同一管理层回复「不是广告」→ 纠错回滚，解黑 + 全群解封。
 	const p2 = await sendReply(OWNER_ID, '不是广告', 72002);
 	assert('回复学习 negative：已移出黑名单', env13.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '72002'")[0].c === 0, JSON.stringify(env13.DB.query('SELECT id FROM blacklist')));

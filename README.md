@@ -80,7 +80,8 @@
   - **AI 是可选的**：未绑定 Workers AI 时自动降级为「评分 + 指纹」两层，`/adstats` 会明确标注降级状态，不会静默失效。
   - **6 张独立 D1 表自动建立**：与核心 5 表完全隔离，`D1_SCHEMA_VERSION` 不变，现有黑名单数据零改动。建表失败则整层静默跳过并进 60 秒冷却，既有功能不受任何影响。
   - **回复学习**：群管理员回复某条消息说「这是广告」→ 立即判定 + 学入指纹；说「不是广告」→ 解黑 + 全群解封 + 给命中指纹记误报。触发词一律**要求成词**，「学习了」「already done」「封面不错」这类正常回复不会误触发。
-  - **回复学习的群内回执 8 秒自动撤回**：回执含被处置者 TGID 与指纹计数，不该长期公开留在群里。此前 `sendFlashMessage` 的 `ctx` 参数传了 `null`，导致延时撤回任务根本没注册、回执永久残留（`ctx.waitUntil` 是 Workers 注册后台任务的唯一入口，缺了它撤回逻辑直接被跳过）。现已把 `ctx` 从 `handleMessage` 透传到底，并在测试里把 `waitUntil` 从空实现改为**真实收集并执行**后台任务 —— 空实现会让这类「延时动作到底有没有发生」的缺陷永远测不出来。
+  - **回复学习的群内回执自动撤回**：回执含被处置者 TGID 与指纹计数，不该长期公开留在群里。此前 `sendFlashMessage` 的 `ctx` 参数传了 `null`，导致延时撤回任务根本没注册、回执永久残留（`ctx.waitUntil` 是 Workers 注册后台任务的唯一入口，缺了它撤回逻辑直接被跳过）。现已把 `ctx` 从 `handleMessage` 透传到底，并在测试里把 `waitUntil` 从空实现改为**真实收集并执行**后台任务 —— 空实现会让这类「延时动作到底有没有发生」的缺陷永远测不出来。
+- **闪屏时长统一为可配置项**：群内闪屏提示的存活时长从散落在各调用点的硬编码（5000 / 6000 / 8000 三种）收敛为单一常量 `DEFAULT_FLASH_MESSAGE_TTL_MS = 5000`，并支持环境变量 `FLASH_MESSAGE_TTL_MS` 覆盖（0~60000，填 `0` = 永不撤回）。回复学习的回执原为 8 秒，现统一为 5 秒。`/help` 群内引导提示刻意保留 6000ms 显式传值（引导性文案要留够阅读时间，不随全局调短）。校验规则与其它数值型配置一致：空串 / 非整数 / 超范围一律回落默认值 —— 特殊点是允许 `0`，所以下界判 `>= 0` 而非 `> 0`。
 - **`/ad` 群内举报投票**：任一配置群管理员回复消息发 `/ad [原因]` 发起隐藏投票，赞成达 6 票即加黑 + 全群封禁 + 删除被举报消息。第一主人可用 `/add_ad_admin TGID` 授权普通成员发起。投票状态存 D1（保留 7 天），支持改投去重、管理员一票否决、发起人放弃举报。命令消息发出即删除以隐藏痕迹。
 - **频道自动转发帖单点早退（安全加固）**：频道发帖后 Telegram 自动转发进关联讨论群的那条消息带 `is_automatic_forward: true` + `sender_chat`，有正文、非服务消息、`from` 是 Telegram 服务账号，会一路穿过治理逻辑被广告检测当成群成员发言处理。现在在 `handleMessage` **最顶部**单点早退 —— 先于黑名单拦截、消息缓存、广告检测、命令分发的一切逻辑，一律不删、不缓存、不检测、不当命令。
 
@@ -229,7 +230,7 @@
 ├── _worker.js           # Worker 主程序（单文件，含广告检测层）
 ├── wrangler.toml        # Cloudflare Wrangler 配置（D1 / Queue / AI 绑定）
 ├── test_kick.mjs        # 真踢人闭环 + Queue + 命令权限完整回归（838 项）
-├── test_ad_detection.mjs # 广告检测三层判定 + 命令闭环 + 回归（376 项）
+├── test_ad_detection.mjs # 广告检测三层判定 + 命令闭环 + 回归（385 项）
 ├── test_batch.mjs       # 批量预算、D1、重试与消息分块离线测试（108 项）
 ├── test_export.mjs      # 导出接口离线测试（41 项）
 ├── test_leavegroup.mjs  # 退群命令离线测试（35 项）
@@ -237,7 +238,7 @@
 └── LICENSE
 ```
 
-全部测试共 **1398 项**，跑法：
+全部测试共 **1407 项**，跑法：
 
 ```bash
 node test_kick.mjs && node test_ad_detection.mjs && node test_batch.mjs \
@@ -298,6 +299,7 @@ node test_kick.mjs && node test_ad_detection.mjs && node test_batch.mjs \
 | `BLACKLIST_PAGE_LIMIT` | `30` | `/blacklist` 命令单次最多展示多少条（按时间倒序，最新在前）。值必须是正整数。 |
 | `BLACKLIST_REASON_LABELS` | 见源码 | `/blacklist` 列表中"原因"字段的中文映射，**JSON 字符串**形式。例：`{"spam":"群内举报","manual":"管理员添加","manual_ban":"自动同步"}`。非法 JSON 时自动回退默认。 |
 | `GKY_BANLIST_ENDPOINT` | `https://gkybot.gmeow.cc/banlist` | GKY 封禁记录查询后端。改动者请确保返回 HTML 与 `parseBanlistHTML` 兼容。 |
+| `FLASH_MESSAGE_TTL_MS` | `5000` | **群内闪屏提示存活多少毫秒后自动撤回**（0~60000 的整数）。闪屏 = 群内执行授权命令后那条短提示，让操作者立刻看到结果又不长期污染群消息流。调大 = 看得更从容但残留更久；调小 = 群更干净但容易没看清就消失。<br>**填 `0` 表示永不撤回** —— 不推荐，闪屏回执常含 TGID 等不宜长期公开的信息。空串 / 非整数 / 负数 / 超过 60000 一律回落默认值。<br>⚠️ 只影响群内闪屏，不影响私聊详情（私聊消息永久保留）。`/help` 在群内的引导提示刻意固定为 6000ms，不随此项变化。 |
 | `AD_SCORE_THRESHOLD` | `7` | 广告检测**封禁阈值**（1-100）。三层总分达到即加黑 + 全群封禁。调低更激进（误封增多），调高更保守（漏放增多）。 |
 | `AD_OBSERVATION_SCORE` | `5` | 广告检测**观察阈值**（1-100）。总分达到但未及封禁阈值时进入观察窗口，不做任何处置，窗口内再发言分数累加。应低于封禁阈值。 |
 | `AD_OBSERVATION_HOURS` | `24` | 观察窗口保留时长，单位小时（1-720）。 |
@@ -321,6 +323,7 @@ const DEFAULT_SELF_UNBAN_PROMPT = `...`;   // /unban 的自助解封检查清单
 const DEFAULT_SELF_UNBAN_APPROVED = `...`;
 const DEFAULT_MSG_CACHE_SIZE = 50;         // /ban /spam 清扫当前群时的回看上限
 const DEFAULT_BLACKLIST_PAGE_LIMIT = 30;
+const DEFAULT_FLASH_MESSAGE_TTL_MS = 5000; // 群内闪屏几毫秒后自动撤回，0 = 永不撤回
 const DEFAULT_BLACKLIST_REASON_LABELS = { spam: '...', manual: '...', manual_ban: '...' };
 const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
 const DEFAULT_SUPER_ADMINS = ['123456', '789012'];   // 数组形式，多个 TGID
@@ -470,6 +473,7 @@ wrangler secret put GROUP_ID     # 输入：-1001234567890
 | `MSG_CACHE_SIZE` | `50`（多群建议 `200`） | 清扫回看上限，1~500 |
 | `BLACKLIST_REASON_LABELS` | `{"spam":"群内举报"}` | JSON 字符串，自定义原因中文映射 |
 | `GKY_BANLIST_ENDPOINT` | `https://gkybot.gmeow.cc/banlist` | GKY 查询后端，一般不改 |
+| `FLASH_MESSAGE_TTL_MS` | `5000`（想看久点填 `10000`） | 群内闪屏几毫秒后自动撤回，0~60000。填 `0` = 永不撤回（不推荐） |
 
 #### 6.5 广告检测阈值（可选，**建议一个都不填**）
 

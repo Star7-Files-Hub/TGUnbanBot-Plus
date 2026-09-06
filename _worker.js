@@ -90,6 +90,13 @@ const SELF_UNBAN_CONTACT_BUTTON_PREFIX = '💬 ';
 //    环境变量名：BLACKLIST_PAGE_LIMIT （要求是正整数）
 const DEFAULT_BLACKLIST_PAGE_LIMIT = 30;
 
+// 6) 群内闪屏提示存活多少毫秒后自动撤回。
+//    闪屏 = 群内执行授权命令后那条"短提示"，让操作者立刻看到结果又不长期污染群消息流。
+//    调大 = 看得更从容但残留更久；调小 = 群更干净但容易没看清就消失。
+//    设为 0 或负数则永不撤回（不推荐：回执常含 TGID 等不宜长期公开的信息）。
+//    环境变量名：FLASH_MESSAGE_TTL_MS （要求 0~60000 之间的整数，单位毫秒）
+const DEFAULT_FLASH_MESSAGE_TTL_MS = 5000;
+
 // /purge 清扫按“黑名单用户 × 配置群组”分批执行，避免单次 Worker 撞 Cloudflare 子请求限制。
 // 最坏情况下每个组合会调用 getChatMember + banChatMember 两次 Telegram API。
 const PURGE_DEFAULT_PAIR_LIMIT = 20;
@@ -99,7 +106,7 @@ const PURGE_RUN_DELAY_MS = 250;
 const PURGE_DEFAULT_REASONS = ['manual', 'sa', 'spam', 'ad_vote'];
 const TG_MUTATION_RETRY_DELAY_MS = 350;
 
-// 6) /blacklist 列表中"原因"字段的中文映射。
+// 7) /blacklist 列表中"原因"字段的中文映射。
 //    spam 表示 /spam 举报，manual 表示 /ban 手动添加；历史 reason=sa 继续按 /spam 展示。
 //    ad_auto / ad_learn / gky_global 已无写入方（自动广告治理与杀神主动查杀均已移除），
 //    但 D1 里的历史封禁记录仍带这些 reason，标签必须保留，否则旧记录会显示成裸字符串。
@@ -115,11 +122,11 @@ const DEFAULT_BLACKLIST_REASON_LABELS = {
 	gky_global: '🌐 杀神全局封禁库命中（历史记录）'
 };
 
-// 7) GKY 封禁记录查询后端。改动者请确保返回 HTML 与 parseBanlistHTML 兼容。
+// 8) GKY 封禁记录查询后端。改动者请确保返回 HTML 与 parseBanlistHTML 兼容。
 //    环境变量名：GKY_BANLIST_ENDPOINT
 const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
 
-// 8) 超级管理员 TGID 白名单。用于普通管理命令鉴权，支持多个 TGID。
+// 9) 超级管理员 TGID 白名单。用于普通管理命令鉴权，支持多个 TGID。
 //    环境变量名：SUPER_ADMINS （字符串形式，逗号分隔）
 //    例：'123456,789012'
 //    硬编码这里写数组形式，留空数组表示默认无超管。
@@ -128,7 +135,7 @@ const DEFAULT_SUPER_ADMINS = [
 	// '987654321',
 ];
 
-// 9) 主人 TGID(项目所有者),用于"主人审计通知"系统
+// 10) 主人 TGID(项目所有者),用于"主人审计通知"系统
 //    所有管理员/超管在群里使用 /ban /unban /spam 命令、
 //    群内手动 ban/unban 时,主人会收到一份带操作人标记的私聊审计通知
 //    环境变量 OWNER_IDS(逗号分隔,中英文逗号均可):第一个是主人,后续是副主人
@@ -137,7 +144,7 @@ const DEFAULT_SUPER_ADMINS = [
 //    填了主人/副主人ID但账号从未私聊过 bot → 通知会投递失败,Worker 日志可见
 const DEFAULT_OWNER_IDS = [];
 
-// 10) 自助解封成功后，"联系管理员"按钮指向哪个群（主群 = 回家的入口）。
+// 11) 自助解封成功后，"联系管理员"按钮指向哪个群（主群 = 回家的入口）。
 //    留空 → 用 GROUP_IDS[0]（主群），与原行为一致。
 //    填了但该群不在 GROUP_ID 配置里 → 忽略并回落主群 + 打日志，避免把用户导向 bot 管不到的群。
 //    环境变量名：SELF_UNBAN_CONTACT_GROUP
@@ -169,6 +176,9 @@ let SELF_UNBAN_CONTACT_GROUP;
 let BLACKLIST_PAGE_LIMIT;
 let BLACKLIST_REASON_LABELS;
 let GKY_BANLIST_ENDPOINT;
+// 群内闪屏存活毫秒数。给初值是因为 sendFlashMessage 可能在 getConfig 之前被调用
+// （例如配置解析本身报错时的提示），此时不该因为 undefined 退化成"永不撤回"。
+let FLASH_MESSAGE_TTL_MS = DEFAULT_FLASH_MESSAGE_TTL_MS;
 
 // Telegram Bot Token
 let TOKEN;
@@ -207,6 +217,7 @@ function applyRuntimeConfig(config) {
 	SUPER_ADMINS = config.SUPER_ADMINS;
 	OWNER_IDS = config.OWNER_IDS;
 	MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
+	FLASH_MESSAGE_TTL_MS = config.FLASH_MESSAGE_TTL_MS;
 	SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
 	START_WELCOME = config.START_WELCOME;
 	SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
@@ -436,6 +447,15 @@ function loadRequiredConfig(env) {
 		if (Number.isInteger(n) && n > 0 && n <= 500) msgCacheSize = n;
 	}
 
+	// 闪屏存活时长。允许 0（= 永不撤回），所以下界判 n >= 0 而不是 n > 0；
+	// 上界 60 秒：再长就失去"闪屏"语义，且 ctx.waitUntil 挂太久没意义。
+	// 空串/非整数/超范围一律回落默认值，避免误配把闪屏变成永久消息。
+	let flashTtlMs = DEFAULT_FLASH_MESSAGE_TTL_MS;
+	if (env.FLASH_MESSAGE_TTL_MS !== undefined && env.FLASH_MESSAGE_TTL_MS !== null && String(env.FLASH_MESSAGE_TTL_MS).trim() !== '') {
+		const n = parseInt(String(env.FLASH_MESSAGE_TTL_MS).trim(), 10);
+		if (Number.isInteger(n) && n >= 0 && n <= 60000) flashTtlMs = n;
+	}
+
 	return {
 		TOKEN: String(env.TOKEN).trim(),
 		BOT_TOKEN: String(env.BOT_TOKEN).trim(),
@@ -444,6 +464,7 @@ function loadRequiredConfig(env) {
 		SUPER_ADMINS: superAdmins,
 		OWNER_IDS: ownerIds,
 		MSG_CACHE_SIZE: msgCacheSize,
+		FLASH_MESSAGE_TTL_MS: flashTtlMs,
 		SELF_UNBAN_KEYWORD: selfUnbanKeyword,
 		START_WELCOME: startWelcome,
 		SELF_UNBAN_PROMPT: selfUnbanPrompt,
@@ -6673,6 +6694,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		await deleteAuthorizedGroupCommandMessage(message, '/help');
 		// 隐藏指令仅在私聊展开(群内不回,避免其他成员看到指令清单)
 		if (isInGroup) {
+			// 刻意显式传 6000（略长于 FLASH_MESSAGE_TTL_MS 默认值）：这条是引导性提示，
+			// 要留够时间让主人看到"去私聊发 /help"，不随全局时长调短。
 			await sendFlashMessage(chatId, 'ℹ️ 请私聊我发送 /help 查看 OWNER_IDS 专属指令。', ctx, 6000);
 			return;
 		}
@@ -7732,12 +7755,18 @@ async function deleteMessage(chatId, messageId) {
 // 发一条群内闪屏提示，ttlMs 毫秒后自动撤回
 // ctx 是 Cloudflare Worker 的 ExecutionContext；ctx.waitUntil 让 Worker 在响应返回后继续等
 // ctx 缺失（比如离线测试或非 Worker 环境）则退化为只发不撤回
-async function sendFlashMessage(chatId, text, ctx, ttlMs = 5000) {
+// 群内闪屏：发一条短提示，ttlMs 毫秒后自动撤回。
+// ttlMs 省略时用 FLASH_MESSAGE_TTL_MS（硬编码默认 5000，可被环境变量
+// FLASH_MESSAGE_TTL_MS 覆盖）；显式传值的调用点保留自己的时长。
+// ttlMs <= 0 表示永不撤回，此时不注册后台任务。
+// ⚠️ ctx 必须由调用方透传：延时撤回挂在 ctx.waitUntil 上，传 null 会让提示永久留在群里。
+async function sendFlashMessage(chatId, text, ctx, ttlMs) {
+	const ttl = Number.isFinite(Number(ttlMs)) ? Number(ttlMs) : FLASH_MESSAGE_TTL_MS;
 	const result = await sendTelegramMessage(chatId, text);
 	const messageId = result?.result?.message_id;
-	if (!messageId || !ctx || typeof ctx.waitUntil !== 'function') return result;
+	if (!messageId || ttl <= 0 || !ctx || typeof ctx.waitUntil !== 'function') return result;
 	ctx.waitUntil((async () => {
-		await new Promise((r) => setTimeout(r, ttlMs));
+		await new Promise((r) => setTimeout(r, ttl));
 		await deleteMessage(chatId, messageId);
 	})());
 	return result;
@@ -10395,7 +10424,7 @@ async function handleAdReplyLearning(message, env, ctx) {
 	if (!targetUser || targetUser.is_bot) return false;
 	const targetId = String(targetUser.id);
 	if (isPrivilegedManager(targetId)) {
-		await sendFlashMessage(chat.id, '⚠️ 目标是管理层，已忽略该操作。', ctx, 5000);
+		await sendFlashMessage(chat.id, '⚠️ 目标是管理层，已忽略该操作。', ctx);
 		return true;
 	}
 	if (!(await adDetectionReady(env))) return false;
@@ -10462,6 +10491,6 @@ async function handleAdReplyLearning(message, env, ctx) {
 	await sendFlashMessage(chat.id, [
 		'✅ 已按广告处置 ' + targetId,
 		'指纹 +' + (Number(learn?.learned) || 0) + '　封禁 ' + (enforced.banSummary || '未知')
-	].join('\n'), ctx, 8000);
+	].join('\n'), ctx);
 	return true;
 }
