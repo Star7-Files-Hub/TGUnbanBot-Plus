@@ -8268,9 +8268,13 @@ function isAdPlatformDomain(domain) {
 // AI 样本库目标条数与每请求懒加载补齐数量（避免首请求超时与子请求超限）
 const AD_SAMPLE_TARGET_COUNT = 30;
 const AD_SAMPLE_LAZY_BATCH = 8;
-// Workers AI 嵌入模型（768 维中文模型，与样本库维度绑定；换模型必须清空 ad_sample_embeddings）
-const AD_EMBEDDING_MODEL = '@cf/baai/bge-base-zh-v1.5';
-const AD_EMBEDDING_DIMENSION = 768;
+// Workers AI 嵌入模型（与样本库维度绑定；换模型必须清空 ad_sample_embeddings）
+// ⚠️ 必须使用 Cloudflare 目录里真实存在的模型 ID。曾误用 '@cf/baai/bge-base-zh-v1.5' ——
+// 该模型不存在（bge 系列只有 -en- 三个尺寸与 bge-m3，没有 -zh- 变体），
+// 每次调用都被 Ai._parseError 拒绝，第三层长期空转且日志只见栈不见因。
+// bge-m3 是多语言模型，中文广告文本正是其适用场景；1024 维，60000 token 上下文。
+const AD_EMBEDDING_MODEL = '@cf/baai/bge-m3';
+const AD_EMBEDDING_DIMENSION = 1024;
 // 筛查记录保留期（秒）：14 天后剪枝，防止 D1 无限增长
 const AD_SCREENING_RETENTION_SECONDS = 14 * 24 * 3600;
 // /pending 快照有效期 1 小时；/clearsamples 二次确认 60 秒
@@ -9125,7 +9129,14 @@ async function embedAdText(env, text) {
 		if (!Array.isArray(vector) || !vector.length) return null;
 		return vector.map((v) => Number(v) || 0);
 	} catch (error) {
-		console.error('[广告检测] 生成文本向量失败:', error);
+		// 必须打出 name + message：Workers AI 的 Ai._parseError 抛出的 Error 往往 message 为空，
+		// 只 console.error(error) 时日志里只有一串栈、看不到「模型不存在」这类真实原因，
+		// 曾因此把「模型 ID 写错」误判为「AI 限流」。model 也一并打出便于对照目录。
+		console.error('[广告检测] 生成文本向量失败'
+			+ ' model=' + AD_EMBEDDING_MODEL
+			+ ' name=' + (error?.name || '未知')
+			+ ' message=' + (error?.message || '（空）')
+			+ ' textLen=' + source.length);
 		return null;
 	}
 }
@@ -9199,9 +9210,20 @@ async function checkAdAiSimilarity(env, text, options = {}) {
 
 	let best = 0;
 	let bestSample = null;
+	let skippedDim = 0;
 	for (const sample of samples) {
+		// 维度守卫：cosineSimilarity 用 Math.min(a.length, b.length) 截断，维度不一致时会
+		// 静默算出一个无意义的相似度，可能随机越过阈值造成误封。换模型后库里必然残留旧维度向量
+		// （本项目就从 768 维换到 1024 维），所以这里必须显式跳过而不是让它算。
+		if (sample.vector.length !== vector.length) { skippedDim += 1; continue; }
 		const similarity = cosineSimilarity(vector, sample.vector);
 		if (similarity > best) { best = similarity; bestSample = sample.text; }
+	}
+	if (skippedDim > 0) {
+		// 提示运维：换过模型且未清空样本库。/clearsamples 后重新 /warmup 即可恢复第三层。
+		console.warn('[广告检测] 跳过 ' + skippedDim + ' 条维度不匹配的样本向量'
+			+ '（当前模型 ' + AD_EMBEDDING_MODEL + ' 输出 ' + vector.length + ' 维）'
+			+ '，请用 /clearsamples 清空后重新 /warmup 生成。');
 	}
 	return {
 		available: true,
@@ -9246,14 +9268,23 @@ async function clearAdSamples(env) {
 }
 
 async function countAdSamples(env) {
-	if (!(await adDetectionReady(env))) return { total: 0, ready: 0 };
+	if (!(await adDetectionReady(env))) return { total: 0, ready: 0, stale: 0 };
 	try {
 		const total = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_sample_embeddings').first();
 		const ready = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL').first();
-		return { total: Number(total?.c) || 0, ready: Number(ready?.c) || 0 };
+		// stale = 已生成但维度与当前模型不符的向量。换模型后这些向量在判定时会被跳过，
+		// 光看 ready 数会以为第三层没问题，实际可用样本是 ready - stale。
+		const stale = await env.DB.prepare(
+			'SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL AND dimension IS NOT NULL AND dimension != ?'
+		).bind(AD_EMBEDDING_DIMENSION).first();
+		return {
+			total: Number(total?.c) || 0,
+			ready: Number(ready?.c) || 0,
+			stale: Number(stale?.c) || 0
+		};
 	} catch (error) {
 		console.error('[广告检测] 统计语义样本失败:', error);
-		return { total: 0, ready: 0 };
+		return { total: 0, ready: 0, stale: 0 };
 	}
 }
 
@@ -10184,6 +10215,24 @@ async function handleAdWarmupCommand(env, chatId) {
 		return;
 	}
 	const target = Math.min(before.total, AD_SAMPLE_TARGET_COUNT);
+	// 陈旧向量优先处理：维度不符的向量在判定时会被跳过，此时 ready 达标也不代表第三层可用，
+	// 直接报「已就绪」会误导运维。必须先引导清空，否则 /warmup 补不动（embedding 非 NULL 不会被重算）。
+	if (before.stale > 0) {
+		await sendTelegramMessageChunks(chatId, [
+			'⚠️ <b>存在旧模型维度的向量</b>',
+			'',
+			'共 <b>' + before.stale + '</b> 条向量的维度与当前模型不符，判定时会被跳过。',
+			'当前模型：<code>' + AD_EMBEDDING_MODEL + '</code>（' + AD_EMBEDDING_DIMENSION + ' 维）',
+			'',
+			'这些行的 embedding 非空，<code>/warmup</code> 不会重算它们。',
+			'请先发 <code>/clearsamples</code> 清空样本库（会走二次确认），',
+			'再用 <code>/addsample</code> 补回你的自定义样本，然后重新 <code>/warmup</code>。',
+			'',
+			'提示：内置 10 条种子样本会在样本表为空时由下次冷启动的建表检查补回'
+			+ '（同一 isolate 内建表结果被缓存，不会立即重建）。'
+		].join('\n'));
+		return;
+	}
 	if (before.ready >= target) {
 		await sendTelegramMessage(chatId, [
 			'✅ <b>向量已就绪</b>',
@@ -10304,7 +10353,7 @@ async function handleAdStatsCommand(env, chatId) {
 		'封禁阈值：<b>' + config.scoreThreshold + '</b>　观察阈值：<b>' + config.observationScore + '</b>',
 		'观察窗口：' + config.observationHours + ' 小时',
 		'AI 语义阈值：' + config.aiSimilarityThreshold + '　指纹最低置信：' + config.fingerprintMinConfidence,
-		'第三层 AI：' + (config.aiEnabled ? '✅ 已绑定（' + AD_EMBEDDING_MODEL + '）' : '⚠️ 未绑定，降级为评分 + 指纹两层'),
+		'第三层 AI：' + (config.aiEnabled ? '✅ 已绑定（' + AD_EMBEDDING_MODEL + ' / ' + AD_EMBEDDING_DIMENSION + ' 维）' : '⚠️ 未绑定，降级为评分 + 指纹两层'),
 		'',
 		'<b>指纹库</b>　共 <b>' + fpTotal + '</b> 条'
 	];
@@ -10320,6 +10369,10 @@ async function handleAdStatsCommand(env, chatId) {
 		lines.push('　↳ 本次顺带生成 <b>' + warmed + '</b> 条向量' + (samples.ready < Math.min(samples.total, AD_SAMPLE_TARGET_COUNT) ? '，再发几次 /adstats 或 /warmup 可继续补齐' : ''));
 	} else if (config.aiEnabled && samples.ready === 0 && samples.total > 0) {
 		lines.push('　↳ ⚠️ 向量为 0，第三层 AI 实际未生效，请发 /warmup 补齐');
+	}
+	if (samples.stale > 0) {
+		lines.push('　↳ ⚠️ 其中 <b>' + samples.stale + '</b> 条是旧模型维度，判定时会被跳过');
+		lines.push('　　 用 /clearsamples 清空后重新 /warmup 生成');
 	}
 	lines.push('<b>观察窗口</b>　窗口内 <b>' + screeningCount + '</b> 人');
 	lines.push('<b>待确认快照</b>　<b>' + pendingCount + '</b> 条（保留 1 小时）');

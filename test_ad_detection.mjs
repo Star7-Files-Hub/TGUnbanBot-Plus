@@ -231,9 +231,21 @@ function makeFakeAI(mapper) {
 	};
 }
 
+// 假向量维度必须与产品的 AD_EMBEDDING_DIMENSION 一致：checkAdAiSimilarity 有维度守卫，
+// 维度不符的样本会被直接跳过（避免 cosineSimilarity 的 Math.min 截断算出无意义相似度）。
+//
+// ⚠️ 不能写 sandbox.AD_EMBEDDING_DIMENSION —— vm 沙箱里只有【function 声明】会挂到全局对象，
+// 顶层 const 属于词法作用域、读不到（实测为 undefined，会让 new Array(undefined) 产出空数组，
+// 连带十余条 AI 层断言静默失败）。所以这里从源码文本里正则提取，既跟随产品值又不依赖沙箱导出。
+const EMBED_DIM = Number(src.match(/const AD_EMBEDDING_DIMENSION = (\d+)/)?.[1]);
+const EMBED_MODEL = src.match(/const AD_EMBEDDING_MODEL = '([^']+)'/)?.[1] || '';
+if (!Number.isInteger(EMBED_DIM) || EMBED_DIM <= 0) {
+	throw new Error('无法从 _worker.js 解析 AD_EMBEDDING_DIMENSION，测试无法继续');
+}
+
 function adVector(text) {
 	const isAd = /收购|网赚|USDT|代理|洗急|稳宝|辣妞|风口|高价收|日结/.test(text);
-	const base = new Array(768).fill(0);
+	const base = new Array(EMBED_DIM).fill(0);
 	if (isAd) { base[0] = 1; base[1] = 0.5; } else { base[2] = 1; base[3] = 0.5; }
 	return base;
 }
@@ -506,7 +518,7 @@ section('[5] AI 语义层三分支（硬命中 / 软加分 / 未绑定降级）'
 	// 软加分：探针向量 [1, 0.2, 0.8] 与广告向量 [1, 0.5] 的余弦 ≈ 0.759，落在 [0.65, 0.78)。
 	const softProbe = { profile: { firstName: '弱相似探针', bio: '有需要', status: 'member' }, text: '', forwardChat: null };
 	const softMapper = (text) => {
-		const vector = new Array(768).fill(0);
+		const vector = new Array(EMBED_DIM).fill(0);
 		if (text.includes('弱相似探针')) { vector[0] = 1; vector[1] = 0.2; vector[2] = 0.8; return vector; }
 		vector[0] = 1; vector[1] = 0.5;
 		return vector;
@@ -536,6 +548,55 @@ section('[5] AI 语义层三分支（硬命中 / 软加分 / 未绑定降级）'
 	const aiBefore = envShort.AI.calls;
 	await W.evaluateAdSuspect(envShort, { profile: { firstName: '洗急', bio: '', status: 'member' }, text: '', forwardChat: null }, {});
 	assert('语义文本过短时不调用 AI', envShort.AI.calls === aiBefore, `${aiBefore} -> ${envShort.AI.calls}`);
+
+	// 维度守卫：cosineSimilarity 用 Math.min(a.length, b.length) 截断，维度不一致时会
+	// 静默算出一个无意义的相似度，可能随机越过阈值造成误封。换模型后库里必然残留旧维度向量
+	// （本项目从误用的 768 维换到 bge-m3 的 1024 维），必须显式跳过而非让它参与比对。
+	// 模型 ID 必须是 Cloudflare 目录里真实存在的。曾误用 '@cf/baai/bge-base-zh-v1.5'（不存在，
+	// bge 系列只有 -en- 三个尺寸与 bge-m3），线上每次调用都被 Ai._parseError 拒绝，第三层长期空转。
+	assert('嵌入模型是真实存在的 Cloudflare 模型 ID', EMBED_MODEL === '@cf/baai/bge-m3', EMBED_MODEL);
+	assert('嵌入维度与 bge-m3 一致', EMBED_DIM === 1024, String(EMBED_DIM));
+
+	const envDim = makeEnv({ AI: makeFakeAI(adVector) });
+	await W.adDetectionReady(envDim);
+	// 手工塞一条旧维度（768）向量，模拟换模型后的存量数据
+	const staleVec = JSON.stringify(new Array(768).fill(0).map((_, i) => (i === 0 ? 1 : i === 1 ? 0.5 : 0)));
+	envDim.DB.__sqlite.exec(
+		"UPDATE ad_sample_embeddings SET embedding = '" + staleVec + "', dimension = 768 WHERE id = 1"
+	);
+	const dimCounts = await W.countAdSamples(envDim);
+	assert('维度统计：识别出陈旧向量', dimCounts.stale === 1, JSON.stringify(dimCounts));
+
+	// 守卫本身：库里【只】留那条 768 维向量，其余样本行全部删掉，确保没有可比样本。
+	// 若不清掉其余行，checkAdAiSimilarity 会先 topUp 把它们补成 1024 维，
+	// 那些新向量与广告文本本就高度相似 → 相似度 1.0，与守卫是否生效无关，断言等于没测。
+	const envDimOnly = makeEnv({ AI: makeFakeAI(adVector) });
+	await W.adDetectionReady(envDimOnly);
+	envDimOnly.DB.__sqlite.exec('DELETE FROM ad_sample_embeddings WHERE id != 1');
+	envDimOnly.DB.__sqlite.exec(
+		"UPDATE ad_sample_embeddings SET embedding = '" + staleVec + "', dimension = 768 WHERE id = 1"
+	);
+	// 该向量是 [1, 0.5, 0...]，与广告文本向量方向完全一致：未被跳过则相似度 1.0 直接硬命中。
+	const dimSim = await W.checkAdAiSimilarity(envDimOnly, '长期收购网赚账号 USDT 日结', { config: W.loadAdDetectionConfig(envDimOnly) });
+	assert('维度守卫：陈旧向量不参与比对', dimSim.similarity === 0, JSON.stringify(dimSim));
+	assert('维度守卫：跳过后不产生硬命中', dimSim.isMatch !== true, JSON.stringify(dimSim));
+
+	// /adstats 与 /warmup 都必须把陈旧向量摊开说，否则运维只看 ready 数会以为第三层正常
+	const dimStats = await (async () => {
+		resetCalls();
+		await sendUpdate({ message: privateMessage(OWNER_ID, '/adstats') }, envDim);
+		return allSentText();
+	})();
+	assert('/adstats 提示存在旧模型维度向量', dimStats.includes('旧模型维度'), dimStats);
+	assert('/adstats 引导清空重建', dimStats.includes('/clearsamples'), dimStats);
+	const dimWarm = await (async () => {
+		resetCalls();
+		await sendUpdate({ message: privateMessage(OWNER_ID, '/warmup') }, envDim);
+		return allSentText();
+	})();
+	assert('/warmup 遇陈旧向量时先引导清空', dimWarm.includes('存在旧模型维度的向量'), dimWarm);
+	assert('/warmup 说明 embedding 非空不会被重算', dimWarm.includes('不会重算'), dimWarm);
+	assert('/warmup 遇陈旧向量时不误报已就绪', !dimWarm.includes('向量已就绪'), dimWarm);
 }
 
 section('[6] 入群检测端到端（webhook → 封禁 → 快照 → 私聊通知）');
@@ -963,11 +1024,13 @@ section('[10] 状态、白名单与观察窗口复判（adstats / whitelist / re
 	assert('/adstats 统计观察窗口人数', statsText.includes('观察窗口') && statsText.includes('窗口内 <b>0</b> 人'), statsText);
 	assert('/adstats 统计待确认快照', statsText.includes('待确认快照') && statsText.includes('<b>0</b> 条'), statsText);
 	assert('/adstats 统计域名白名单', statsText.includes('域名白名单') && statsText.includes('内置种子'), statsText);
-	const envAi = makeEnv({ AI: { async run() { return { data: [new Array(768).fill(0)] }; } } });
+	const envAi = makeEnv({ AI: { async run() { return { data: [new Array(EMBED_DIM).fill(0)] }; } } });
 	await W.adDetectionReady(envAi);
 	const statsAi = await cmdAll(envAi, '/adstats');
 	assert('/adstats 绑定 AI 时标注已绑定', statsAi.includes('已绑定'), statsAi);
-	assert('/adstats 绑定 AI 时写出模型名', statsAi.includes('bge-base-zh'), statsAi);
+	// 直接比对源码里的模型常量，换模型时这条断言自动跟随，不会像写死 'bge-base-zh' 那样过期
+	assert('/adstats 绑定 AI 时写出模型名', statsAi.includes(EMBED_MODEL), statsAi);
+	assert('/adstats 绑定 AI 时写出维度', statsAi.includes(EMBED_DIM + ' 维'), statsAi);
 	// /adstats 顺带补一批向量。此前 topUpAdSampleEmbeddings 只在第三层内部被调用，
 	// 而第三层要消息通过零成本预筛才会走到、指纹层命中定罪更走不到 —— 于是新部署的向量
 	// 可能长期停在 0，第三层空转。把补齐挂在「主人查状态」这个自然时机上打破死锁。
@@ -977,7 +1040,7 @@ section('[10] 状态、白名单与观察窗口复判（adstats / whitelist / re
 	assert('/adstats 未绑 AI 不提补齐', !statsText.includes('本次顺带生成'), statsText);
 
 	// /warmup：手动补齐入口，反复发直到补满。
-	const envWarm = makeEnv({ AI: { async run() { return { data: [new Array(768).fill(0)] }; } } });
+	const envWarm = makeEnv({ AI: { async run() { return { data: [new Array(EMBED_DIM).fill(0)] }; } } });
 	await W.adDetectionReady(envWarm);
 	const warm1 = await cmdAll(envWarm, '/warmup');
 	const warmReady1 = envWarm.DB.query('SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL')[0].c;
@@ -998,7 +1061,7 @@ section('[10] 状态、白名单与观察窗口复判（adstats / whitelist / re
 	assert('/warmup 未绑 AI 时说明不可用', warmNoAi.includes('未绑定 Workers AI'), warmNoAi);
 	assert('/warmup 未绑 AI 时说明降级为两层', warmNoAi.includes('两层'), warmNoAi);
 	// 样本库为空时引导去 /addsample，而不是报成功
-	const envEmptySample = makeEnv({ AI: { async run() { return { data: [new Array(768).fill(0)] }; } } });
+	const envEmptySample = makeEnv({ AI: { async run() { return { data: [new Array(EMBED_DIM).fill(0)] }; } } });
 	await W.adDetectionReady(envEmptySample);
 	envEmptySample.DB.__sqlite.exec('DELETE FROM ad_sample_embeddings');
 	const warmEmpty = await cmdAll(envEmptySample, '/warmup');
