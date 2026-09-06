@@ -239,13 +239,28 @@ function adVector(text) {
 }
 
 // ---------- webhook 驱动 ----------
+// 收集本次请求里 ctx.waitUntil 收到的后台任务。sendFlashMessage 的延时撤回就挂在这上面，
+// 空实现的 waitUntil 会让「闪屏是否真被撤回」这类断言永远测不到（曾因此漏掉一个
+// ctx 传 null 导致闪屏永久残留的缺陷），所以这里必须真实收集。
+let pendingWaits = [];
+function resetWaits() { pendingWaits = []; }
+// 跑完所有后台任务。sendFlashMessage 内部先 setTimeout(ttlMs) 再删消息，
+// 用假定时器会牵连产品代码，这里直接 await 真实 promise —— 测试里 ttl 最长 8 秒，
+// 故只在需要验证撤回的断言前调用，普通用例不必等。
+async function flushWaits() {
+	const tasks = pendingWaits;
+	pendingWaits = [];
+	await Promise.allSettled(tasks);
+}
 async function sendUpdate(update, env) {
 	const request = new Request('https://example.workers.dev/', {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({ update_id: Math.floor(Math.random() * 1e9), ...update })
 	});
-	const response = await handler.fetch(request, env, { waitUntil() {} });
+	const response = await handler.fetch(request, env, {
+		waitUntil(promise) { pendingWaits.push(Promise.resolve(promise).catch(() => {})); }
+	});
 	return response;
 }
 
@@ -1194,6 +1209,13 @@ section('[13] 回复学习端到端（管理层回复即判定，误触发必须
 	assert('回复学习 positive：指纹记为 manual', env13.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE source = 'manual'")[0].c > 0, JSON.stringify(env13.DB.query('SELECT value, source FROM ad_fingerprints')));
 	assert('回复学习 positive：追加了 reply 来源语义样本', env13.DB.query("SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE source = 'reply'")[0].c === 1, JSON.stringify(env13.DB.query("SELECT source FROM ad_sample_embeddings WHERE source != 'seed'")));
 	assert('回复学习 positive：群内有处置回执', p1.includes('已按广告处置 72002'), p1);
+	// 处置回执必须是「闪屏」：sendFlashMessage 靠 ctx.waitUntil 注册延时撤回，
+	// 调用方给 ctx 传 null 时撤回逻辑根本不会注册，回执会永久留在群里
+	// （内含被处置者 TGID 与内部指纹计数，不该长期公开展示）。这里断言后台任务确实被注册。
+	assert('回复学习 positive：回执注册了延时撤回任务', pendingWaits.length >= 1, '待执行后台任务数 ' + pendingWaits.length);
+	const deleteBeforeFlush = countCalls('deleteMessage');
+	await flushWaits();
+	assert('回复学习 positive：回执被自动撤回', countCalls('deleteMessage') > deleteBeforeFlush, '撤回前 ' + deleteBeforeFlush + ' 次，撤回后 ' + countCalls('deleteMessage') + ' 次');
 
 	// 场景 2：同一管理层回复「不是广告」→ 纠错回滚，解黑 + 全群解封。
 	const p2 = await sendReply(OWNER_ID, '不是广告', 72002);

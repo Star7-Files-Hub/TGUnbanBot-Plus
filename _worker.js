@@ -6124,7 +6124,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		return;
 	}
 
-	if (await handleAdReplyLearning(message, env)) {
+	if (await handleAdReplyLearning(message, env, ctx)) {
 		return;
 	}
 
@@ -10374,7 +10374,9 @@ function classifyAdReplyIntent(text) {
 }
 
 // 返回 true 表示已处理该消息（调用方应立即 return），false 表示放行。
-async function handleAdReplyLearning(message, env) {
+// ctx 必须由调用方透传：sendFlashMessage 靠 ctx.waitUntil 注册延时撤回，
+// 传 null 会让闪屏永久留在群里（回执含 TGID 与指纹计数，不该长期公开展示）。
+async function handleAdReplyLearning(message, env, ctx) {
 	if (!env?.DB) return false;
 	const chat = message?.chat;
 	const target = message?.reply_to_message;
@@ -10393,7 +10395,7 @@ async function handleAdReplyLearning(message, env) {
 	if (!targetUser || targetUser.is_bot) return false;
 	const targetId = String(targetUser.id);
 	if (isPrivilegedManager(targetId)) {
-		await sendFlashMessage(chat.id, '⚠️ 目标是管理层，已忽略该操作。', null, 5000);
+		await sendFlashMessage(chat.id, '⚠️ 目标是管理层，已忽略该操作。', ctx, 5000);
 		return true;
 	}
 	if (!(await adDetectionReady(env))) return false;
@@ -10460,6 +10462,6 @@ async function handleAdReplyLearning(message, env) {
 	await sendFlashMessage(chat.id, [
 		'✅ 已按广告处置 ' + targetId,
 		'指纹 +' + (Number(learn?.learned) || 0) + '　封禁 ' + (enforced.banSummary || '未知')
-	].join('\n'), null, 8000);
+	].join('\n'), ctx, 8000);
 	return true;
 }
