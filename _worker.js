@@ -6737,6 +6737,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/addword 值 [类型]　手动新增指纹，类型可省略自动推断',
 			'/delword 值　删除指纹',
 			'/addsample 文本　新增 AI 语义比对样本',
+			'/warmup　补齐样本向量（向量为 0 时第三层 AI 不生效，反复发直到补满）',
 			'/clearsamples　清空全部 AI 样本，需二次确认令牌',
 			'/whitelist [list|add|del] [域名]　维护域名白名单，命中即豁免',
 		];
@@ -8237,6 +8238,33 @@ const AD_AI_SOFT_BONUS_FLOOR = 0.65;
 const AD_AI_SOFT_BONUS_SCORE = 2;
 // 指纹命中加分
 const AD_FINGERPRINT_HIT_SCORE = 3;
+// 协同分：交易动词与业务关键词同时命中时的额外加分。
+// 单独命中任一类都可能是正常语境，同现才是广告话术的稳定特征。
+const AD_COMBO_BONUS_SCORE = 2;
+
+// 平台自身域名：结构上不该被当作广告特征，绝不学入指纹库，也不计链接可疑分。
+// 与用户可维护的 ad_domain_whitelist 分离 —— 后者是「这个群认为无害」，
+// 本名单是「学它必然造成大面积误伤」，因此不允许被用户误删。
+// 实测事故：t.me 曾被学成 weight=1 的 domain 指纹并命中 10 次，
+// 导致任何人分享 Telegram 链接都可能被判广告。
+const AD_PLATFORM_DOMAINS = new Set([
+	't.me', 'telegram.me', 'telegram.org', 'telegra.ph', 'telesco.pe',
+	'telegram.dog', 'tg.dev'
+]);
+
+// 是否为平台自身域名（含真子域，判定口径与 isAdDomainWhitelisted 一致）。
+function isAdPlatformDomain(domain) {
+	const value = normalizeAdDomain(domain);
+	if (!value) return false;
+	if (AD_PLATFORM_DOMAINS.has(value)) return true;
+	const parts = value.split('.');
+	// 上界取 length - 1，保证永不单独匹配顶级域：
+	// evil-t.me / t.me.evil.tk 都不该被当成平台域名放过。
+	for (let i = 1; i < parts.length - 1; i += 1) {
+		if (AD_PLATFORM_DOMAINS.has(parts.slice(i).join('.'))) return true;
+	}
+	return false;
+}
 // AI 样本库目标条数与每请求懒加载补齐数量（避免首请求超时与子请求超限）
 const AD_SAMPLE_TARGET_COUNT = 30;
 const AD_SAMPLE_LAZY_BATCH = 8;
@@ -8638,9 +8666,14 @@ function hasAdSuspiciousLink(text, whitelistSet) {
 	const source = String(text ?? '');
 	if (!source) return false;
 	if (AD_BOT_MENTION_RE.test(source)) return true;
+	// t.me/ 这里刻意保留计分：广告样本的引流出口几乎都是 t.me 邀请链接，
+	// 「发了个 Telegram 链接」本身确实是可疑信号（仅 +2，不单独定罪）。
+	// 与 isAdPlatformDomain 不冲突 —— 后者管的是「不该把 t.me 学成永久指纹」，
+	// 两者一个是即时评分、一个是长期特征，语义不同。
 	if (/t\.me\//i.test(source)) return true;
 	if (/@[A-Za-z0-9_]{5,}/.test(source)) return true;
 	for (const domain of extractAdDomains(source)) {
+		if (isAdPlatformDomain(domain)) continue;			// 平台裸域名不再重复计分
 		if (!isAdDomainWhitelisted(domain, whitelistSet)) return true;
 	}
 	return false;
@@ -8670,6 +8703,13 @@ function scoreAdProfile(profile, options = {}) {
 	const businessHits = countAdKeywordHits(combined, AD_BUSINESS_KEYWORDS);
 	if (businessHits.length) add(2, '业务关键词：' + businessHits.slice(0, 3).join('/'));
 
+	// 协同分：两类词单独出现都可能是正常语境（「收购」可能在聊二手交易，「USDT」可能在聊技术），
+	// 但「交易动词 + 业务关键词」同时出现几乎必然是广告话术。
+	// 只加分给同现，比统一提高单项权重或下调观察阈值精确得多 —— 后两者会让正常用户成片进窗口。
+	// 实测：`高价收网赚号` + `长期收购网 du 商宝账号` 原为 4 分（低于观察阈值 5 被放行），
+	// 加协同分后 6 分进观察窗口，窗口内再发一条广告即累加至封禁线。
+	if (tradeHits.length && businessHits.length) add(AD_COMBO_BONUS_SCORE, '交易动词 + 业务关键词同现');
+
 	if (hasAdSuspiciousLink(combined, whitelistSet)) add(2, '含非白名单引流链接');
 	if (username && AD_RANDOM_USERNAME_RE.test(username) && /[0-9]/.test(username)) add(1, '随机字母数字 username');
 	if (hasAdRepeatedSegment(bio)) add(1, 'Bio 重复段落');
@@ -8696,6 +8736,9 @@ function scoreAdMessageText(text, options = {}) {
 	if (tradeHits.length) add(2, '正文交易动词：' + tradeHits.slice(0, 3).join('/'));
 	const businessHits = countAdKeywordHits(source, AD_BUSINESS_KEYWORDS);
 	if (businessHits.length) add(2, '正文业务关键词：' + businessHits.slice(0, 3).join('/'));
+	// 与 scoreAdProfile 同一条协同判据：两类词同现才是广告话术的稳定特征。
+	// 实测：`高价收网赚账号 长期收购 USDT 日结秒到 需要的私我` 原为 4 分被放行，加分后进观察窗口。
+	if (tradeHits.length && businessHits.length) add(AD_COMBO_BONUS_SCORE, '正文交易动词 + 业务关键词同现');
 	if (hasAdSuspiciousLink(source, whitelistSet)) add(2, '正文含非白名单引流链接');
 	if (AD_SYMMETRIC_EMOJI_RE.test(source)) add(3, '正文首尾对称 emoji');
 	if (hasAdRepeatedSegment(source)) add(1, '正文重复段落');
@@ -8863,6 +8906,9 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 	if (bio.length >= 6) push('bio', bio.slice(0, 60), 0.8);
 
 	for (const domain of extractAdDomains(combined)) {
+		// 平台自身域名绝不学习：t.me 之类一旦入库，任何人分享 Telegram 链接都会命中，
+		// 且它权重给满 1（单条即可定罪）。这道判断独立于用户白名单，不可被误删绕过。
+		if (isAdPlatformDomain(domain)) continue;
 		if (!isAdDomainWhitelisted(domain, whitelistSet)) push('domain', domain, 1);
 	}
 
@@ -9817,7 +9863,7 @@ async function detectAdOnMessage(message, env) {
 // === 命令层 ===
 // 11 条广告检测命令一律走这一个入口，handleMessage 里只挂一个钩子，
 // 不改动任何既有命令分支。返回 true 表示命令已被处理，调用方应立即 return。
-const AD_COMMAND_RE = /^\/(pending|confirm|ignore|addword|delword|words|addsample|clearsamples|adstats|whitelist|rescreen)(?:@[^\s]+)?(?:\s|$)/i;
+const AD_COMMAND_RE = /^\/(pending|confirm|ignore|addword|delword|words|addsample|clearsamples|adstats|whitelist|rescreen|warmup)(?:@[^\s]+)?(?:\s|$)/i;
 
 // 快照 → 判定载荷。/confirm 学指纹、/ignore 标误判都要用同一份载荷，保证两边命中的指纹集合一致。
 function adPayloadFromSnapshot(snapshot) {
@@ -9883,6 +9929,7 @@ async function handleAdDetectionCommands(message, env, ctx) {
 			case 'adstats': await handleAdStatsCommand(env, chatId); break;
 			case 'whitelist': await handleAdWhitelistCommand(env, chatId, ownerId, arg); break;
 			case 'rescreen': await handleAdRescreenCommand(env, chatId, arg); break;
+			case 'warmup': await handleAdWarmupCommand(env, chatId); break;
 		}
 	} catch (error) {
 		console.error('[广告检测] 命令 /' + command + ' 执行异常:', error);
@@ -10115,6 +10162,57 @@ async function handleAdAddSampleCommand(env, chatId, arg) {
 	].join('\n'));
 }
 
+// /warmup：手动补齐语义样本向量，每次最多 AD_SAMPLE_LAZY_BATCH 条。
+// 存在意义：向量原本只在第三层被调用时懒加载，而第三层需要可疑消息才会触发，
+// 指纹层命中即定罪的情况更走不到 —— 于是新部署的向量可能长期为 0，第三层空转。
+// 本命令给主人一个明确的补齐入口与进度反馈，反复执行即可补满。
+// 单次仍受 AD_SAMPLE_LAZY_BATCH 限制，避免一口气跑几十次 AI 推理撞子请求预算。
+async function handleAdWarmupCommand(env, chatId) {
+	const config = loadAdDetectionConfig(env);
+	if (!config.aiEnabled) {
+		await sendTelegramMessage(chatId, [
+			'⚠️ <b>未绑定 Workers AI</b>',
+			'',
+			'第三层语义判定不可用，无需补齐向量。',
+			'当前按「结构化评分 + 指纹库」两层工作。'
+		].join('\n'));
+		return;
+	}
+	const before = await countAdSamples(env);
+	if (!before.total) {
+		await sendTelegramMessage(chatId, '📭 样本库为空，请先用 <code>/addsample 文本</code> 添加样本。');
+		return;
+	}
+	const target = Math.min(before.total, AD_SAMPLE_TARGET_COUNT);
+	if (before.ready >= target) {
+		await sendTelegramMessage(chatId, [
+			'✅ <b>向量已就绪</b>',
+			'',
+			'已生成 <b>' + before.ready + '</b> 条 / 共 ' + before.total + ' 条样本（目标 ' + AD_SAMPLE_TARGET_COUNT + '）。',
+			'第三层 AI 语义判定正常工作，无需再补。'
+		].join('\n'));
+		return;
+	}
+	const filled = await topUpAdSampleEmbeddings(env);
+	const after = await countAdSamples(env);
+	const remain = Math.max(0, target - after.ready);
+	const lines = [
+		filled > 0 ? '✅ <b>已生成 ' + filled + ' 条向量</b>' : '⚠️ <b>本次未生成任何向量</b>',
+		'',
+		'进度：<b>' + after.ready + '</b> / ' + after.total + ' 条样本（目标 ' + AD_SAMPLE_TARGET_COUNT + '）'
+	];
+	if (remain > 0) {
+		lines.push('还差 <b>' + remain + '</b> 条，再发 /warmup 继续（每次最多 ' + AD_SAMPLE_LAZY_BATCH + ' 条）。');
+	} else {
+		lines.push('已达目标，第三层 AI 语义判定现已生效。');
+	}
+	if (filled === 0) {
+		lines.push('');
+		lines.push('未生成的可能原因：AI 调用失败或限流。可查 Workers Logs 搜 <code>[广告检测]</code> 前缀。');
+	}
+	await sendTelegramMessageChunks(chatId, lines.join('\n'));
+}
+
 // /clearsamples：清空全部语义样本（含内置种子）。破坏性操作 → 走 D1 一次性令牌二次确认。
 // 纯 D1 环境没有 KV 的 TTL，令牌表用 expires_at + 读取即删实现 60 秒有效且只能用一次。
 async function handleAdClearSamplesCommand(env, chatId, ownerId, arg) {
@@ -10163,6 +10261,13 @@ async function handleAdClearSamplesCommand(env, chatId, ownerId, arg) {
 // /adstats：一屏看全检测状态 —— 配置、指纹库、样本库、观察窗口、待确认快照、域名白名单。
 async function handleAdStatsCommand(env, chatId) {
 	const config = loadAdDetectionConfig(env);
+	// 顺带补一批样本向量。此前 topUpAdSampleEmbeddings 的唯一调用点在 checkAdAiSimilarity 内部，
+	// 而第三层只在消息通过零成本预筛后才会走到 —— 形成死锁：
+	//   没有可疑消息 → 第三层不被调用 → 向量不补 → 一直 0 条 → 即使来了可疑消息，
+	//   samples 为空也直接返回相似度 0，第三层等于不存在。
+	// 指纹层命中即定罪的情况更走不到第三层，向量可能永远补不上。
+	// 放在 /adstats 里：主人查状态是自然的补齐时机，且能立刻在回执里看到进度。
+	const warmed = await topUpAdSampleEmbeddings(env);
 	const now = Math.floor(Date.now() / 1000);
 	const samples = await countAdSamples(env);
 	const whitelist = await loadAdDomainWhitelist(env);
@@ -10211,6 +10316,11 @@ async function handleAdStatsCommand(env, chatId) {
 	}
 	lines.push('');
 	lines.push('<b>语义样本</b>　共 <b>' + samples.total + '</b> 条，已生成向量 <b>' + samples.ready + '</b> 条（目标 ' + AD_SAMPLE_TARGET_COUNT + '）');
+	if (warmed > 0) {
+		lines.push('　↳ 本次顺带生成 <b>' + warmed + '</b> 条向量' + (samples.ready < Math.min(samples.total, AD_SAMPLE_TARGET_COUNT) ? '，再发几次 /adstats 或 /warmup 可继续补齐' : ''));
+	} else if (config.aiEnabled && samples.ready === 0 && samples.total > 0) {
+		lines.push('　↳ ⚠️ 向量为 0，第三层 AI 实际未生效，请发 /warmup 补齐');
+	}
 	lines.push('<b>观察窗口</b>　窗口内 <b>' + screeningCount + '</b> 人');
 	lines.push('<b>待确认快照</b>　<b>' + pendingCount + '</b> 条（保留 1 小时）');
 	lines.push('<b>域名白名单</b>　生效 <b>' + whitelist.size + '</b> 条（D1 自定义 ' + whitelistRows + ' 条，内置种子 ' + AD_DOMAIN_WHITELIST_SEED.length + ' 条）');

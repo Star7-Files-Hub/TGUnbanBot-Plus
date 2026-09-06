@@ -329,6 +329,42 @@ section('[1] 结构化评分层（纯函数，零网络）');
 	const chatText = W.scoreAdMessageText('大家好，今天天气不错，一起吃饭吗');
 	assert('正常聊天正文得分为 0', chatText.score === 0, JSON.stringify(chatText));
 
+	// 协同分：两类词单独命中都可能是正常语境，同现才是广告话术的稳定特征。
+	// 线上实测漏放案例：这两段原本各只得 4 分（低于观察阈值 5 直接放行），
+	// 加协同分后进观察窗口，窗口内再发一条即累加过封禁线。
+	const comboProfile = W.scoreAdProfile({ firstName: '高价收网赚号', bio: '长期收购网 du 商宝账号，老账号优先加价' });
+	assert('协同分：资料两类词同现得 6 分', comboProfile.score === 6, JSON.stringify(comboProfile));
+	assert('协同分：资料判据写明同现', comboProfile.reasons.some((r) => r.includes('交易动词 + 业务关键词同现')), JSON.stringify(comboProfile.reasons));
+	const comboText = W.scoreAdMessageText('高价收网赚账号 长期收购 USDT 日结秒到 需要的私我');
+	assert('协同分：正文两类词同现得 6 分', comboText.score === 6, JSON.stringify(comboText));
+	assert('协同分：正文判据写明同现', comboText.reasons.some((r) => r.includes('正文交易动词 + 业务关键词同现')), JSON.stringify(comboText.reasons));
+	// 只命中一类时不得加协同分，否则等于变相提高单项权重、把正常用户成片卷进来。
+	const tradeOnly = W.scoreAdMessageText('有没有人收购二手显卡');
+	assert('协同分：只命中交易动词不加协同分', !tradeOnly.reasons.some((r) => r.includes('同现')), JSON.stringify(tradeOnly.reasons));
+	const bizOnly = W.scoreAdMessageText('请问 USDT 链上转账手续费怎么算');
+	assert('协同分：只命中业务关键词不加协同分', !bizOnly.reasons.some((r) => r.includes('同现')), JSON.stringify(bizOnly.reasons));
+
+	// 平台自身域名：绝不学入指纹库。线上事故 —— t.me 曾被学成 weight=1 的 domain 指纹
+	// 并命中 10 次，导致任何人分享 Telegram 链接都可能被判广告。
+	assert('平台域名：t.me 被识别', W.isAdPlatformDomain('t.me') === true);
+	assert('平台域名：telegram.org 被识别', W.isAdPlatformDomain('telegram.org') === true);
+	assert('平台域名：telegra.ph 被识别', W.isAdPlatformDomain('telegra.ph') === true);
+	assert('平台域名：真子域被识别', W.isAdPlatformDomain('cdn.t.me') === true);
+	// 判定上界取 length-1，保证永不单独匹配顶级域，仿冒域名不得蒙混过关。
+	assert('平台域名：evil-t.me 不算平台域名', W.isAdPlatformDomain('evil-t.me') === false);
+	assert('平台域名：t.me.evil.tk 不算平台域名', W.isAdPlatformDomain('t.me.evil.tk') === false);
+	assert('平台域名：普通广告域名不算', W.isAdPlatformDomain('evil-shop.top') === false);
+	const platformCand = W.extractAdFingerprintCandidates(
+		{ name: '收U代理', username: '', bio: '联系 https://t.me/+abcDEF123 详谈 日结', text: '' },
+		new Set()
+	);
+	assert('平台域名：t.me 不进指纹候选', !platformCand.some((c) => c.type === 'domain' && c.value === 't.me'), JSON.stringify(platformCand.filter((c) => c.type === 'domain')));
+	const evilCand = W.extractAdFingerprintCandidates(
+		{ name: '收U代理', username: '', bio: '上号地址 evil-shop.top 日结佣金', text: '' },
+		new Set()
+	);
+	assert('平台域名：真广告域名照常入候选', evilCand.some((c) => c.type === 'domain' && c.value === 'evil-shop.top'), JSON.stringify(evilCand.filter((c) => c.type === 'domain')));
+
 	const forwardAd = W.scoreAdForwardChat({ title: '💚高价收网赚号💚', username: 'aaa_channel' });
 	assert('广告频道转发判定为广告来源', forwardAd.isAd === true, JSON.stringify(forwardAd));
 	const forwardNormal = W.scoreAdForwardChat({ title: 'Cloudflare 官方公告', username: 'cf_news' });
@@ -608,16 +644,33 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 	assert('广告消息：通知含消息正文', ownerNoticeText().includes('长期收购网赚账号'), ownerNoticeText());
 
 	// 中间分数：只写观察窗口，不封禁。
+	// ⚠️ 关键约束：零成本预筛只用【正文分】做闸门（detectAdOnMessage 里
+	// `quickScore + historyScore < observationScore` 即 return），资料分再高也进不来 ——
+	// 这是刻意的成本控制，正文不够可疑就不花 getChat 的钱。所以要覆盖观察分支，
+	// 正文单独必须 >= observationScore(5)，同时资料 + 正文合计 < scoreThreshold(7)。
+	//   正文「长期收购网赚账号 USDT 秒结」= 交易动词 +2、业务关键词 +2、两类同现 +2 = 6 分（无链接）
+	//   资料 plainProfile（bio 空）吃「无 emoji 且无 Bio」-1，max(0, -1) = 0 分
+	//   合计 6 分，落在 [5, 7) 观察区间
+	const MID_TEXT = '长期收购网赚账号 USDT 秒结';
 	const env3 = makeEnv();
 	resetCalls();
 	setApi(plainProfile);
-	await sendUpdate({ message: groupMessage({ id: 60003, first_name: '路人' }, AD_TEXT) }, env3);
+	await sendUpdate({ message: groupMessage({ id: 60003, first_name: '路人' }, MID_TEXT) }, env3);
 	assert('中间分数：不封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
 	assert('中间分数：不进黑名单', env3.DB.query('SELECT COUNT(*) AS c FROM blacklist')[0].c === 0);
 	const observed = env3.DB.query('SELECT user_id, score, layer FROM ad_user_screening');
 	assert('中间分数：写入观察窗口', observed.length === 1 && observed[0].user_id === '60003', JSON.stringify(observed));
-	assert('中间分数：观察分为 6（正文 2+2+2）', observed[0]?.score === 6, JSON.stringify(observed));
+	assert('中间分数：观察分为 6（正文 2+2+协同 2，资料 0）', observed[0]?.score === 6, JSON.stringify(observed));
 	assert('中间分数：不推私聊快照', env3.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c === 0);
+
+	// 反向确认协同分确实把 AD_TEXT 顶过了封禁线（原为 6 分观察，现为 8 分封禁）。
+	// 差别只在多了一个引流 @账号（+2），可见协同分与链接分是独立叠加的。
+	const env3b = makeEnv();
+	resetCalls();
+	setApi(plainProfile);
+	await sendUpdate({ message: groupMessage({ id: 60013, first_name: '路人' }, AD_TEXT) }, env3b);
+	assert('协同分端到端：三类判据同现直接封禁', env3b.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '60013'")[0].c === 1, JSON.stringify(env3b.DB.query('SELECT id FROM blacklist')));
+	assert('协同分端到端：得分越过封禁线', (env3b.DB.query("SELECT score FROM ad_pending_snapshots WHERE user_id = '60013'")[0]?.score || 0) >= 7, JSON.stringify(env3b.DB.query('SELECT user_id, score FROM ad_pending_snapshots')));
 
 	// 观察窗口历史分累加：本条正文只有 3 分，叠加历史 4 分正好到 7 分封禁线。
 	const env4 = makeEnv();
@@ -915,6 +968,41 @@ section('[10] 状态、白名单与观察窗口复判（adstats / whitelist / re
 	const statsAi = await cmdAll(envAi, '/adstats');
 	assert('/adstats 绑定 AI 时标注已绑定', statsAi.includes('已绑定'), statsAi);
 	assert('/adstats 绑定 AI 时写出模型名', statsAi.includes('bge-base-zh'), statsAi);
+	// /adstats 顺带补一批向量。此前 topUpAdSampleEmbeddings 只在第三层内部被调用，
+	// 而第三层要消息通过零成本预筛才会走到、指纹层命中定罪更走不到 —— 于是新部署的向量
+	// 可能长期停在 0，第三层空转。把补齐挂在「主人查状态」这个自然时机上打破死锁。
+	assert('/adstats 顺带补齐样本向量', envAi.DB.query('SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL')[0].c > 0, JSON.stringify(envAi.DB.query('SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL')));
+	assert('/adstats 回执写出本次生成条数', statsAi.includes('本次顺带生成'), statsAi);
+	// 未绑 AI 时不该出现补齐相关文案（那台 env 的样本向量永远是 0，属正常）
+	assert('/adstats 未绑 AI 不提补齐', !statsText.includes('本次顺带生成'), statsText);
+
+	// /warmup：手动补齐入口，反复发直到补满。
+	const envWarm = makeEnv({ AI: { async run() { return { data: [new Array(768).fill(0)] }; } } });
+	await W.adDetectionReady(envWarm);
+	const warm1 = await cmdAll(envWarm, '/warmup');
+	const warmReady1 = envWarm.DB.query('SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL')[0].c;
+	assert('/warmup 首次生成向量', warmReady1 > 0, '已生成 ' + warmReady1 + ' 条');
+	assert('/warmup 单次不超过 8 条批量上限', warmReady1 <= 8, '已生成 ' + warmReady1 + ' 条');
+	assert('/warmup 回执写出进度', warm1.includes('进度'), warm1);
+	assert('/warmup 未补满时提示继续', warm1.includes('再发 /warmup 继续'), warm1);
+	// 10 条种子样本 → 第二次补齐即达 10 条（目标 30 但样本只有 10 条，取 min）
+	const warm2 = await cmdAll(envWarm, '/warmup');
+	const warmReady2 = envWarm.DB.query('SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL')[0].c;
+	assert('/warmup 二次补齐后达全部样本', warmReady2 === 10, '已生成 ' + warmReady2 + ' 条');
+	assert('/warmup 补满后提示已生效', warm2.includes('第三层 AI 语义判定现已生效') || warm2.includes('向量已就绪'), warm2);
+	const warm3 = await cmdAll(envWarm, '/warmup');
+	assert('/warmup 已就绪时给出明确回执', warm3.includes('向量已就绪'), warm3);
+	assert('/warmup 已就绪时不再重复生成', envWarm.DB.query('SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL')[0].c === 10);
+	// 未绑 AI 时应说明第三层不可用，而不是假装补齐成功
+	const warmNoAi = await cmdAll(makeEnv(), '/warmup');
+	assert('/warmup 未绑 AI 时说明不可用', warmNoAi.includes('未绑定 Workers AI'), warmNoAi);
+	assert('/warmup 未绑 AI 时说明降级为两层', warmNoAi.includes('两层'), warmNoAi);
+	// 样本库为空时引导去 /addsample，而不是报成功
+	const envEmptySample = makeEnv({ AI: { async run() { return { data: [new Array(768).fill(0)] }; } } });
+	await W.adDetectionReady(envEmptySample);
+	envEmptySample.DB.__sqlite.exec('DELETE FROM ad_sample_embeddings');
+	const warmEmpty = await cmdAll(envEmptySample, '/warmup');
+	assert('/warmup 样本库为空时引导 addsample', warmEmpty.includes('/addsample'), warmEmpty);
 
 	// /whitelist：建表时就把 50 条内置种子写进 D1，所以默认列出的是「D1 自定义 50 条」；
 	// 只有把表清空后才回落到内存里的种子集合。
@@ -1278,6 +1366,106 @@ section('[13] 回复学习端到端（管理层回复即判定，误触发必须
 	assert('申诉句：管理层回复时不封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
 	assert('申诉句：管理层回复时目标未入黑名单', env13.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '72008'")[0].c === 0);
 	assert('申诉句：管理层回复时执行的是解封', countCalls('unbanChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+}
+
+section('[14] 两道闸真实场景回归（用线上真实指纹与漏放案例）');
+{
+	// 本段来源：线上 /words 输出的 5 条真实指纹 + 两个实测漏放案例。
+	// 目的是钉死「入群」与「发言」两道闸的端到端有效性 —— 这是整个广告检测的价值所在，
+	// 任何改动导致其中一道失效都必须立刻暴露。
+	//
+	// ⚠️ 写法要求：必须先 resetCalls() 再 setApi()。resetCalls 内部会调 setApi() 清空 mock，
+	// 顺序写反会让 bot 拿到空资料，判定结果与预期完全不同（本段就曾因此误判为「产品失效」）。
+	const REAL_BIO = 'https://t.me/+vpjO116iE1syNTg1 加群看项目 一天赚8千!';
+	const REAL_USERNAME = '@uHlenkWyTPXTSGrwarGL';
+
+	const adProfileApi = (profile) => ({
+		getChat: (b) => ({ ok: true, result: { id: b?.chat_id, ...profile } }),
+		getChatMember: (b) => ({ ok: true, result: { status: 'member', user: { id: b?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true })
+	});
+
+	// ---------- 第一道闸：入群检测 ----------
+	const envJoin = makeEnv();
+	await W.adDetectionReady(envJoin);
+	await W.addAdFingerprint(envJoin, REAL_BIO, { type: 'bio', createdBy: String(OWNER_ID) });
+	await W.addAdFingerprint(envJoin, REAL_USERNAME, { type: 'username', createdBy: String(OWNER_ID) });
+
+	resetCalls();
+	setApi(adProfileApi({ first_name: '项目对接', bio: REAL_BIO }));
+	await sendUpdate({ message: joinMessage([{ id: 80001, first_name: '项目对接' }]) }, envJoin);
+	assert('第一道闸：bio 命中指纹的号进群即加黑', envJoin.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80001'")[0].c === 1, JSON.stringify(envJoin.DB.query('SELECT id FROM blacklist')));
+	assert('第一道闸：bio 命中后执行全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('第一道闸：bio 命中生成待确认快照', envJoin.DB.query("SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE user_id = '80001'")[0].c === 1);
+
+	resetCalls();
+	setApi(adProfileApi({ first_name: '推广', username: 'uHlenkWyTPXTSGrwarGL', bio: '' }));
+	await sendUpdate({ message: joinMessage([{ id: 80002, first_name: '推广', username: 'uHlenkWyTPXTSGrwarGL' }]) }, envJoin);
+	assert('第一道闸：username 命中指纹的号进群即加黑', envJoin.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80002'")[0].c === 1);
+	assert('第一道闸：username 命中后执行全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+
+	// 线上漏放案例 1：这份资料原本只得 4 分（低于观察阈值 5）被直接放行，
+	// 加了「交易动词 + 业务关键词同现」协同分后应为 6 分，进观察窗口。
+	resetCalls();
+	setApi(adProfileApi({ first_name: '高价收网赚号', bio: '长期收购网 du 商宝账号，老账号优先加价' }));
+	await sendUpdate({ message: joinMessage([{ id: 80003, first_name: '高价收网赚号' }]) }, envJoin);
+	const scr80003 = envJoin.DB.query("SELECT score FROM ad_user_screening WHERE user_id = '80003'")[0];
+	assert('第一道闸：协同分让漏放案例进入观察窗口', Boolean(scr80003), JSON.stringify(envJoin.DB.query('SELECT user_id, score FROM ad_user_screening')));
+	assert('第一道闸：漏放案例得 6 分', scr80003 && scr80003.score === 6, JSON.stringify(scr80003));
+	assert('第一道闸：观察阶段不封禁', envJoin.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80003'")[0].c === 0);
+	assert('第一道闸：观察阶段不调封禁接口', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+
+	resetCalls();
+	setApi(adProfileApi({ first_name: '张伟', bio: '前端开发，喜欢摄影' }));
+	await sendUpdate({ message: joinMessage([{ id: 80004, first_name: '张伟' }]) }, envJoin);
+	assert('第一道闸：正常用户进群不加黑', envJoin.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80004'")[0].c === 0);
+	assert('第一道闸：正常用户进群不封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+	assert('第一道闸：正常用户不进观察窗口', envJoin.DB.query("SELECT COUNT(*) AS c FROM ad_user_screening WHERE user_id = '80004'")[0].c === 0);
+
+	// ---------- 第二道闸：发言检测 ----------
+	const envMsg = makeEnv();
+	await W.adDetectionReady(envMsg);
+
+	// 线上漏放案例 2：这条正文原本只得 4 分被放行，协同分后 6 分进观察窗口。
+	resetCalls();
+	setApi(adProfileApi({ first_name: '小李', bio: '' }));
+	await sendUpdate({ message: groupMessage({ id: 80011, first_name: '小李' }, '高价收网赚账号 长期收购 USDT 日结秒到 需要的私我') }, envMsg);
+	const scr80011 = envMsg.DB.query("SELECT score FROM ad_user_screening WHERE user_id = '80011'")[0];
+	assert('第二道闸：协同分让漏放正文进入观察窗口', Boolean(scr80011), JSON.stringify(envMsg.DB.query('SELECT user_id, score FROM ad_user_screening')));
+	assert('第二道闸：漏放正文首次不封禁', envMsg.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80011'")[0].c === 0);
+
+	// 同一人窗口内再发一条广告 → 历史分累加过封禁线
+	resetCalls();
+	setApi(adProfileApi({ first_name: '小李', bio: '' }));
+	await sendUpdate({ message: groupMessage({ id: 80011, first_name: '小李' }, '收U代理日结 长期收购账号 USDT 秒到') }, envMsg);
+	assert('第二道闸：窗口内二次发广告即加黑', envMsg.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80011'")[0].c === 1, JSON.stringify(envMsg.DB.query('SELECT id FROM blacklist')));
+	assert('第二道闸：二次发广告执行全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('第二道闸：封禁后移出观察窗口', envMsg.DB.query("SELECT COUNT(*) AS c FROM ad_user_screening WHERE user_id = '80011'")[0].c === 0);
+
+	// 零成本预筛：线上真实的正常聊天，不该产生任何 getChat 子请求
+	resetCalls();
+	setApi(adProfileApi({ first_name: '小王', bio: '' }));
+	await sendUpdate({ message: groupMessage({ id: 80012, first_name: '小王' }, '百度做网站的大佬有没') }, envMsg);
+	assert('第二道闸：正常聊天不加黑', envMsg.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80012'")[0].c === 0);
+	assert('第二道闸：正常聊天零成本预筛（getChat=0）', countCalls('getChat') === 0, JSON.stringify(calls.map((c) => c.method)));
+	assert('第二道闸：正常聊天不进观察窗口', envMsg.DB.query("SELECT COUNT(*) AS c FROM ad_user_screening WHERE user_id = '80012'")[0].c === 0);
+
+	// 分享 Telegram 链接不该被当广告封禁 —— t.me 曾被误学成 weight=1 指纹并命中 10 次
+	resetCalls();
+	setApi(adProfileApi({ first_name: '技术群友', bio: '' }));
+	await sendUpdate({ message: groupMessage({ id: 80014, first_name: '技术群友' }, '这个频道不错 https://t.me/durov 推荐看看') }, envMsg);
+	assert('第二道闸：分享 t.me 链接不被封禁', envMsg.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80014'")[0].c === 0, JSON.stringify(envMsg.DB.query('SELECT id FROM blacklist')));
+	assert('第二道闸：分享 t.me 链接不调封禁接口', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+	assert('第二道闸：t.me 未被学成指纹', envMsg.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE type = 'domain' AND value = 't.me'")[0].c === 0, JSON.stringify(envMsg.DB.query("SELECT type, value FROM ad_fingerprints WHERE type = 'domain'")));
+
+	// 管理层豁免：同样的广告文案不得处置
+	resetCalls();
+	setApi(adProfileApi({ first_name: 'Owner', bio: '' }));
+	await sendUpdate({ message: groupMessage({ id: OWNER_ID, first_name: 'Owner' }, '高价收网赚账号 长期收购 USDT 日结秒到') }, envMsg);
+	assert('第二道闸：管理层发广告文案不加黑', envMsg.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '" + OWNER_ID + "'")[0].c === 0);
+	assert('第二道闸：管理层发广告文案不封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
 }
 
 console.log('');
