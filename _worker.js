@@ -703,6 +703,12 @@ const PRIMARY_OWNER_COMMAND_MENU = [
 	{ command: 'listsamples', description: '查看广告样本' },
 	{ command: 'delsample', description: '删除广告样本' },
 	{ command: 'clearsamples', description: '清空广告样本' },
+	{ command: 'ad_test', description: '广告检测测试模式' },
+	{ command: 'clean_blacklist', description: '清理销号用户' },
+	{ command: 'clean_switch', description: '自动销号清理开关' },
+	{ command: 'add_mod', description: '添加额外管理员' },
+	{ command: 'del_mod', description: '移除额外管理员' },
+	{ command: 'list_mod', description: '列出额外管理员' },
 	{ command: 'start', description: '自助解封入口' },
 	{ command: 'help', description: '展开全部隐藏指令' },
 ];
