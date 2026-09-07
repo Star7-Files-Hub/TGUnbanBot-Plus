@@ -11112,15 +11112,63 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const banTargetGroupIds = resolveScopeTargetGroupIds(banScopeGroups);
 		const banScopeLabel = isInGroup ? '仅当前群' : '全部配置群';
 
-		// 提取参数（支持单个 / 批量；开头 TGID 列表之后的文本作为执行原因）
-		// 用正则提取,与 /spam 完全对称:兼容 /ban、/ban@机器人名、多空格;彻底不依赖命令长度,
-		// 根除早期 slice(5) 吃掉参数首字符那类"命令一改短就错位"的隐患。
+		// 提取 /ban 后面的参数。回复模式优先把参数当执行原因；无回复时才按 TGID 模式解析。
 		const argMatch = text.trim().match(/^\/ban(?:@[^\s]+)?\s*([\s\S]*)/i);
-		const rawArg = argMatch ? argMatch[1] : '';
+		const rawArg = argMatch ? argMatch[1].trim() : '';
+		const repliedMsg = message.reply_to_message;
+
+		// ===== 回复模式：回复消息封禁（与 /spam 对称）=====
+		if (repliedMsg && !rawArg) {
+			const repliedUserId = repliedMsg?.from?.id;
+			if (!repliedUserId) {
+				const usageText = '❌ 使用方法：\n• 回复消息后发 <code>/ban</code>\n• 或直接 <code>/ban 用户ID</code>（支持批量：<code>/ban 123,456,789</code>）';
+				await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
+				return;
+			}
+			const result = await addToBlacklist(repliedUserId, env, { reason: 'manual', by: operatorId, scopeGroups: banScopeGroups });
+			const alreadyExists = result.code === 'EXISTS';
+			const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
+			let targetMention = `<code>${escapeHtml(String(repliedUserId))}</code>`;
+			const lines = [`🎬 操作:加入黑名单（${banScopeLabel}）`];
+			let flashText;
+			if (result.success || alreadyExists) {
+				const banResults = await banUserFromGroups(repliedUserId, banTargetGroupIds, { probeMembership: true });
+				const cleanupResult = isInGroup
+					? await cleanupCurrentChatUserMessages(env, chatId, repliedUserId)
+					: null;
+				targetMention = formatTargetFromBanResults(repliedUserId, banResults);
+				lines.push(`🎯 目标用户:${linkedUserId} ${targetMention}`);
+				lines.push(`📍 生效范围:${describeBlacklistScope(result.scopeGroups ?? banScopeGroups)}`);
+				lines.push('');
+				if (alreadyExists) {
+					lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
+					if (result.scopeExpanded) lines.push('ℹ️ 已把本群并入该记录的生效范围。');
+				}
+				lines.push(await renderBanResultsDetail(banResults, null, { userId: repliedUserId, retryCommand: '/ban' }));
+				if (cleanupResult) {
+					lines.push(renderCurrentChatCleanupResult(cleanupResult));
+				}
+				flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${repliedUserId}</code>（${banScopeLabel}）\n` + renderBanResults(banResults);
+			} else {
+				lines.push(`🎯 目标用户:${linkedUserId}`);
+				lines.push('');
+				lines.push(result.message);
+				flashText = `⚠️ <code>${repliedUserId}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
+			}
+			await replyToAdmin(message, ctx, {
+				flashText,
+				detailText: withActionContext(message, lines.join('\n'), ''),
+				isInGroup,
+				notifySecondaryOwners: true
+			});
+			return;
+		}
+
+		// ===== TGID 模式：直接通过 ID 封禁 =====
 		const { valid, invalid, note } = parseTargetIdsAndNote(rawArg);
 
 		if (valid.length === 0 && invalid.length === 0) {
-			const usageText = `❌ 使用方法：<code>/ban 用户ID</code> 或 <code>/ban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
+			const usageText = `❌ 使用方法：\n• 回复消息后发 <code>/ban</code>\n• 或直接 <code>/ban 用户ID</code>（支持批量：<code>/ban 123,456,789</code>，最多 ${BATCH_LIMIT} 个）`;
 			await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
 			return;
 		}
