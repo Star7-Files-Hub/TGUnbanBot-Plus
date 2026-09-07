@@ -1263,6 +1263,8 @@ async function ensureD1Table(env) {
 				// 额外管理员：第一主人通过 /add_mod 添加的非管理员用户，可使用 /ban 和 /spam。
 				// 不需要是 Telegram 群管理员，只需是本项目认可的额外管理员。
 				['moderation_admins', 'CREATE TABLE IF NOT EXISTS moderation_admins (user_id TEXT PRIMARY KEY, added_by TEXT NOT NULL, added_at TEXT NOT NULL, note TEXT);'],
+				// 频道转发警告记录：记录用户转发频道帖子的次数，满3次后自动封禁。
+				['warning_records', 'CREATE TABLE IF NOT EXISTS warning_records (user_id TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, last_warned_at TEXT, history TEXT);'],
 			];
 			for (const [label, sql] of tableStatements) {
 				await runD1SchemaStatement(env, label, sql);
@@ -6483,6 +6485,63 @@ async function listModerationAdmins(env) {
 	}
 }
 
+// ===== 频道转发警告系统 =====
+// 用户转发频道帖子时，先给予警告，满3次后自动封禁。
+// 警告记录存储在 warning_records 表中。
+
+const WARNING_LIMIT = 3; // 警告次数上限，达到后自动封禁
+
+// 获取用户当前警告次数
+async function getWarningCount(env, userId) {
+	if (!env.DB) return 0;
+	const id = String(userId || '').trim();
+	if (!id) return 0;
+	try {
+		await ensureD1Table(env);
+		const row = await env.DB.prepare('SELECT count FROM warning_records WHERE user_id = ?').bind(id).first();
+		return row?.count || 0;
+	} catch (error) {
+		console.error('[warning] 查询失败:', error.message);
+		return 0;
+	}
+}
+
+// 增加警告次数，返回新的次数
+async function incrementWarning(env, userId) {
+	if (!env.DB) return 0;
+	const id = String(userId || '').trim();
+	if (!id) return 0;
+	try {
+		await ensureD1Table(env);
+		const now = new Date().toISOString();
+		const existing = await env.DB.prepare('SELECT count, history FROM warning_records WHERE user_id = ?').bind(id).first();
+		const count = (existing?.count || 0) + 1;
+		const history = existing?.history ? JSON.parse(existing.history) : [];
+		history.push({ at: now, count });
+		await env.DB.prepare(
+			`INSERT OR REPLACE INTO warning_records (user_id, count, last_warned_at, history)
+			 VALUES (?, ?, ?, ?)`
+		).bind(id, count, now, JSON.stringify(history)).run();
+		return count;
+	} catch (error) {
+		console.error('[warning] 增加失败:', error.message);
+		return 0;
+	}
+}
+
+// 清除警告次数（用户被封禁后调用）
+async function clearWarnings(env, userId) {
+	if (!env.DB) return;
+	const id = String(userId || '').trim();
+	if (!id) return;
+	try {
+		await ensureD1Table(env);
+		await env.DB.prepare('DELETE FROM warning_records WHERE user_id = ?').bind(id).run();
+	} catch (error) {
+		console.error('[warning] 清除失败:', error.message);
+	}
+}
+
 
 // ===== /recent 冻结快照(供 /learnlast 按固定序号引用,根治序号漂移)=====
 // /recent 把当时的疑似广告列表(已按上下文过滤+排序)冻结写入 D1;
@@ -7906,6 +7965,7 @@ async function detectAdLegacy(message, env) {
 	//     甲:手动转发频道帖子 —— forward_from_chat 存在（频道身份转发，非 is_automatic_forward）、
 	//        且 forward_origin 类型为 channel。频道是广告投放的主阵地，真人手动转频道帖到群里
 	//        绝大多数是引流广告（正常用户不会手动转频道帖到群里）。
+	//        【改为警告制】不再直接封禁，而是先警告，满3次后再封禁。
 	//     乙:正文含频道链接 —— 文本里出现 t.me/xxx 或 @xxx 格式的频道链接，且同时出现诱导词
 	//        （进群/频道/关注/订阅/领取/免费/福利）→ 典型的"分享频道引流广告"。
 	//   误杀防线：
@@ -7922,6 +7982,8 @@ async function detectAdLegacy(message, env) {
 			hits: [`手动转发频道帖:频道 ${channelTitle}${forwardFromChat.username ? ' @' + forwardFromChat.username : ''}`],
 			strong: '手动转发频道帖(频道引流广告)',
 			source: '频道转发',
+			// 标记为频道转发，由 handleAutomaticAdDecision 处理警告逻辑
+			channelForwardWarning: true,
 		};
 	}
 	if (!AD_STRICT_MODE && !urlsAllWhite) {
@@ -9425,6 +9487,50 @@ async function handleAutomaticAdDecision(message, adResult, env) {
 	const currentId = String(message?.from?.id || '');
 	if (!/^\d+$/.test(currentId)) return false;
 	if (await checkIfUserIsAdmin(currentId)) return false;
+
+	// ===== 频道转发警告制：满3次后自动封禁 =====
+	if (adResult?.channelForwardWarning === true) {
+		const count = await incrementWarning(env, currentId);
+		const channelTitle = adResult.hits?.[0]?.replace('手动转发频道帖:', '') || '未知频道';
+		// 删除转发的频道帖
+		await deleteMessage(message.chat.id, message.message_id);
+		if (count >= WARNING_LIMIT) {
+			// 满3次，执行封禁
+			await clearWarnings(env, currentId);
+			const result = await addToBlacklist(currentId, env, { reason: 'ad_auto', by: 'system', note: `频道转发警告满${WARNING_LIMIT}次自动封禁: ${channelTitle}` });
+			const banResults = await banUserFromAllGroups(currentId, { probeMembership: true, _env: env });
+			const banDetail = await renderBanResultsDetail(banResults, null, { userId: currentId, retryCommand: '/ban' });
+			const lines = [
+				`⚠️ <b>频道转发警告已满 ${WARNING_LIMIT} 次，已自动封禁</b>`,
+				`👤 用户:<code>${currentId}</code>`,
+				`📢 转发频道:${escapeHtml(channelTitle)}`,
+				`📊 累计警告:${count} 次`,
+				'',
+				result.success ? '✅ 已写入 D1 全局黑名单' : `⚠️ D1 写入:${escapeHtml(result.message || '失败')}`,
+				banDetail,
+			];
+			await notifyAllOwners(lines.join('\n'), null);
+			return true;
+		}
+		// 未满3次，发送警告
+		const remaining = WARNING_LIMIT - count;
+		const warnText =
+			`⚠️ <b>警告 ${count}/${WARNING_LIMIT}</b>\n\n` +
+			`检测到您转发了频道帖子（${escapeHtml(channelTitle)}）。\n` +
+			`转发频道帖子属于广告行为，累计 ${WARNING_LIMIT} 次将被自动封禁。\n` +
+			`剩余次数：<b>${remaining}</b> 次`;
+		await sendTelegramMessage(message.chat.id, warnText);
+		// 通知主人
+		await notifyAllOwners(
+			`⚠️ <b>频道转发警告</b>\n` +
+			`👤 用户:<code>${currentId}</code>\n` +
+			`📢 转发频道:${escapeHtml(channelTitle)}\n` +
+			`📊 警告次数:${count}/${WARNING_LIMIT}\n` +
+			`📍 群:<code>${message.chat.id}</code>`,
+			null
+		);
+		return true;
+	}
 
 	const deleteResult = await deleteMessage(message.chat.id, message.message_id);
 	const quoteAuthors = quoteAd ? collectOriginalAuthors(message, 'quote') : [];
