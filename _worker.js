@@ -2007,8 +2007,72 @@ async function banUserFromGroups(userId, groupIds, options = {}) {
 	return results;
 }
 
+// 检测 bot 是否在指定群里（通过 getChat 判断）。
+// 返回: { inGroup: boolean, details?: string }
+async function checkBotInGroup(env, groupId) {
+	if (!env.DB) return { inGroup: false, details: '未绑定 D1' };
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: groupId }),
+		});
+		const result = await response.json();
+		if (response.ok && result?.ok && result.result) {
+			return { inGroup: true, details: result.result.title || result.result.username || '' };
+		}
+		const desc = String(result?.description || '').toLowerCase();
+		if (desc.includes('bot is not a member') || desc.includes('chat not found')) {
+			return { inGroup: false, details: result?.description || 'bot 不在该群' };
+		}
+		return { inGroup: false, details: result?.description || `HTTP ${response.status}` };
+	} catch (error) {
+		return { inGroup: false, details: error.message || 'fetch failed' };
+	}
+}
+
+// 过滤出 bot 仍在的群组。
+// 输入: groupIds 数组
+// 输出: { accessible: string[], inaccessible: { groupId, reason }[] }
+async function filterGroupsBotIsIn(env, groupIds) {
+	const accessible = [];
+	const inaccessible = [];
+	for (const groupId of groupIds) {
+		const id = String(groupId ?? '').trim();
+		if (!id) continue;
+		const check = await checkBotInGroup(env, id);
+		if (check.inGroup) {
+			accessible.push(id);
+		} else {
+			inaccessible.push({ groupId: id, reason: check.details });
+		}
+		// 限流：每条检测间隔 200ms
+		await new Promise((resolve) => setTimeout(resolve, 200));
+	}
+	return { accessible, inaccessible };
+}
+
 // 全群封禁：只有真人 /spam（以及主人私聊 /ban 的全局通道）才使用。
+// 先过滤掉 bot 不在的群组，避免无效尝试。
 async function banUserFromAllGroups(userId, options = {}) {
+	// 从 options 中获取 env（由调用方传入）
+	const envRef = options._env;
+	if (envRef?.DB && options.filterBotGroups !== false) {
+		const { accessible, inaccessible } = await filterGroupsBotIsIn(envRef, GROUP_IDS);
+		if (inaccessible.length > 0) {
+			console.log(`[封禁] bot 不在 ${inaccessible.length} 个群中，已跳过: ${inaccessible.map((i) => i.groupId).join(', ')}`);
+		}
+		if (accessible.length === 0) {
+			return inaccessible.map((i) => ({
+				groupId: i.groupId,
+				userId: String(userId),
+				ok: false,
+				error: `bot 不在该群: ${i.reason}`,
+				skipped: true,
+			}));
+		}
+		return banUserFromGroups(userId, accessible, options);
+	}
 	return banUserFromGroups(userId, GROUP_IDS, options);
 }
 
@@ -2036,7 +2100,24 @@ async function unbanUserFromGroups(userId, groupIds) {
 	return results;
 }
 
-async function unbanUserFromAllGroups(userId) {
+async function unbanUserFromAllGroups(userId, options = {}) {
+	const envRef = options._env;
+	if (envRef?.DB && options.filterBotGroups !== false) {
+		const { accessible, inaccessible } = await filterGroupsBotIsIn(envRef, GROUP_IDS);
+		if (inaccessible.length > 0) {
+			console.log(`[解封] bot 不在 ${inaccessible.length} 个群中，已跳过: ${inaccessible.map((i) => i.groupId).join(', ')}`);
+		}
+		if (accessible.length === 0) {
+			return inaccessible.map((i) => ({
+				groupId: i.groupId,
+				userId: String(userId),
+				ok: false,
+				error: `bot 不在该群: ${i.reason}`,
+				skipped: true,
+			}));
+		}
+		return unbanUserFromGroups(userId, accessible);
+	}
 	return unbanUserFromGroups(userId, GROUP_IDS);
 }
 
@@ -9832,7 +9913,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				const lines = [`🎬 操作:举报加黑(/spam，跨群封禁)`];
 				let flashText;
 				if (result.success || alreadyExists) {
-					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
+					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true, _env: env });
 					targetMention = formatTargetFromBanResults(valid[0], banResults);
 					lines.push(`🎯 目标用户:${targetMention}`);
 					lines.push(`📍 生效范围:${describeBlacklistScope(null)}`);
@@ -9866,7 +9947,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const perUserBanResults = await mapWithConcurrency(
 				idsToKick,
 				BULK_TASK_CONCURRENCY,
-				async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id) })
+				async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id, { _env: env }) })
 			);
 			for (const { banResults } of perUserBanResults) {
 				const okCount = banResults.filter((r) => r.ok).length;
@@ -9919,7 +10000,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (result.success || alreadyExists) {
 			// 加黑成功或已存在 → Telegram 群封禁/预封(revoke_messages 默认 true:封禁同时删该用户在各群全部消息)
 			//   + 缓存清扫兜底(补删 revoke 偶尔漏的、当前群近期消息)
-			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true });
+			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true, _env: env });
 			const cleanupResult = await cleanupCurrentChatUserMessages(env, chatId, repliedUserId, [repliedMsg.message_id]);
 
 			const lines = [
