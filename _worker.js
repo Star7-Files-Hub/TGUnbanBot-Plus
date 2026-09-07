@@ -9731,7 +9731,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const argMatch = text.trim().match(/^\/ad_test(?:@[^\s]+)?\s*(\S*)/i);
 		const arg = argMatch ? argMatch[1].trim().toLowerCase() : 'status';
 		if (arg === 'on') {
-			await setAdTestMode(env, userId, true);
+			const setResult = await setAdTestMode(env, userId, true);
+			console.log(`[ad_test] 开启: userId=${userId}, result=${setResult}`);
 			await sendTelegramMessage(chatId, '✅ <b>广告检测测试模式已开启</b>\n\n转发或发送消息到私聊，机器人会回复是否命中广告判据及依据。\n不会写入任何数据库（不加黑、不学习、不缓存）。\n发送 <code>/ad_test off</code> 关闭。');
 			return;
 		}
@@ -9747,10 +9748,16 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 	// 测试模式下的广告检测分析（不写入数据库）
 	if (message.chat.type === 'private' && message.from && !message.from.is_bot) {
-		const testMode = await getAdTestMode(env, userId);
-		if (testMode && !isTelegramServiceMessage(message) && !isTelegramSlashCommand(text)) {
-			await runAdTestAnalysis(message, env, ctx);
-			return;
+		try {
+			const testMode = await getAdTestMode(env, userId);
+			console.log(`[ad_test] 检测: userId=${userId}, testMode=${testMode}, isService=${isTelegramServiceMessage(message)}, isSlash=${isTelegramSlashCommand(text)}, text=${text?.slice(0, 50)}`);
+			if (testMode && !isTelegramServiceMessage(message) && !isTelegramSlashCommand(text)) {
+				console.log('[ad_test] 运行广告检测分析...');
+				await runAdTestAnalysis(message, env, ctx);
+				return;
+			}
+		} catch (error) {
+			console.error('[ad_test] 分析失败:', error);
 		}
 	}
 
