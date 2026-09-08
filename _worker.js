@@ -11502,11 +11502,29 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			});
 			const lines = ['📖 <b>已学习广告样本</b>'];
 			lines.push(learn.fpAdded ? '✅ 指纹已入库(以后相同广告自动秒杀)' : 'ℹ️ 指纹已存在,未重复入库');
+			// V2: 自动将学习内容写入广告指纹库
+			const fpResults = [];
+			if (env.DB) {
+				// 学习完整文本作为指纹
+				const fpResult = await addAdFingerprint(env, rest, 'keyword', 0.8, 'learn');
+				fpResults.push(fpResult.ok ? '✅ 文本已加入指纹库' : `⚠️ 文本加入失败: ${fpResult.error || '未知'}`);
+				// 提取的关键词也加入指纹库
+				if (learn.suggestedKeywords.length > 0) {
+					for (const kw of learn.suggestedKeywords) {
+						await addAdFingerprint(env, kw, 'keyword', 0.7, 'learn');
+					}
+					fpResults.push(`✅ ${learn.suggestedKeywords.length} 个关键词已加入指纹库`);
+				}
+			}
 			if (learn.suggestedKeywords.length > 0) {
-				lines.push(`💡 建议词(不会自动入库,需手动加):${learn.suggestedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
-				lines.push(`   要加进词库请发:<code>/addword general ${escapeHtml(learn.suggestedKeywords.join(' '))}</code>`);
+				lines.push(`💡 提取关键词:${learn.suggestedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
 			}
 			lines.push(`📊 当前样本库共 ${learn.sampleCount} 条`);
+			if (fpResults.length > 0) {
+				lines.push('');
+				lines.push('<b>V2 指纹库:</b>');
+				fpResults.forEach((r) => lines.push(`  ${r}`));
+			}
 			await replyToAdmin(message, ctx, {
 				flashText: '📖 已学习广告样本',
 				detailText: lines.join('\n'),
