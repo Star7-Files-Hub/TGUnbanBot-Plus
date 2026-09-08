@@ -707,7 +707,7 @@ const PRIMARY_OWNER_COMMAND_MENU = [
 	{ command: 'pending', description: '待确认广告判定快照' },
 	{ command: 'confirm', description: '确认广告判定正确' },
 	{ command: 'ignore', description: '忽略错误判定并解封' },
-	{ command: 'words', description: '查看广告指纹库' },
+	{ command: 'v2words', description: '查看广告指纹库' },
 	{ command: 'clean_blacklist', description: '清理销号用户' },
 	{ command: 'clean_switch', description: '自动销号清理开关' },
 	{ command: 'add_mod', description: '添加额外管理员' },
@@ -10098,7 +10098,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 
 	// ===== 广告检测 V2 命令（仅第一主人私聊）=====
-	if (text && /^\/(pending|confirm|ignore|addword|delword|words)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+	if (text && /^\/(pending|confirm|ignore|v2add|v2del|v2words)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
 		if (!isPrimaryOwner(userId)) {
 			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告检测管理仅限第一主人。');
@@ -10112,8 +10112,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间。');
 			return;
 		}
-		const head = text.trim().match(/^\/(pending|confirm|ignore|addword|delword|words)(?:@[^\s]+)?/i)[1].toLowerCase();
-		const argMatch = text.trim().match(/^\/(?:pending|confirm|ignore|addword|delword|words)(?:@[^\s]+)?\s*([\s\S]*)/i);
+		const head = text.trim().match(/^\/(pending|confirm|ignore|v2add|v2del|v2words)(?:@[^\s]+)?/i)[1].toLowerCase();
+		const argMatch = text.trim().match(/^\/(?:pending|confirm|ignore|v2add|v2del|v2words)(?:@[^\s]+)?\s*([\s\S]*)/i);
 		const arg = argMatch ? argMatch[1].trim() : '';
 
 		// /pending [N] - 列出待确认快照
@@ -10185,8 +10185,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 
-		// /addword 值 - 手动添加指纹
-		if (head === 'addword') {
+		// /v2add 值 - 手动添加指纹
+		if (head === 'v2add') {
 			if (!arg) {
 				await sendTelegramMessage(chatId, '❌ 用法：<code>/addword 关键词</code>');
 				return;
@@ -10198,8 +10198,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 
-		// /delword 值 - 删除指纹
-		if (head === 'delword') {
+		// /v2del 值 - 删除指纹
+		if (head === 'v2del') {
 			if (!arg) {
 				await sendTelegramMessage(chatId, '❌ 用法：<code>/delword 关键词</code>');
 				return;
@@ -10211,8 +10211,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 
-		// /words [页码] - 查看指纹库
-		if (head === 'words') {
+		// /v2words [页码] - 查看指纹库
+		if (head === 'v2words') {
 			const page = Math.max(parseInt(arg) || 1, 1);
 			const offset = (page - 1) * 20;
 			await ensureD1Table(env);
