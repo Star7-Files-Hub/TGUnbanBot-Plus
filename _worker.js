@@ -10056,7 +10056,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const head = text.trim().match(/^\/(add_mod|del_mod|list_mod)(?:@[^\s]+)?/i)[1].toLowerCase();
 
 		// /list_mod：列出全部额外管理员
-		if (head === '/list_mod') {
+		if (head === 'list_mod') {
 			const admins = await listModerationAdmins(env);
 			const lines = ['🛡️ <b>额外管理员列表</b>（可使用 /ban 和 /spam）', ''];
 			if (admins.length === 0) {
@@ -10079,7 +10079,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 		const targetId = match[2];
 		const note = match[3] ? match[3].trim() : '';
-		if (head === '/add_mod') {
+		if (head === 'add_mod') {
 			const result = await addModerationAdmin(env, targetId, userId, note);
 			await sendTelegramMessage(chatId, result.ok
 				? `✅ 已将 <code>${escapeHtml(targetId)}</code> 添加为额外管理员${note ? '（' + escapeHtml(note) + '）' : ''}。\n可使用 /ban 和 /spam。`
@@ -10113,7 +10113,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const arg = argMatch ? argMatch[1].trim() : '';
 
 		// /pending [N] - 列出待确认快照
-		if (head === '/pending') {
+		if (head === 'pending') {
 			const limit = Math.min(Math.max(parseInt(arg) || 10, 1), 50);
 			const snapshots = await getPendingSnapshots(env, limit);
 			const lines = ['📋 <b>待确认广告判定快照</b>', ''];
@@ -10134,7 +10134,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		// /confirm 序号 - 确认判定正确，学入指纹库
-		if (head === '/confirm') {
+		if (head === 'confirm') {
 			if (!arg) {
 				await sendTelegramMessage(chatId, '❌ 用法：<code>/confirm 序号</code>（见 /pending）');
 				return;
@@ -10162,7 +10162,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		// /ignore 序号 - 判定错误，解黑 + 标记误报
-		if (head === '/ignore') {
+		if (head === 'ignore') {
 			if (!arg) {
 				await sendTelegramMessage(chatId, '❌ 用法：<code>/ignore 序号</code>（见 /pending）');
 				return;
@@ -10182,7 +10182,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		// /addword 值 - 手动添加指纹
-		if (head === '/addword') {
+		if (head === 'addword') {
 			if (!arg) {
 				await sendTelegramMessage(chatId, '❌ 用法：<code>/addword 关键词</code>');
 				return;
@@ -10195,7 +10195,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		// /delword 值 - 删除指纹
-		if (head === '/delword') {
+		if (head === 'delword') {
 			if (!arg) {
 				await sendTelegramMessage(chatId, '❌ 用法：<code>/delword 关键词</code>');
 				return;
@@ -10208,7 +10208,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		// /words [页码] - 查看指纹库
-		if (head === '/words') {
+		if (head === 'words') {
 			const page = Math.max(parseInt(arg) || 1, 1);
 			const offset = (page - 1) * 20;
 			await ensureD1Table(env);
