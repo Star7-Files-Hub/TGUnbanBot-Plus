@@ -993,7 +993,7 @@ async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 // 读取并归一化黑名单
 // === D1 工具函数 ===
 // 首次访问 D1 时建表（幂等），避免人工建表步骤
-const D1_SCHEMA_VERSION = 6;
+const D1_SCHEMA_VERSION = 7;
 const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
 const D1_INIT_PROMISES = new WeakMap();
@@ -10339,8 +10339,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 命令：/ad_test on | /ad_test off | /ad_test status
 	if (text && /^\/ad_test(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		if (!isPrimaryOwner(userId)) {
-			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/ad_test 仅限第一主人使用。');
+		if (!isOwner(userId)) {
+			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/ad_test 仅限主人使用。');
 			return;
 		}
 		const argMatch = text.trim().match(/^\/ad_test(?:@[^\s]+)?\s*(\S*)/i);
