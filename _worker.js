@@ -6769,6 +6769,101 @@ async function updatePendingSnapshot(env, token, status) {
 	}
 }
 
+// ===== 状态菜单 =====
+async function sendStatusMenu(message, env, ctx) {
+	const chatId = message.chat.id;
+	const lines = ['🤖 <b>机器人状态</b>', ''];
+
+	// 基本状态
+	lines.push('✅ <b>运行状态:</b> 正常运行');
+	lines.push(`🕐 <b>时间:</b> ${new Date().toISOString().slice(0, 19).replace('T', ' ')} UTC`);
+
+	// AI 绑定状态
+	const aiStatus = env.AI ? '✅ 已绑定' : '❌ 未绑定';
+	lines.push(`🧠 <b>Workers AI:</b> ${aiStatus}`);
+
+	// 广告检测状态
+	const adStatus = AD_FILTER_ENABLED ? '✅ 已开启' : '❌ 已关闭';
+	lines.push(`🔍 <b>广告检测:</b> ${adStatus}`);
+
+	// 自动清理状态
+	let autoCleanStatus = '❌ 已关闭';
+	try {
+		if (env.DB) {
+			await ensureD1Table(env);
+			const row = await env.DB.prepare("SELECT value FROM auto_clean_settings WHERE key = 'enabled'").first();
+			autoCleanStatus = row && row.value ? '✅ 已开启' : '❌ 已关闭';
+		}
+	} catch (error) { /* ignore */ }
+	lines.push(`🧹 <b>自动清理:</b> ${autoCleanStatus}`);
+
+	lines.push('');
+	lines.push('<b>📊 数据统计</b>');
+
+	// 指纹库数量
+	let fpCount = 0;
+	let obsCount = 0;
+	let pendingCount = 0;
+	let warnCount = 0;
+	let modAdminCount = 0;
+	try {
+		if (env.DB) {
+			await ensureD1Table(env);
+			const fpRow = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_fingerprints').first();
+			fpCount = fpRow?.cnt || 0;
+			const obsRow = await env.DB.prepare("SELECT COUNT(*) as cnt FROM ad_observation_window WHERE status = 'observing'").first();
+			obsCount = obsRow?.cnt || 0;
+			const pendingRow = await env.DB.prepare("SELECT COUNT(*) as cnt FROM ad_pending_snapshots WHERE status = 'pending'").first();
+			pendingCount = pendingRow?.cnt || 0;
+			const warnRow = await env.DB.prepare('SELECT COUNT(*) as cnt FROM warning_records').first();
+			warnCount = warnRow?.cnt || 0;
+			const modRow = await env.DB.prepare('SELECT COUNT(*) as cnt FROM moderation_admins').first();
+			modAdminCount = modRow?.cnt || 0;
+		}
+	} catch (error) { /* ignore */ }
+
+	lines.push(`  • 指纹库: ${fpCount} 条`);
+	lines.push(`  • 观察窗口: ${obsCount} 人`);
+	lines.push(`  • 待确认快照: ${pendingCount} 条`);
+	lines.push(`  • 警告记录: ${warnCount} 人`);
+	lines.push(`  • 额外管理员: ${modAdminCount} 人`);
+
+	// 黑名单数量
+	let blacklistCount = 0;
+	try {
+		if (env.DB) {
+			const blRow = await env.DB.prepare('SELECT COUNT(*) as cnt FROM blacklist').first();
+			blacklistCount = blRow?.cnt || 0;
+		}
+	} catch (error) { /* ignore */ }
+	lines.push(`  • 黑名单: ${blacklistCount} 人`);
+
+	// 内联按钮
+	const replyMarkup = {
+		inline_keyboard: [
+			[
+				{ text: '🔄 刷新', callback_data: 'status:refresh' },
+				{ text: '🔍 广告检测', callback_data: 'status:ad_toggle' },
+			],
+			[
+				{ text: '🧹 自动清理', callback_data: 'status:clean_toggle' },
+				{ text: '📋 待确认', callback_data: 'status:pending' },
+			],
+			[
+				{ text: '📚 指纹库', callback_data: 'status:words' },
+				{ text: '🛡️ 管理员', callback_data: 'status:mods' },
+			],
+		],
+	};
+
+	// 发送或编辑消息
+	try {
+		await sendTelegramMessage(chatId, lines.join('\n'), replyMarkup);
+	} catch (error) {
+		console.error('[status] 发送失败:', error);
+	}
+}
+
 // 域名白名单检查
 async function isDomainWhitelisted(env, text) {
 	if (!env.DB || !text) return false;
@@ -9473,6 +9568,93 @@ async function finalizeAdVote(env, state, result, decisionBy = null) {
 
 async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 	const data = String(callbackQuery?.data || '');
+	const voterId = String(callbackQuery?.from?.id || '');
+	const callbackChatId = String(callbackQuery?.message?.chat?.id || '');
+	const callbackMessageId = Number(callbackQuery?.message?.message_id) || 0;
+
+	// 状态菜单（内联按钮）
+	if (data.startsWith('status:')) {
+		const action = data.slice('status:'.length);
+		if (!isOwner(voterId)) {
+			await answerAdVoteCallback(callbackQuery?.id, '仅限主人操作', true);
+			return;
+		}
+		const cbChatId = String(callbackQuery?.message?.chat?.id || '');
+		if (action === 'refresh') {
+			await answerAdVoteCallback(callbackQuery?.id, '🔄 已刷新');
+			await sendStatusMenu({ chat: { id: cbChatId }, message: callbackQuery.message }, env, ctx);
+			return;
+		}
+		if (action === 'ad_toggle') {
+			await answerAdVoteCallback(callbackQuery?.id, '请在 Cloudflare 后台修改 AD_FILTER_ENABLED 环境变量');
+			return;
+		}
+		if (action === 'clean_toggle') {
+			try {
+				if (env.DB) {
+					await ensureD1Table(env);
+					const row = await env.DB.prepare("SELECT value FROM auto_clean_settings WHERE key = 'enabled'").first();
+					const current = row?.value ? true : false;
+					await setAutoCleanEnabled(env, !current);
+					await answerAdVoteCallback(callbackQuery?.id, `已${!current ? '开启' : '关闭'}自动清理`);
+					await sendStatusMenu({ chat: { id: cbChatId }, message: callbackQuery.message }, env, ctx);
+				}
+			} catch (error) {
+				await answerAdVoteCallback(callbackQuery?.id, `操作失败: ${error.message}`, true);
+			}
+			return;
+		}
+		if (action === 'pending') {
+			const snapshots = await getPendingSnapshots(env, 10);
+			if (snapshots.length === 0) {
+				await answerAdVoteCallback(callbackQuery?.id, '没有待确认的快照');
+			} else {
+				let text = '📋 <b>待确认快照</b>\n\n';
+				snapshots.forEach((s, i) => {
+					text += `${i + 1}. 序号:<code>${s.token.slice(0, 12)}</code> 评分:${s.score}\n`;
+					text += `   用户:<code>${s.user_id}</code>\n\n`;
+				});
+				text += '确认:<code>/confirm 序号</code> 忽略:<code>/ignore 序号</code>';
+				await sendTelegramMessage(cbChatId, text);
+				await answerAdVoteCallback(callbackQuery?.id, '已发送待确认列表');
+			}
+			return;
+		}
+		if (action === 'words') {
+			try {
+				await ensureD1Table(env);
+				const { results } = await env.DB.prepare('SELECT value, type, weight, hit_count FROM ad_fingerprints ORDER BY hit_count DESC LIMIT 10').all();
+				let text = '📚 <b>广告指纹库 Top 10</b>\n\n';
+				if (results.length === 0) {
+					text += '（空）';
+				} else {
+					results.forEach((r, i) => {
+						text += `${i + 1}. <code>${escapeHtml(r.value)}</code> (权重${r.weight}, 命中${r.hit_count})\n`;
+					});
+				}
+				await sendTelegramMessage(cbChatId, text);
+				await answerAdVoteCallback(callbackQuery?.id, '已发送指纹库');
+			} catch (error) {
+				await answerAdVoteCallback(callbackQuery?.id, `查询失败: ${error.message}`, true);
+			}
+			return;
+		}
+		if (action === 'mods') {
+			const admins = await listModerationAdmins(env);
+			let text = '🛡️ <b>额外管理员列表</b>\n\n';
+			if (admins.length === 0) {
+				text += '（空）';
+			} else {
+				admins.forEach((a, i) => {
+					const note = a.note ? ` — ${escapeHtml(a.note)}` : '';
+					text += `${i + 1}. <code>${escapeHtml(a.user_id)}</code>${note}\n`;
+				});
+			}
+			await sendTelegramMessage(cbChatId, text);
+			await answerAdVoteCallback(callbackQuery?.id, '已发送管理员列表');
+			return;
+		}
+	}
 
 	// 自动销号清理开关（内联按钮）
 	if (data.startsWith('clean_switch:')) {
@@ -9527,8 +9709,6 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 	}
 	const action = match[1];
 	const voteToken = match[2];
-	const callbackChatId = String(callbackQuery?.message?.chat?.id || '');
-	const callbackMessageId = Number(callbackQuery?.message?.message_id) || 0;
 	if (!isConfiguredGroup(callbackChatId)) {
 		await answerAdVoteCallback(callbackQuery?.id, '该投票不属于配置群', true);
 		return;
@@ -9558,7 +9738,6 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 		return;
 	}
 
-	const voterId = String(callbackQuery?.from?.id || '');
 	if (!/^\d+$/.test(voterId) || callbackQuery?.from?.is_bot) {
 		await answerAdVoteCallback(callbackQuery?.id, '机器人或无效账号不能投票', true);
 		return;
@@ -10094,6 +10273,17 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				? `✅ 已将 <code>${escapeHtml(targetId)}</code> 从额外管理员移除。`
 				: `❌ 移除失败：${escapeHtml(result.error || '未知错误')}`);
 		}
+		return;
+	}
+
+	// ===== /status 机器人状态（内联按钮菜单）=====
+	if (text && /^\/status(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		if (!isOwner(userId)) {
+			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/status 仅限主人使用。');
+			return;
+		}
+		await sendStatusMenu(message, env, ctx);
 		return;
 	}
 
