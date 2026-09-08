@@ -1265,9 +1265,45 @@ async function ensureD1Table(env) {
 				['moderation_admins', 'CREATE TABLE IF NOT EXISTS moderation_admins (user_id TEXT PRIMARY KEY, added_by TEXT NOT NULL, added_at TEXT NOT NULL, note TEXT);'],
 				// 频道转发警告记录：记录用户转发频道帖子的次数，满3次后自动封禁。
 				['warning_records', 'CREATE TABLE IF NOT EXISTS warning_records (user_id TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, last_warned_at TEXT, history TEXT);'],
+			// ===== 广告检测 V2 =====
+			// 广告指纹库：存储关键词/域名/用户名/Bio 模式的指纹，用于快速匹配。
+				['ad_fingerprints', `CREATE TABLE IF NOT EXISTS ad_fingerprints (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT UNIQUE NOT NULL, type TEXT NOT NULL, weight REAL NOT NULL DEFAULT 0.6, source TEXT NOT NULL DEFAULT 'auto', hit_count INTEGER NOT NULL DEFAULT 0, created_at TEXT, last_hit_at TEXT);`],
+			// 观察窗口：记录可疑用户，24 小时内累计分数达标才封禁。
+				['ad_observation_window', `CREATE TABLE IF NOT EXISTS ad_observation_window (user_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, score REAL NOT NULL DEFAULT 0, hits TEXT, first_seen TEXT, last_seen TEXT, status TEXT NOT NULL DEFAULT 'observing');`],
+			// 待确认快照：自动判定为广告时推给主人复核的快照。
+				['ad_pending_snapshots', `CREATE TABLE IF NOT EXISTS ad_pending_snapshots (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, chat_id TEXT NOT NULL, message_id INTEGER, score REAL, hits TEXT, preview TEXT, created_at TEXT, status TEXT NOT NULL DEFAULT 'pending');`],
+			// 域名白名单：命中即豁免广告检测。
+				['ad_domain_whitelist', `CREATE TABLE IF NOT EXISTS ad_domain_whitelist (domain TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'manual', created_at TEXT);`],
+			// AI 语义比对样本（可选，需要 Workers AI 绑定）。
+				['ad_sample_embeddings', `CREATE TABLE IF NOT EXISTS ad_sample_embeddings (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, embedding TEXT NOT NULL, created_at TEXT);`],
 			];
 			for (const [label, sql] of tableStatements) {
 				await runD1SchemaStatement(env, label, sql);
+			}
+
+			// V2 索引
+			const v2Indexes = [
+				['idx_ad_fingerprints_value', 'CREATE INDEX IF NOT EXISTS idx_ad_fingerprints_value ON ad_fingerprints(value);'],
+				['idx_ad_fingerprints_type', 'CREATE INDEX IF NOT EXISTS idx_ad_fingerprints_type ON ad_fingerprints(type);'],
+				['idx_ad_observation_status', 'CREATE INDEX IF NOT EXISTS idx_ad_observation_status ON ad_observation_window(status);'],
+				['idx_ad_pending_status', 'CREATE INDEX IF NOT EXISTS idx_ad_pending_status ON ad_pending_snapshots(status);'],
+			];
+			for (const [label, sql] of v2Indexes) {
+				await runD1SchemaStatement(env, label, sql, { optional: true });
+			}
+
+			// V2 域名白名单种子数据
+			try {
+				const existingWhitelist = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_domain_whitelist').first();
+				if (!existingWhitelist || existingWhitelist.cnt === 0) {
+					const seedDomains = ['github.com', 'gitlab.com', 'google.com', 'youtube.com', 'bilibili.com', 'telegram.org', 'wikipedia.org', 'stackoverflow.com', 'zhihu.com', 'juejin.cn'];
+					for (const domain of seedDomains) {
+						await env.DB.prepare('INSERT OR IGNORE INTO ad_domain_whitelist (domain, source, created_at) VALUES (?, ?, ?)')
+							.bind(domain, 'seed', new Date().toISOString()).run();
+					}
+				}
+			} catch (error) {
+				console.error('[ad_v2] 域名白名单种子写入失败:', error.message);
 			}
 
 			const optionalIndexes = [
@@ -6542,6 +6578,215 @@ async function clearWarnings(env, userId) {
 	}
 }
 
+// ===== 广告检测 V2 =====
+// 观察窗口 + 指纹库 + 人工确认机制
+
+const AD_V2_OBSERVATION_HOURS = 24;
+const AD_V2_BAN_SCORE = 7;      // 达到此分数直接封禁
+const AD_V2_OBSERVE_SCORE = 4;  // 达到此分数进入观察窗口
+const AD_V2_FINGERPRINT_BAN_WEIGHT = 0.8;  // 指纹权重达到此值直接封禁
+
+// 获取指纹库（带缓存）
+let _adFingerprintCache = null;
+let _adFingerprintCacheAt = 0;
+const AD_FINGERPRINT_CACHE_TTL = 60000;
+
+async function getAdFingerprints(env) {
+	if (!env.DB) return [];
+	const now = Date.now();
+	if (_adFingerprintCache && (now - _adFingerprintCacheAt) < AD_FINGERPRINT_CACHE_TTL) {
+		return _adFingerprintCache;
+	}
+	try {
+		await ensureD1Table(env);
+		const { results } = await env.DB.prepare('SELECT value, type, weight, source FROM ad_fingerprints').all();
+		_adFingerprintCache = results || [];
+		_adFingerprintCacheAt = now;
+		return _adFingerprintCache;
+	} catch (error) {
+		console.error('[ad_v2] 读取指纹库失败:', error.message);
+		return [];
+	}
+}
+
+function invalidateAdFingerprintCache() {
+	_adFingerprintCache = null;
+	_adFingerprintCacheAt = 0;
+}
+
+// 添加指纹
+async function addAdFingerprint(env, value, type = 'keyword', weight = 0.6, source = 'auto') {
+	if (!env.DB) return { ok: false, error: '未绑定 D1' };
+	try {
+		await ensureD1Table(env);
+		const now = new Date().toISOString();
+		await env.DB.prepare(
+			`INSERT INTO ad_fingerprints (value, type, weight, source, hit_count, created_at)
+			 VALUES (?, ?, ?, ?, 0, ?)
+			 ON CONFLICT(value) DO UPDATE SET weight = MAX(weight, excluded.weight), source = CASE WHEN source = 'manual' THEN 'manual' ELSE excluded.source END`
+		).bind(String(value).toLowerCase(), type, weight, source, now).run();
+		invalidateAdFingerprintCache();
+		return { ok: true };
+	} catch (error) {
+		console.error('[ad_v2] 添加指纹失败:', error.message);
+		return { ok: false, error: error.message };
+	}
+}
+
+// 删除指纹
+async function removeAdFingerprint(env, value) {
+	if (!env.DB) return { ok: false, error: '未绑定 D1' };
+	try {
+		await ensureD1Table(env);
+		const result = await env.DB.prepare('DELETE FROM ad_fingerprints WHERE value = ?').bind(String(value).toLowerCase()).run();
+		invalidateAdFingerprintCache();
+		return { ok: true, changed: (result?.meta?.changes || result?.changes || 0) > 0 };
+	} catch (error) {
+		console.error('[ad_v2] 删除指纹失败:', error.message);
+		return { ok: false, error: error.message };
+	}
+}
+
+// 指纹匹配：返回匹配的指纹列表
+async function matchAdFingerprints(env, text) {
+	if (!text) return [];
+	const fingerprints = await getAdFingerprints(env);
+	const lower = String(text).toLowerCase();
+	const matches = [];
+	for (const fp of fingerprints) {
+		if (fp.value && lower.includes(fp.value.toLowerCase())) {
+			matches.push(fp);
+		}
+	}
+	return matches;
+}
+
+// 更新观察窗口
+async function updateObservationWindow(env, userId, chatId, scoreDelta, hits) {
+	if (!env.DB) return null;
+	const id = String(userId || '').trim();
+	if (!id) return null;
+	try {
+		await ensureD1Table(env);
+		const now = new Date().toISOString();
+		const existing = await env.DB.prepare('SELECT * FROM ad_observation_window WHERE user_id = ?').bind(id).first();
+		if (existing) {
+			const newScore = (existing.score || 0) + scoreDelta;
+			const historyHits = existing.hits ? JSON.parse(existing.hits) : [];
+			if (hits) historyHits.push(...hits);
+			await env.DB.prepare(
+				'UPDATE ad_observation_window SET score = ?, hits = ?, last_seen = ?, status = ? WHERE user_id = ?'
+			).bind(newScore, JSON.stringify(historyHits), now, newScore >= AD_V2_BAN_SCORE ? 'banned' : 'observing', id).run();
+			return { score: newScore, status: newScore >= AD_V2_BAN_SCORE ? 'banned' : 'observing' };
+		}
+		await env.DB.prepare(
+			`INSERT INTO ad_observation_window (user_id, chat_id, score, hits, first_seen, last_seen, status)
+			 VALUES (?, ?, ?, ?, ?, ?, 'observing')`
+		).bind(id, String(chatId), scoreDelta, JSON.stringify(hits || []), now, now).run();
+		return { score: scoreDelta, status: 'observing' };
+	} catch (error) {
+		console.error('[ad_v2] 更新观察窗口失败:', error.message);
+		return null;
+	}
+}
+
+// 获取观察窗口中的用户
+async function getObservationWindow(env, limit = 10) {
+	if (!env.DB) return [];
+	try {
+		await ensureD1Table(env);
+		const since = new Date(Date.now() - AD_V2_OBSERVATION_HOURS * 3600 * 1000).toISOString();
+		const { results } = await env.DB.prepare(
+			'SELECT * FROM ad_observation_window WHERE status = "observing" AND last_seen > ? ORDER BY score DESC LIMIT ?'
+		).bind(since, limit).all();
+		return results || [];
+	} catch (error) {
+		console.error('[ad_v2] 读取观察窗口失败:', error.message);
+		return [];
+	}
+}
+
+// 创建待确认快照
+async function createPendingSnapshot(env, userId, chatId, messageId, score, hits, preview) {
+	if (!env.DB) return null;
+	try {
+		await ensureD1Table(env);
+		const token = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+		const now = new Date().toISOString();
+		await env.DB.prepare(
+			`INSERT INTO ad_pending_snapshots (token, user_id, chat_id, message_id, score, hits, preview, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		).bind(token, String(userId), String(chatId), messageId, score, JSON.stringify(hits || []), preview || '', now).run();
+		return token;
+	} catch (error) {
+		console.error('[ad_v2] 创建快照失败:', error.message);
+		return null;
+	}
+}
+
+// 获取待确认快照
+async function getPendingSnapshots(env, limit = 20) {
+	if (!env.DB) return [];
+	try {
+		await ensureD1Table(env);
+		const since = new Date(Date.now() - 3600000).toISOString();
+		const { results } = await env.DB.prepare(
+			'SELECT * FROM ad_pending_snapshots WHERE status = "pending" AND created_at > ? ORDER BY created_at DESC LIMIT ?'
+		).bind(since, limit).all();
+		return results || [];
+	} catch (error) {
+		console.error('[ad_v2] 读取快照失败:', error.message);
+		return [];
+	}
+}
+
+// 获取单个快照
+async function getPendingSnapshot(env, token) {
+	if (!env.DB) return null;
+	try {
+		await ensureD1Table(env);
+		return await env.DB.prepare('SELECT * FROM ad_pending_snapshots WHERE token = ? AND status = "pending"').bind(token).first();
+	} catch (error) {
+		console.error('[ad_v2] 读取快照失败:', error.message);
+		return null;
+	}
+}
+
+// 更新快照状态
+async function updatePendingSnapshot(env, token, status) {
+	if (!env.DB) return false;
+	try {
+		await ensureD1Table(env);
+		await env.DB.prepare('UPDATE ad_pending_snapshots SET status = ? WHERE token = ?').bind(status, token).run();
+		return true;
+	} catch (error) {
+		console.error('[ad_v2] 更新快照失败:', error.message);
+		return false;
+	}
+}
+
+// 域名白名单检查
+async function isDomainWhitelisted(env, text) {
+	if (!env.DB || !text) return false;
+	try {
+		await ensureD1Table(env);
+		const { results } = await env.DB.prepare('SELECT domain FROM ad_domain_whitelist').all();
+		const domains = (results || []).map((r) => r.domain.toLowerCase());
+		const urlPattern = /(?:https?:\/\/)?([^\s/]+\.[^\s/]+)/g;
+		let match;
+		while ((match = urlPattern.exec(text)) !== null) {
+			const domain = match[1].toLowerCase();
+			for (const wd of domains) {
+				if (domain === wd || domain.endsWith('.' + wd)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	} catch (error) {
+		return false;
+	}
+}
 
 // ===== /recent 冻结快照(供 /learnlast 按固定序号引用,根治序号漂移)=====
 // /recent 把当时的疑似广告列表(已按上下文过滤+排序)冻结写入 D1;
@@ -8140,6 +8385,25 @@ async function detectAdLegacy(message, env) {
 
 	if (mentionsBot && hasLure) { score += 2; hits.push('@bot+诱导词'); }
 
+	// V2 指纹库匹配
+	if (env?.DB) {
+		const fpMatches = await matchAdFingerprints(env, fullText);
+		for (const fp of fpMatches) {
+			if (fp.weight >= AD_V2_FINGERPRINT_BAN_WEIGHT) {
+				// 高权重指纹直接命中
+				return { isAd: true, score: 99, hits: [`指纹:${fp.value}`], strong: '广告指纹库命中', source: '指纹库' };
+			}
+			// 低权重指纹加分
+			score += AD_FINGERPRINT_HIT_SCORE;
+			hits.push(`指纹:${fp.value}`);
+		}
+		// 检查域名白名单
+		if (await isDomainWhitelisted(env, fullText)) {
+			score = Math.max(0, score - 3);
+			hits.push('域名白名单豁免');
+		}
+	}
+
 	return { isAd: score >= AD_SCORE_THRESHOLD, score, hits, strong: null };
 }
 
@@ -9589,11 +9853,41 @@ async function handleAutomaticAdDecision(message, adResult, env) {
 		else if (selfQuotedAd) source = '当前广告原作者';
 		else if (forwardedQuotedAd) source = '高置信广告转发者';
 		else if (observation) source = '重复误触型广告引用传播者';
-		currentResult = await enforceAutomaticAdTarget({
-			id: currentId,
-			user: message.from,
-			source,
-		}, env, { skipAdminCheck: true, scopeGroups: [String(message.chat.id)] });
+
+		// V2 观察窗口：直接广告检测（非引用/转发）走观察窗口机制
+		if (directAd && !quoteAd && env?.DB) {
+			const score = adResult.score || 0;
+			const hits = adResult.hits || [];
+			const obsResult = await updateObservationWindow(env, currentId, message.chat.id, score, hits);
+			if (obsResult && obsResult.score >= AD_V2_BAN_SCORE) {
+				// 观察窗口累计分数达标，执行封禁
+				currentResult = await enforceAutomaticAdTarget({
+					id: currentId,
+					user: message.from,
+					source: '广告检测V2观察窗口累计达标',
+				}, env, { skipAdminCheck: true, scopeGroups: [String(message.chat.id)] });
+			} else if (obsResult && obsResult.score >= AD_V2_OBSERVE_SCORE) {
+				// 进入观察窗口，创建待确认快照
+				const preview = (message.text || message.caption || '').slice(0, 100);
+				const token = await createPendingSnapshot(env, currentId, message.chat.id, message.message_id, obsResult.score, hits, preview);
+				// 通知主人
+				await notifyAllOwners(
+					`⚠️ <b>广告检测 V2 观察窗口</b>\n` +
+					`👤 用户:<code>${currentId}</code>\n` +
+					`📊 评分:${obsResult.score}/${AD_V2_BAN_SCORE}\n` +
+					`📍 群:<code>${message.chat.id}</code>\n` +
+					`🔍 命中:${hits.slice(0, 3).map((h) => escapeHtml(h)).join('、')}\n` +
+					(token ? `📋 快照:<code>${token.slice(0, 12)}</code>` : ''),
+					null
+				);
+			}
+		} else {
+			currentResult = await enforceAutomaticAdTarget({
+				id: currentId,
+				user: message.from,
+				source,
+			}, env, { skipAdminCheck: true, scopeGroups: [String(message.chat.id)] });
+		}
 	}
 
 	const originalResults = [];
@@ -9797,6 +10091,140 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				: `❌ 移除失败：${escapeHtml(result.error || '未知错误')}`);
 		}
 		return;
+	}
+
+	// ===== 广告检测 V2 命令（仅第一主人私聊）=====
+	if (text && /^\/(pending|confirm|ignore|addword|delword|words)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+		const isInGroup = message.chat.type !== 'private';
+		if (!isPrimaryOwner(userId)) {
+			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告检测管理仅限第一主人。');
+			return;
+		}
+		if (isInGroup) {
+			await sendAuthorizedCommandResult(message, ctx, { flashText: 'ℹ️ 请私聊操作', detailText: '⚠️ 广告检测管理命令仅限私聊使用。' });
+			return;
+		}
+		if (!env.DB) {
+			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间。');
+			return;
+		}
+		const head = text.trim().match(/^\/(pending|confirm|ignore|addword|delword|words)(?:@[^\s]+)?/i)[1].toLowerCase();
+		const argMatch = text.trim().match(/^\/(?:pending|confirm|ignore|addword|delword|words)(?:@[^\s]+)?\s*([\s\S]*)/i);
+		const arg = argMatch ? argMatch[1].trim() : '';
+
+		// /pending [N] - 列出待确认快照
+		if (head === '/pending') {
+			const limit = Math.min(Math.max(parseInt(arg) || 10, 1), 50);
+			const snapshots = await getPendingSnapshots(env, limit);
+			const lines = ['📋 <b>待确认广告判定快照</b>', ''];
+			if (snapshots.length === 0) {
+				lines.push('（空）自动判定为广告时会推给你复核。');
+			} else {
+				snapshots.forEach((s, i) => {
+					const hits = s.hits ? JSON.parse(s.hits) : [];
+					lines.push(`${i + 1}. 序号:<code>${s.token.slice(0, 12)}</code> 评分:${s.score}`);
+					lines.push(`   用户:<code>${escapeHtml(s.user_id)}</code> 预览:${escapeHtml((s.preview || '').slice(0, 60))}`);
+					if (hits.length > 0) lines.push(`   命中:${hits.slice(0, 3).map((h) => escapeHtml(h)).join('、')}`);
+					lines.push('');
+				});
+				lines.push('确认:<code>/confirm 序号</code> 忽略:<code>/ignore 序号</code>');
+			}
+			await sendTelegramMessage(chatId, lines.join('\n'));
+			return;
+		}
+
+		// /confirm 序号 - 确认判定正确，学入指纹库
+		if (head === '/confirm') {
+			if (!arg) {
+				await sendTelegramMessage(chatId, '❌ 用法：<code>/confirm 序号</code>（见 /pending）');
+				return;
+			}
+			const snapshots = await getPendingSnapshots(env, 50);
+			const snap = snapshots[parseInt(arg) - 1] || snapshots.find((s) => s.token.startsWith(arg));
+			if (!snap) {
+				await sendTelegramMessage(chatId, '❌ 快照不存在或已过期。');
+				return;
+			}
+			// 学入指纹库
+			const hits = snap.hits ? JSON.parse(snap.hits) : [];
+			for (const hit of hits) {
+				if (hit.includes('指纹:')) {
+					const fpValue = hit.replace('指纹:', '');
+					await addAdFingerprint(env, fpValue, 'keyword', 0.7, 'manual');
+				}
+			}
+			// 执行封禁
+			await addToBlacklist(snap.user_id, env, { reason: 'ad_auto', by: userId, note: `广告检测V2确认: 评分${snap.score}` });
+			await banUserFromAllGroups(snap.user_id, { probeMembership: true, _env: env });
+			await updatePendingSnapshot(env, snap.token, 'confirmed');
+			await sendTelegramMessage(chatId, `✅ 已确认并封禁用户 <code>${escapeHtml(snap.user_id)}</code>，指纹已学入。`);
+			return;
+		}
+
+		// /ignore 序号 - 判定错误，解黑 + 标记误报
+		if (head === '/ignore') {
+			if (!arg) {
+				await sendTelegramMessage(chatId, '❌ 用法：<code>/ignore 序号</code>（见 /pending）');
+				return;
+			}
+			const snapshots = await getPendingSnapshots(env, 50);
+			const snap = snapshots[parseInt(arg) - 1] || snapshots.find((s) => s.token.startsWith(arg));
+			if (!snap) {
+				await sendTelegramMessage(chatId, '❌ 快照不存在或已过期。');
+				return;
+			}
+			// 解除黑名单
+			await removeFromBlacklist(snap.user_id, env);
+			await unbanUserFromAllGroups(snap.user_id, { _env: env });
+			await updatePendingSnapshot(env, snap.token, 'ignored');
+			await sendTelegramMessage(chatId, `✅ 已忽略并解封用户 <code>${escapeHtml(snap.user_id)}</code>。`);
+			return;
+		}
+
+		// /addword 值 - 手动添加指纹
+		if (head === '/addword') {
+			if (!arg) {
+				await sendTelegramMessage(chatId, '❌ 用法：<code>/addword 关键词</code>');
+				return;
+			}
+			const result = await addAdFingerprint(env, arg, 'keyword', 0.8, 'manual');
+			await sendTelegramMessage(chatId, result.ok
+				? `✅ 已添加指纹: <code>${escapeHtml(arg)}</code>`
+				: `❌ 添加失败：${escapeHtml(result.error || '未知错误')}`);
+			return;
+		}
+
+		// /delword 值 - 删除指纹
+		if (head === '/delword') {
+			if (!arg) {
+				await sendTelegramMessage(chatId, '❌ 用法：<code>/delword 关键词</code>');
+				return;
+			}
+			const result = await removeAdFingerprint(env, arg);
+			await sendTelegramMessage(chatId, result.ok
+				? result.changed ? `✅ 已删除指纹: <code>${escapeHtml(arg)}</code>` : `❌ 指纹不存在: <code>${escapeHtml(arg)}</code>`
+				: `❌ 删除失败：${escapeHtml(result.error || '未知错误')}`);
+			return;
+		}
+
+		// /words [页码] - 查看指纹库
+		if (head === '/words') {
+			const page = Math.max(parseInt(arg) || 1, 1);
+			const offset = (page - 1) * 20;
+			await ensureD1Table(env);
+			const { results } = await env.DB.prepare('SELECT value, type, weight, source, hit_count FROM ad_fingerprints ORDER BY hit_count DESC LIMIT 20 OFFSET ?').bind(offset).all();
+			const lines = ['📚 <b>广告指纹库</b>', ''];
+			if (results.length === 0) {
+				lines.push('（空）用 <code>/addword 关键词</code> 添加。');
+			} else {
+				results.forEach((r, i) => {
+					lines.push(`${offset + i + 1}. <code>${escapeHtml(r.value)}</code> (${r.type}, 权重${r.weight}, 命中${r.hit_count})`);
+				});
+				lines.push('', `第 ${page} 页，共 ${results.length} 条`);
+			}
+			await sendTelegramMessage(chatId, lines.join('\n'));
+			return;
+		}
 	}
 
 	// /clean_blacklist：第一主人手动清理黑名单中已销号的 Telegram 账号。
