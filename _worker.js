@@ -6776,7 +6776,9 @@ async function sendStatusMenu(message, env, ctx) {
 
 	// 基本状态
 	lines.push('✅ <b>运行状态:</b> 正常运行');
-	lines.push(`🕐 <b>时间:</b> ${new Date().toISOString().slice(0, 19).replace('T', ' ')} UTC`);
+	// 使用 UTC+8 时间
+	const now = new Date(Date.now() + 8 * 3600 * 1000);
+	lines.push(`🕐 <b>时间:</b> ${now.toISOString().slice(0, 19).replace('T', ' ')} UTC+8`);
 
 	// AI 绑定状态
 	const aiStatus = env.AI ? '✅ 已绑定' : '❌ 未绑定';
@@ -6790,7 +6792,7 @@ async function sendStatusMenu(message, env, ctx) {
 	let autoCleanStatus = '❌ 已关闭';
 	try {
 		if (env.DB) {
-			await ensureD1Table(env);
+			await ensureAutoCleanTable(env);
 			const row = await env.DB.prepare("SELECT value FROM auto_clean_settings WHERE key = 'enabled'").first();
 			autoCleanStatus = row && row.value ? '✅ 已开启' : '❌ 已关闭';
 		}
@@ -9586,13 +9588,18 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 			return;
 		}
 		if (action === 'ad_toggle') {
-			await answerAdVoteCallback(callbackQuery?.id, '请在 Cloudflare 后台修改 AD_FILTER_ENABLED 环境变量');
+			// 切换广告检测测试模式
+			const currentMode = await getAdTestMode(env, voterId);
+			const newMode = !currentMode;
+			await setAdTestMode(env, voterId, newMode);
+			await answerAdVoteCallback(callbackQuery?.id, `已${newMode ? '开启' : '关闭'}广告检测测试模式`);
+			await sendStatusMenu({ chat: { id: cbChatId }, message: callbackQuery.message }, env, ctx);
 			return;
 		}
 		if (action === 'clean_toggle') {
 			try {
 				if (env.DB) {
-					await ensureD1Table(env);
+					await ensureAutoCleanTable(env);
 					const row = await env.DB.prepare("SELECT value FROM auto_clean_settings WHERE key = 'enabled'").first();
 					const current = row?.value ? true : false;
 					await setAutoCleanEnabled(env, !current);
