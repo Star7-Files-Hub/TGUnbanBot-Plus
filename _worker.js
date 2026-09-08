@@ -6793,7 +6793,7 @@ async function sendStatusMenu(message, env, ctx) {
 	try {
 		if (env.DB) {
 			await ensureAutoCleanTable(env);
-			const row = await env.DB.prepare("SELECT value FROM auto_clean_settings WHERE key = 'enabled'").first();
+			const row = await env.DB.prepare('SELECT value FROM auto_clean_settings WHERE key = ?').bind('enabled').first();
 			autoCleanStatus = row && row.value ? '✅ 已开启' : '❌ 已关闭';
 		}
 	} catch (error) { /* ignore */ }
@@ -9600,7 +9600,7 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 			try {
 				if (env.DB) {
 					await ensureAutoCleanTable(env);
-					const row = await env.DB.prepare("SELECT value FROM auto_clean_settings WHERE key = 'enabled'").first();
+					const row = await env.DB.prepare('SELECT value FROM auto_clean_settings WHERE key = ?').bind('enabled').first();
 					const current = row?.value ? true : false;
 					await setAutoCleanEnabled(env, !current);
 					await answerAdVoteCallback(callbackQuery?.id, `已${!current ? '开启' : '关闭'}自动清理`);
@@ -13188,7 +13188,7 @@ async function ensureAutoCleanTable(env) {
 	if (!env.DB) return false;
 	try {
 		await env.DB.exec(
-			`CREATE TABLE IF NOT EXISTS ${AUTO_CLEAN_TABLE} (
+			`CREATE TABLE IF NOT EXISTS auto_clean_settings (
 				key TEXT PRIMARY KEY,
 				value INTEGER NOT NULL DEFAULT 1,
 				updated_at INTEGER NOT NULL DEFAULT 0
@@ -13206,8 +13206,8 @@ async function getAutoCleanEnabled(env) {
 	try {
 		await ensureAutoCleanTable(env);
 		const row = await env.DB.prepare(
-			`SELECT value FROM ${AUTO_CLEAN_TABLE} WHERE key = 'enabled'`
-		).first();
+			'SELECT value FROM auto_clean_settings WHERE key = ?'
+		).bind('enabled').first();
 		// 默认开启（1），只有显式设为 0 才关闭
 		return row ? Boolean(row.value) : true;
 	} catch (error) {
@@ -13222,7 +13222,7 @@ async function setAutoCleanEnabled(env, enabled) {
 		await ensureAutoCleanTable(env);
 		const now = Math.floor(Date.now() / 1000);
 		await env.DB.prepare(
-			`INSERT INTO ${AUTO_CLEAN_TABLE} (key, value, updated_at)
+			`INSERT INTO auto_clean_settings (key, value, updated_at)
 			 VALUES ('enabled', ?, ?)
 			 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
 		).bind(enabled ? 1 : 0, now).run();
