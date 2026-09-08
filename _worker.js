@@ -6784,8 +6784,15 @@ async function sendStatusMenu(message, env, ctx) {
 	const aiStatus = env.AI ? '✅ 已绑定' : '❌ 未绑定';
 	lines.push(`🧠 <b>Workers AI:</b> ${aiStatus}`);
 
-	// 广告检测状态
-	const adStatus = AD_FILTER_ENABLED ? '✅ 已开启' : '❌ 已关闭';
+	// 广告检测状态（显示当前用户的测试模式状态）
+	let adStatus = AD_FILTER_ENABLED ? '✅ 已开启' : '❌ 已关闭';
+	try {
+		if (env.DB && message?.from?.id) {
+			await ensureAdTestModeTable(env);
+			const testMode = await getAdTestMode(env, message.from.id);
+			adStatus = testMode ? '✅ 测试中' : '❌ 已关闭';
+		}
+	} catch (error) { /* ignore */ }
 	lines.push(`🔍 <b>广告检测:</b> ${adStatus}`);
 
 	// 自动清理状态
