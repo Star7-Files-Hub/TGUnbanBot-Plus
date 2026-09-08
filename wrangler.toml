@@ -3,6 +3,10 @@ main = "_worker.js"
 compatibility_date = "2026-05-19"
 keep_vars = true
 
+# 环境变量
+[vars]
+AD_FILTER_ENABLED = "true"  # 启用广告检测（V1 + V2）
+
 # D1 数据库（唯一存储后端，必须绑定；表结构由代码自动建立）
 [[d1_databases]]
 binding = "DB"								# D1 绑定名默认不可修改
