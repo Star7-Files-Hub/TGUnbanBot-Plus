@@ -700,9 +700,10 @@ const PRIMARY_OWNER_COMMAND_MENU = [
 	{ command: 'listwords', description: '查看广告指纹库' },
 	{ command: 'clean_blacklist', description: '清理销号用户' },
 	{ command: 'clean_switch', description: '自动销号清理开关' },
-	{ command: 'add_mod', description: '添加额外管理员' },
-	{ command: 'del_mod', description: '移除额外管理员' },
-	{ command: 'list_mod', description: '列出额外管理员' },
+	{ command: 'add_admin', description: '添加额外管理员' },
+	{ command: 'del_admin', description: '移除额外管理员' },
+	{ command: 'list_admin', description: '列出额外管理员' },
+	{ command: 'status', description: '查看机器人状态' },
 	{ command: 'start', description: '自助解封入口' },
 	{ command: 'help', description: '展开全部隐藏指令' },
 ];
@@ -2544,7 +2545,9 @@ async function checkMessageOperatorIsAdmin(message, userId) {
 }
 
 function isOwner(id) {
-	return OWNER_IDS.length > 0 && OWNER_IDS.includes(String(id || ''));
+	const result = OWNER_IDS.length > 0 && OWNER_IDS.includes(String(id || ''));
+	console.log(`[权限检查] isOwner(${id}) => ${result}, OWNER_IDS=${JSON.stringify(OWNER_IDS)}`);
+	return result;
 }
 
 function isPrimaryOwner(id) {
@@ -10568,13 +10571,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
 		if (result.success || alreadyExists) {
-			// 加黑成功或已存在 → Telegram 群封禁/预封(revoke_messages 默认 true:封禁同时删该用户在各群全部消息)
-			//   + 缓存清扫兜底(补删 revoke 偶尔漏的、当前群近期消息)
-			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true, _env: env });
-			// 使用增强版清扫：删除用户所有消息（包括 @bot 的消息）
+			// 加黑成功或已存在 → 优先删除当前群消息，再执行预封禁
+			// 1. 先删除当前群该用户的所有消息（包括 @bot 的消息）
 			const cleanupResult = await cleanupUserAllMessages(env, chatId, repliedUserId, repliedMsg?.from?.username);
 
-			// 检测广告 Bot 的触发者（@bot 的人）
+			// 2. 检测广告 Bot 的触发者（@bot 的人）
 			const triggererLines = [];
 			if (repliedMsg?.from?.is_bot || repliedMsg?.from?.username?.toLowerCase().includes('bot')) {
 				const botUsername = repliedMsg.from.username;
@@ -10589,6 +10590,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					}
 				}
 			}
+
+			// 3. Telegram 群封禁/预封（revoke_messages 默认 true:封禁同时删该用户在各群全部消息）
+			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true, _env: env });
 
 			const lines = [
 				`🎬 操作:举报加黑(/spam，跨群封禁)`,
