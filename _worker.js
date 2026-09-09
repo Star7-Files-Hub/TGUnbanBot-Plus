@@ -697,7 +697,7 @@ const PRIMARY_OWNER_COMMAND_MENU = [
 	{ command: 'pending', description: '待确认广告判定快照' },
 	{ command: 'confirm', description: '确认广告判定正确' },
 	{ command: 'ignore', description: '忽略错误判定并解封' },
-	{ command: 'v2words', description: '查看广告指纹库' },
+	{ command: 'listwords', description: '查看广告指纹库' },
 	{ command: 'clean_blacklist', description: '清理销号用户' },
 	{ command: 'clean_switch', description: '自动销号清理开关' },
 	{ command: 'add_mod', description: '添加额外管理员' },
@@ -10174,7 +10174,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 
 	// ===== 广告检测 V2 命令（仅第一主人私聊）=====
-	if (text && /^\/(pending|confirm|ignore|v2add|v2del|v2words)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+	if (text && /^\/(pending|confirm|ignore|addword|delword|listwords)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
 		if (!isPrimaryOwner(userId)) {
 			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告检测管理仅限第一主人。');
@@ -10188,8 +10188,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间。');
 			return;
 		}
-		const head = text.trim().match(/^\/(pending|confirm|ignore|v2add|v2del|v2words)(?:@[^\s]+)?/i)[1].toLowerCase();
-		const argMatch = text.trim().match(/^\/(?:pending|confirm|ignore|v2add|v2del|v2words)(?:@[^\s]+)?\s*([\s\S]*)/i);
+		const head = text.trim().match(/^\/(pending|confirm|ignore|addword|delword|listwords)(?:@[^\s]+)?/i)[1].toLowerCase();
+		const argMatch = text.trim().match(/^\/(?:pending|confirm|ignore|addword|delword|listwords)(?:@[^\s]+)?\s*([\s\S]*)/i);
 		const arg = argMatch ? argMatch[1].trim() : '';
 
 		// /pending [N] - 列出待确认快照
@@ -10261,8 +10261,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 
-		// /v2add 值 - 手动添加指纹
-		if (head === 'v2add') {
+		// /addword 值 - 手动添加指纹
+		if (head === 'addword') {
 			if (!arg) {
 				await sendTelegramMessage(chatId, '❌ 用法：<code>/addword 关键词</code>');
 				return;
@@ -10274,8 +10274,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 
-		// /v2del 值 - 删除指纹
-		if (head === 'v2del') {
+		// /delword 值 - 删除指纹
+		if (head === 'delword') {
 			if (!arg) {
 				await sendTelegramMessage(chatId, '❌ 用法：<code>/delword 关键词</code>');
 				return;
@@ -10287,8 +10287,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 
-		// /v2words [页码] - 查看指纹库
-		if (head === 'v2words') {
+		// /listwords [页码] - 查看指纹库
+		if (head === 'listwords') {
 			const page = Math.max(parseInt(arg) || 1, 1);
 			const offset = (page - 1) * 20;
 			await ensureD1Table(env);
@@ -11022,9 +11022,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'🔐 <b>第一主人专属指令</b>（其他人无反应，也不出现在命令菜单里）',
 			'',
 			'<b>━━ 广告检测 V2(私聊)━━</b>',
-			'/v2add 关键词　添加广告指纹(自动加入指纹库)',
-			'/v2del 关键词　删除广告指纹',
-			'/v2words [页码]　查看广告指纹库',
+			'/addword 关键词　添加广告指纹(自动加入指纹库)',
+			'/delword 关键词　删除广告指纹',
+			'/listwords [页码]　查看广告指纹库',
 			'/pending [N]　查看待确认的广告判定快照',
 			'/confirm 序号　确认判定正确，学入指纹库并封禁',
 			'/ignore 序号　判定错误，解黑并解封',
