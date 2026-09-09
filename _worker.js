@@ -6501,6 +6501,10 @@ async function sendStatusMenu(message, env, ctx) {
 	} catch (error) { /* ignore */ }
 	lines.push(`🧹 <b>自动清理:</b> ${autoCleanStatus}`);
 
+	// 内联按钮（显示当前状态）
+	const autoCleanBtnText = autoCleanStatus.includes('已开启') ? '🧹 自动清理 ✅' : '🧹 自动清理 ❌';
+	const adBtnText = adStatus.includes('已开启') ? '🔍 广告检测 ✅' : '🔍 广告检测 ❌';
+
 	lines.push('');
 	lines.push('<b>📊 数据统计</b>');
 
@@ -6542,15 +6546,15 @@ async function sendStatusMenu(message, env, ctx) {
 	} catch (error) { /* ignore */ }
 	lines.push(`  • 黑名单: ${blacklistCount} 人`);
 
-	// 内联按钮
+	// 内联按钮（显示当前状态）
 	const replyMarkup = {
 		inline_keyboard: [
 			[
 				{ text: '🔄 刷新', callback_data: 'status:refresh' },
-				{ text: '🔍 广告检测', callback_data: 'status:ad_toggle' },
+				{ text: adBtnText, callback_data: 'status:ad_toggle' },
 			],
 			[
-				{ text: '🧹 自动清理', callback_data: 'status:clean_toggle' },
+				{ text: autoCleanBtnText, callback_data: 'status:clean_toggle' },
 				{ text: '📋 待确认', callback_data: 'status:pending' },
 			],
 			[
