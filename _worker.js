@@ -9546,7 +9546,7 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 	if (data.startsWith('clean_switch:')) {
 		const action = data.slice('clean_switch:'.length);
 		const voterId = String(callbackQuery?.from?.id || '');
-		if (!isPrimaryOwner(voterId)) {
+		if (!isOwner(voterId)) {
 			await answerAdVoteCallback(callbackQuery?.id, '仅限第一主人操作', true);
 			return;
 		}
@@ -10075,8 +10075,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// /add_admin、/del_admin：第一主人管理额外管理员（可使用 /ban 和 /spam 的非管理员用户）。
 	if (text && /^\/(add_admin|del_admin|list_admin)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		if (!isPrimaryOwner(userId)) {
-			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n额外管理员管理仅限第一主人。');
+		if (!isOwner(userId)) {
+			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n额外管理员管理仅限主人。');
 			return;
 		}
 		if (!env.DB) {
@@ -10137,8 +10137,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// ===== 广告检测 V2 命令（仅第一主人私聊）=====
 	if (text && /^\/(pending|confirm|ignore|addword|delword|listwords)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		if (!isPrimaryOwner(userId)) {
-			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告检测管理仅限第一主人。');
+		if (!isOwner(userId)) {
+			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告检测管理仅限主人。');
 			return;
 		}
 		if (isInGroup) {
@@ -10902,7 +10902,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 仅 OWNER_IDS[0] 第一主人可用。其他角色群内静默、私聊提示权限不足。
 	if (text && /^\/help(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		const isOwnerUser = isPrimaryOwner(userId);
+		const isOwnerUser = isOwner(userId);
 		if (!isOwnerUser) {
 			// 群内完全静默(连"权限不足"都不发,避免暴露命令存在);私聊也不暴露隐藏指令
 			if (!isInGroup) {
@@ -10958,7 +10958,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 仅 OWNER_IDS[0] 主人私聊可用;群内完全静默,避免暴露权限配置和用户资料。
 	if (text && /^\/admins(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		if (!isPrimaryOwner(userId)) {
+		if (!isOwner(userId)) {
 			if (!isInGroup) {
 				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限主人使用。');
 			}
@@ -10977,7 +10977,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 仅 OWNER_IDS[0] 主人私聊可用;群内完全静默,避免暴露群组配置。
 	if (text && /^\/groups(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		if (!isPrimaryOwner(userId)) {
+		if (!isOwner(userId)) {
 			if (!isInGroup) {
 				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限主人使用。');
 			}
@@ -10996,7 +10996,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 仅 OWNER_IDS[0] 主人私聊可用；群内发送只撤回命令，不执行退出。
 	if (text && /^\/leavegroup(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		if (!isPrimaryOwner(userId)) {
+		if (!isOwner(userId)) {
 			if (!isInGroup) {
 				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限主人私聊使用。');
 			}
@@ -11055,9 +11055,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	if (text && /^\/(addgroup|delgroup|listgroups)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
 		// 群内一律静默（避免泄漏命令存在），私聊才给权限提示
-		if (!isPrimaryOwner(userId)) {
+		if (!isOwner(userId)) {
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n动态群组管理仅限第一主人使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n动态群组管理仅限主人使用。');
 			}
 			return;
 		}
@@ -11589,7 +11589,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 群聊权限与拆分前完全一致：只有第一主人能触发，其他任何人（普通成员、群管理员、
 		// 超级管理员、副主人、匿名管理员）一律【纯静默】—— 不回、不撤回、不通知主人、
 		// 零 Telegram 请求。私聊不进此判定，任何人都能看到介绍语。
-		if (message.chat.type !== 'private' && !isPrimaryOwner(getMessageActorId(message))) {
+		if (message.chat.type !== 'private' && !isOwner(getMessageActorId(message))) {
 			return;
 		}
 		// 刻意【不】走 blockSelfUnbanIfBlacklisted：这段只是自我介绍，黑名单用户也该看得到
@@ -11622,7 +11622,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 原因：这段清单是给「被封禁用户私聊 bot」用的自助流程，任何人都能在群里
 		// 把它刷出来会污染群消息流，且清单里含解封确认整句，等于公开教学如何触发解封。
 		// 私聊完全不进此判定，权限与行为保持原样。
-		if (message.chat.type !== 'private' && !isPrimaryOwner(getMessageActorId(message))) {
+		if (message.chat.type !== 'private' && !isOwner(getMessageActorId(message))) {
 			return;
 		}
 
