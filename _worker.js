@@ -10588,8 +10588,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 在黑名单拦截之后、命令分发之前；管理员豁免
 	// 服务消息（置顶/入群/改群名等）不是用户发言，不参与广告判定 ——
 	// 否则置顶一条含广告词的消息会让【置顶者】被当成广告发布者处置。
+	// 命令消息（/spam /ban /ad 等）也跳过广告检测，避免举报者被误判。
 	if (AD_FILTER_ENABLED && isConfiguredGroup(chatId) && message.from && !message.from.is_bot
-		&& !isTelegramServiceMessage(message)) {
+		&& !isTelegramServiceMessage(message) && !isTelegramSlashCommand(text)) {
 		// 先把 D1 自定义词库与学习样本 merge 进来(detectAd 之前)
 		await Promise.all([
 			mergeAdKeywordsFromD1(env),
