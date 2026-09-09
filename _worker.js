@@ -494,6 +494,14 @@ function loadRequiredConfig(env) {
 	// 去重，保持顺序
 	const uniqueGroupIds = [...new Set(groupIds)];
 
+	// 管理员 ID 清洗：去重、trim、过滤非数字
+	const sanitizeAdmins = (list) =>
+		[...new Set(
+			(list || [])
+				.map((id) => String(id).trim())
+				.filter((id) => /^\d+$/.test(id))
+		)];
+
 	// OWNER_IDS 可选：逗号分隔（中英文逗号均可），第一个主人、后续副主人，空 = 禁用主人通知
 	let ownerIds = [];
 	const rawOwnerEnv = env.OWNER_IDS;
