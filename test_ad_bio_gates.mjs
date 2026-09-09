@@ -435,7 +435,12 @@ function verdict(name, ok, passText, failText) {
 }
 
 // ============================================================
-//  场景 5：指纹配额 —— 长简介广告号必须学到 domain 与 username
+//  场景 5：指纹配额 —— 长简介广告号必须学到 domain，且一条 username 都不学
+//
+//  【2026-09-10 方案 A 后的语义】本场景原本防的是「keyword 短语把 domain 与 username
+//  的配额挤干」（长简介会在交易动词周边截出十几条 keyword）。username 维度整体下线后，
+//  「domain 不被挤掉」这一半覆盖必须保住 —— 那是真实修过的 bug、domain 是权重 1 的强指纹；
+//  另一半翻转成「username 一条都不许入库」，正是本次误封治理的核心断言。
 // ============================================================
 {
 	const env = makeEnv();
@@ -451,9 +456,10 @@ function verdict(name, ok, passText, failText) {
 	console.log('  学到条数 : ' + learned.learned);
 	for (const t of Object.keys(byType).sort()) console.log('  ' + t.padEnd(9) + ': ' + byType[t].length + ' 条  ' + JSON.stringify(byType[t]).slice(0, 150));
 	const ok = (byType.domain || []).includes('evil-shop.top')
-		&& (byType.username || []).includes('@ad_seller_001')
-		&& (byType.username || []).includes('@promo_channel_x');
-	verdict('场景 5 · 指纹配额（domain 与 username 入库）', ok, '通过：domain 与 username 都已入库', '失败：强指纹仍被 keyword 挤掉');
+		&& (byType.username || []).length === 0;
+	verdict('场景 5 · 指纹配额（domain 入库、username 零入库）', ok,
+		'通过：domain 未被 keyword 挤掉，且 username 一条未学（方案 A）',
+		'失败：domain 被 keyword 挤掉，或 username 仍在入库（误封通道未断）');
 }
 
 // ============================================================

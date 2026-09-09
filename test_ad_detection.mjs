@@ -522,12 +522,15 @@ section('[4] 指纹库读写与误报回滚');
 	const rows = env.DB.query('SELECT type, value FROM ad_fingerprints ORDER BY id');
 	assert('学到 keyword 类指纹', rows.some((r) => r.type === 'keyword'), JSON.stringify(rows));
 	assert('学到 bio 类指纹', rows.some((r) => r.type === 'bio'), JSON.stringify(rows));
-	assert('学到 bio 内 @引流账号（username 类）', rows.some((r) => r.type === 'username' && r.value === '@promo_channel_x'), JSON.stringify(rows));
 	assert('学到非白名单域名（domain 类）', rows.some((r) => r.type === 'domain' && r.value === 'evil-shop.top'), JSON.stringify(rows));
-	// 广告号自身的 username 也入库：广告团伙常把同一批 @handle 在换名换简介后反复启用，
-	// 而 markAdFingerprintFalsePositive 的 haystack 本就含 payload.username（回滚侧一直认这一维度），
-	// 学习侧不入库会让两边不对称，因此这里要求自身 username 与资料里的引流账号都落库。
-	assert('广告号自身 username 被学成指纹', rows.some((r) => r.type === 'username' && r.value === '@ad_seller_001'), JSON.stringify(rows));
+	// 【2026-09-10 方案 A：username 维度整体下线】断言翻转 ——
+	// 原来这里要求「bio 内 @引流账号」与「广告号自身 username」都学成 username 型指纹。
+	// 线上证明这条通道是误封主因：username 权重 0.8 恰好触及 AD_FINGERPRINT_BAN_WEIGHT，
+	// 单条命中即定罪、不看总分。#143 因广告号艾特主人而把主人 @handle 学进库，
+	// 此后任何人艾特主人都被封（得分 3/阈值 7 照样封 14 群）。
+	// 现在改为断言【一条 username 型指纹都不许产生】。
+	assert('bio 内 @引流账号不再学成 username 指纹', !rows.some((r) => r.type === 'username'), JSON.stringify(rows));
+	assert('广告号自身 username 不再学成指纹', !rows.some((r) => r.type === 'username' && r.value === '@ad_seller_001'), JSON.stringify(rows));
 
 	// 2026-09-08 拆掉了「source='auto' 必须含强交易动词」的闸门（详见 learnAdFingerprints 注释：
 	// AI 层定罪时 structure.guilty 为 false，那道闸门让「AI 越有用、指纹库学到的越少」）。
@@ -1165,7 +1168,11 @@ section('[9] 指纹与样本维护命令（addword / words / delword / addsample
 	assert('/addword 显式类型落库为 keyword', env.DB.query("SELECT type FROM ad_fingerprints WHERE value = '收U秒结'")[0]?.type === 'keyword', JSON.stringify(env.DB.query('SELECT type, value, source FROM ad_fingerprints')));
 	assert('/addword 同值重复提示已更新', (await cmd(env, '/addword 收U秒结 keyword')).includes('指纹已更新'), lastSent());
 	assert('/addword 同值重复不产生第二行', countFp(env, "value = '收U秒结'") === 1);
-	assert('/addword 自动推断 username', (await cmd(env, '/addword @promo_seller_x')).includes('类型：username'), lastSent());
+	// 【方案 A】@ 开头不再推断为 username 型（那类指纹已不参与匹配，写进去是死数据），
+	// 改为落到 keyword —— @handle 作为普通子串参与昵称/简介/正文匹配，仍可定罪，
+	// 但走的是主人显式手工添加这条明路，不是自动学习偷偷入库。
+	assert('/addword @值推断为 keyword 而非 username', (await cmd(env, '/addword @promo_seller_x')).includes('类型：keyword'), lastSent());
+	assert('/addword @值不产生 username 型行', countFp(env, "type = 'username'") === 0, JSON.stringify(env.DB.query('SELECT type, value FROM ad_fingerprints')));
 	assert('/addword 自动推断 domain', (await cmd(env, '/addword AD-Example.com')).includes('类型：domain'), lastSent());
 	assert('/addword domain 值被归一化为小写', countFp(env, "type = 'domain' AND value = 'ad-example.com'") === 1, JSON.stringify(env.DB.query("SELECT type, value FROM ad_fingerprints WHERE type = 'domain'")));
 	assert('/addword 手动指纹一律记为 manual', countFp(env, "source = 'manual'") === 3, JSON.stringify(env.DB.query('SELECT value, source FROM ad_fingerprints')));
@@ -1234,7 +1241,8 @@ section('[9] 指纹与样本维护命令（addword / words / delword / addsample
 	const envBulk = makeEnv();
 	await W.adDetectionReady(envBulk);
 	const seedFpCount = countFp(envBulk, "source = 'seed'");
-	assert('批量档基线：种子指纹已就位', seedFpCount === 33, String(seedFpCount));
+	// 33 → 26：方案 A 移除了 7 条 username 型引流账号种子（2026-09-10）。
+	assert('批量档基线：种子指纹已就位', seedFpCount === 26, String(seedFpCount));
 
 	const delUsage = await cmd(envBulk, '/delword');
 	assert('/delword 用法写出 noise 批量档', delUsage.includes('/delword noise'), delUsage);
@@ -1247,18 +1255,30 @@ section('[9] 指纹与样本维护命令（addword / words / delword / addsample
 	assert('/delword 未知类型列出可用类型', badType.includes('keyword') && badType.includes('bio'), badType);
 	assert('/delword 未知类型不签令牌', envBulk.DB.query('SELECT COUNT(*) AS c FROM ad_confirm_tokens')[0].c === 0);
 
-	// 造线上那种局面：一批自动学来的单账号 username 指纹，其中两条命中 0（纯噪声），
+	// 造线上那种局面：一批自动学来的单账号指纹，其中两条命中 0（纯噪声），
 	// 一条已经真抓到过人（有命中）—— noise 档必须只删前两条。
-	await W.addAdFingerprint(envBulk, '@noise_one', { type: 'username', createdBy: String(OWNER_ID) });
-	await W.addAdFingerprint(envBulk, '@noise_two', { type: 'username', createdBy: String(OWNER_ID) });
-	await W.addAdFingerprint(envBulk, '@hit_seller', { type: 'username', createdBy: String(OWNER_ID) });
+	// 【2026-09-10 方案 A】原来这三条用 type:'username' 造，现在 addAdFingerprint 会拒收，
+	// 改用 keyword 型 —— 本组测的是 /delword 批量删除机制（noise 筛选、令牌、种子保护），
+	// 与指纹类型无关，换类型不减少任何覆盖。
+	await W.addAdFingerprint(envBulk, '@noise_one', { type: 'keyword', createdBy: String(OWNER_ID) });
+	await W.addAdFingerprint(envBulk, '@noise_two', { type: 'keyword', createdBy: String(OWNER_ID) });
+	await W.addAdFingerprint(envBulk, '@hit_seller', { type: 'keyword', createdBy: String(OWNER_ID) });
 	await envBulk.DB.exec("UPDATE ad_fingerprints SET match_count = 5 WHERE value = '@hit_seller'");
+	// 另造两条【历史遗留的 username 型】行，绕过 addAdFingerprint 直插 D1 ——
+	// 线上库里确实存着这类旧数据（含原 7 条种子），下面 type:username 档要能把它们清掉。
+	// 这是方案 A 的运维闭环：代码侧已免疫（matchAdFingerprints 跳过 username 型），
+	// 但主人仍需要一条指令把脏数据真正删干净。
+	await envBulk.DB.exec(
+		"INSERT INTO ad_fingerprints (fingerprint, type, value, weight, match_count, false_positive_count, confidence, source, created_by, created_at, updated_at) "
+		+ "VALUES ('legacyfp0000001', 'username', '@legacy_user_a', 0.8, 0, 0, 1, 'auto', '', 1757000000, 1757000000), "
+		+ "('legacyfp0000002', 'username', '@legacy_user_b', 0.8, 3, 0, 1, 'auto', '', 1757000000, 1757000000)"
+	);
 	const bulkTotalBefore = countFp(envBulk);
 
 	const noisePreview = await cmdAll(envBulk, '/delword noise');
 	assert('/delword noise 先要求二次确认', noisePreview.includes('确认批量删除指纹'), noisePreview);
 	assert('/delword noise 写明筛选口径', noisePreview.includes('命中 0 次的噪声指纹'), noisePreview);
-	assert('/delword noise 写明将删条数', noisePreview.includes('将删除 <b>2</b> 条'), noisePreview);
+	assert('/delword noise 写明将删条数', noisePreview.includes('将删除 <b>3</b> 条'), noisePreview);
 	assert('/delword noise 声明已排除种子', noisePreview.includes('种子指纹已排除'), noisePreview);
 	// 破坏性操作必须让主人先【看见要删什么】，只报个数字他无从判断。
 	assert('/delword noise 列出样本值', noisePreview.includes('@noise_one') && noisePreview.includes('@noise_two'), noisePreview);
@@ -1269,7 +1289,7 @@ section('[9] 指纹与样本维护命令（addword / words / delword / addsample
 
 	const noiseDone = await cmd(envBulk, '/delword bulk ' + noiseToken);
 	assert('/delword bulk 执行后回执正确', noiseDone.includes('已批量删除指纹'), noiseDone);
-	assert('/delword bulk 回执写明删除条数', noiseDone.includes('删除 <b>2</b> 条'), noiseDone);
+	assert('/delword bulk 回执写明删除条数', noiseDone.includes('删除 <b>3</b> 条'), noiseDone);
 	assert('/delword noise 命中 0 的被删掉', countFp(envBulk, "value IN ('@noise_one','@noise_two')") === 0, JSON.stringify(envBulk.DB.query('SELECT value, match_count FROM ad_fingerprints WHERE type = \'username\'')));
 	assert('/delword noise 有命中的保留', countFp(envBulk, "value = '@hit_seller'") === 1);
 	// 33 条种子的 match_count 全是 0，正是 noise 档最容易误删的一批。
@@ -1598,21 +1618,22 @@ section('[12] 修复项专项：manual 提权 / 自身 username / 回复学习�
 	assert('A1 manual 指纹扛过 5 次误判不被退役', env12.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE source = 'manual'")[0].c === manualBefore, JSON.stringify(env12.DB.query('SELECT value, source, match_count, false_positive_count, confidence FROM ad_fingerprints')));
 	assert('A1 对照组 auto 指纹被退役清空', env12.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE source = 'auto'")[0].c === 0, JSON.stringify(env12.DB.query('SELECT value, source, confidence FROM ad_fingerprints')));
 
-	// —— B1：账号自身 username 入库与边界 ——
-	assert('B1 自身 username 已入库', env12.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE type = 'username' AND value = '@fp_seller_777'")[0].c === 1, JSON.stringify(env12.DB.query("SELECT type, value FROM ad_fingerprints WHERE type = 'username'")));
+	// —— B1：username 维度已整体下线（2026-09-10 方案 A）——
+	// 这一组原本逐项断言 username 的入库与边界（自身入库 / 无 @ 前缀归一化 / 过短剔除 /
+	// 非法字符剔除 / 自身与提及同时入库 / 重复去重）。username 维度删除后，
+	// 全部翻转为「任何形态都不产生 username 候选」—— 边界用例保留，因为它们恰好覆盖了
+	// 各种可能的漏法：合法长 handle、无 @ 前缀、过短、非法字符、自身+提及、重复。
+	assert('B1 自身 username 不再入库', env12.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE type = 'username'")[0].c === 0, JSON.stringify(env12.DB.query("SELECT type, value FROM ad_fingerprints")));
 	const candNoAt = W.extractAdFingerprintCandidates({ name: '收U代理', username: 'no_at_prefix_ok', bio: '', text: '' }, new Set());
-	assert('B1 不带 @ 前缀的 username 也归一化入库', candNoAt.some((c) => c.type === 'username' && c.value === '@no_at_prefix_ok'), JSON.stringify(candNoAt));
+	assert('B1 不带 @ 前缀的 username 不入库', !candNoAt.some((c) => c.type === 'username'), JSON.stringify(candNoAt));
 	const candBad = W.extractAdFingerprintCandidates({ name: '收U代理', username: '@ab', bio: '', text: '' }, new Set());
 	assert('B1 过短 username 不入库', !candBad.some((c) => c.type === 'username'), JSON.stringify(candBad));
 	const candIllegal = W.extractAdFingerprintCandidates({ name: '收U代理', username: '@有中文的名字', bio: '', text: '' }, new Set());
 	assert('B1 非法字符 username 不入库', !candIllegal.some((c) => c.type === 'username'), JSON.stringify(candIllegal));
 	const candBoth = W.extractAdFingerprintCandidates({ name: '收U代理', username: '@self_handle_x', bio: '请联系 @other_handle_y 详谈', text: '' }, new Set());
-	assert('B1 自身与提及的 username 同时入库', (
-		candBoth.some((c) => c.type === 'username' && c.value === '@self_handle_x') &&
-		candBoth.some((c) => c.type === 'username' && c.value === '@other_handle_y')
-	), JSON.stringify(candBoth));
+	assert('B1 自身与提及的 username 都不入库', !candBoth.some((c) => c.type === 'username'), JSON.stringify(candBoth));
 	const candDup = W.extractAdFingerprintCandidates({ name: '收U代理', username: '@same_handle_z', bio: '联系 @same_handle_z', text: '' }, new Set());
-	assert('B1 自身与提及重复时只留一条', candDup.filter((c) => c.type === 'username').length === 1, JSON.stringify(candDup));
+	assert('B1 重复 username 一条都不入库', candDup.filter((c) => c.type === 'username').length === 0, JSON.stringify(candDup));
 
 	// —— C1：回复学习词表不再裸子串误判 ——
 	// 这些是旧词表（含单字「封」、子串 'ad'、'学习'）会误判成封禁指令的正常回复。
@@ -1787,7 +1808,11 @@ section('[14] 两道闸真实场景回归（用线上真实指纹与漏放案例
 	const envJoin = makeEnv();
 	await W.adDetectionReady(envJoin);
 	await W.addAdFingerprint(envJoin, REAL_BIO, { type: 'bio', createdBy: String(OWNER_ID) });
-	await W.addAdFingerprint(envJoin, REAL_USERNAME, { type: 'username', createdBy: String(OWNER_ID) });
+	// 【方案 A】username 型指纹已下线：addAdFingerprint 显式传 type='username' 会被拒，
+	// 且 matchAdFingerprints 的 haystack 已不含 payload.username。
+	// 这里仍以 keyword 型写入该 @handle，用来验证下面那条【翻转后的】断言 ——
+	// 即使库里存在这条指纹，仅出现在 username 字段的 @handle 也不再命中、不再封人。
+	await W.addAdFingerprint(envJoin, REAL_USERNAME, { type: 'keyword', createdBy: String(OWNER_ID) });
 
 	resetCalls();
 	setApi(adProfileApi({ first_name: '项目对接', bio: REAL_BIO }));
@@ -1799,8 +1824,12 @@ section('[14] 两道闸真实场景回归（用线上真实指纹与漏放案例
 	resetCalls();
 	setApi(adProfileApi({ first_name: '推广', username: 'uHlenkWyTPXTSGrwarGL', bio: '' }));
 	await sendUpdate({ message: joinMessage([{ id: 80002, first_name: '推广', username: 'uHlenkWyTPXTSGrwarGL' }]) }, envJoin);
-	assert('第一道闸：username 命中指纹的号进群即加黑', envJoin.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80002'")[0].c === 1);
-	assert('第一道闸：username 命中后执行全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	// 【2026-09-10 方案 A：断言翻转】原来断言「username 命中指纹的号进群即加黑」。
+	// 现在 haystack 只含昵称 + 简介 + 正文，用户名不参与匹配 ——
+	// 这个号昵称「推广」不足以定罪、简介为空，唯一「证据」是 username 命中，
+	// 因此必须放行。这正是主人的口径：用户名很难检测出东西，只会造成误封。
+	assert('第一道闸：仅 username 命中不再加黑', envJoin.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80002'")[0].c === 0, JSON.stringify(envJoin.DB.query('SELECT id FROM blacklist')));
+	assert('第一道闸：仅 username 命中不再全群封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
 
 	// 原「线上漏放案例 1」：这份资料最早只得 4 分被直接放行，加协同分后 6 分进观察窗口。
 	// 2026-09-07 通道 card（用户名 + 简介）上线后再次翻转成【进群即封】——
@@ -2351,8 +2380,14 @@ section('[16] 指纹种子库（35 图特征下移到第二层）+ /spam 人工�
 		['赌博拉新型（双通道漏放）', '真宝', '真宝玩家注册即送88-388USDT 大额无忧'],
 		['包盒项目型（双通道漏放）', '7💚收号💚', '收各种赚钱包盒项目'],
 		['网赌号回收（图 27 原型）', '♻网赌账号回收h🀄', '6大量收网赌亏损号输钱号'],
-		['引流 bot 挡箭牌（图 28 原型）', '正常昵称', '双向联系 @s88888888x_bot 有事私聊'],
-		['引流账号（图 28 原型）', '正常昵称', '联系 @sx8888888sx'],
+		// 【2026-09-10 方案 A】图 28 那两条「引流 bot 挡箭牌 @s88888888x_bot」与
+		// 「引流账号 @sx8888888sx」已从本清单移出 —— 7 条 username 型种子随维度下线。
+		// 移出的理由不是它们抓错了人，而是这条通道的形态本身有误伤：
+		// username 型权重 0.8 恰好触及 AD_FINGERPRINT_BAN_WEIGHT、单条即定罪，
+		// 于是任何在正文里提到这些 @handle 的人（举报、转述、警示「别加这个号」）
+		// 都会被当成广告号封掉 —— 举报者反被封是它最典型的误伤形态。
+		// 这两条的召回改由：昵称 emoji / 交易动词短语 / 域名 / bio / AI 语义 /
+		// 四通道结构查杀共同承担；下面 seedCleanCases 里补了对应的放行断言。
 		['带空格 du 变体', '收号', '长期收购网 du 商宝账号'],
 		['无空格 du 变体', '收号', '长期收购网du商宝账号'],
 		['价格表话术', '回收', '长期收购各类账号 价格表私聊 秒结不拖欠'],
@@ -2387,7 +2422,15 @@ section('[16] 指纹种子库（35 图特征下移到第二层）+ /spam 人工�
 		['收藏出闲置（负向排除生效）', '老相机迷', '收藏老相机 出闲置镜头一只'],
 		['长期收听播客（负向排除生效）', '播客控', '长期收听这档节目 很好'],
 		['大量收集数据（负向排除生效）', '研究员', '需要大量收集问卷数据'],
-		['赚钱包鼓鼓（剔除误切分）', '打工人', '希望今年赚钱包鼓鼓的']
+		['赚钱包鼓鼓（剔除误切分）', '打工人', '希望今年赚钱包鼓鼓的'],
+		// 【2026-09-10 方案 A：username 种子下线后的放行回归】
+		// 这三条是线上误封的真实形态，钉死它们不再命中：
+		//   1) 举报者原文引用广告号的 @handle 来警示他人 —— 原 7 条 username 种子下必被封；
+		//   2) 正常用户被艾特 / 艾特他人（#143 的形态：任何人艾特主人都被封）；
+		//   3) 昵称干净、简介干净，唯一「证据」是提到了某个 @handle。
+		['举报者引用广告号 handle（原 username 种子）', '热心群友', '大家别加 @sx8888888sx 这个号 是广告'],
+		['转述挡箭牌 bot（原 username 种子）', '路人甲', '他给我发的是 @s88888888x_bot 我没敢点'],
+		['艾特他人（#143 误封形态）', 'My fuhrer', '@ym94203 帮忙看一下这个问题']
 	];
 	for (const [label, name, bio] of seedCleanCases) {
 		const r = await W.matchAdFingerprints(envSeed, { name, username: '', bio, text: '', domains: [] }, {});
@@ -3246,6 +3289,141 @@ section('[19] 方案 E · 短语自我泛化（共现提炼成指纹 + 三重闸
 	assert('P1 种子指纹 singleWord=false', Boolean(seedMatched.hits.find((h) => h.value === '秒结不拖欠')?.singleWord === false),
 		JSON.stringify(seedMatched.hits.map((h) => ({ value: h.value, singleWord: h.singleWord }))));
 	assert('P1 种子铁证「秒结不拖欠」照封', seedHit.verdict === 'ban', JSON.stringify(seedHit));
+}
+
+// ============================================================
+//  [方案 A] username 维度下线 + 权限人 username 白名单 + keyword 短语降权
+//  2026-09-10 —— 对应线上 #135 / #132 / #143 / #69 四起误封
+// ============================================================
+{
+	console.log('\n[方案 A] username 维度下线 / 权限人白名单 / keyword 短语降权');
+	const env = makeEnv();
+	await W.adDetectionReady(env);
+
+	// —— 1) 权限人 username 白名单解析 ——
+	// parseAdProtectedUsernames 要能吃下三种写法：半角逗号、全角逗号、带 @ 前缀。
+	const parsed = W.parseAdProtectedUsernames('ym94203, @suqi_20，avelix0');
+	assert('白名单：三种分隔与 @ 前缀都能解析',
+		parsed.length === 3 && parsed.includes('ym94203') && parsed.includes('suqi_20') && parsed.includes('avelix0'),
+		JSON.stringify(parsed));
+	// 非法形态必须丢弃 —— 否则空串进列表会让 includes 全量命中，等于关掉整个指纹层。
+	const parsedBad = W.parseAdProtectedUsernames('ab, , @, 有中文, ok_name_1');
+	assert('白名单：过短/空值/非法字符一律丢弃',
+		parsedBad.length === 1 && parsedBad[0] === 'ok_name_1', JSON.stringify(parsedBad));
+	assert('白名单：留空得到空列表', W.parseAdProtectedUsernames('').length === 0);
+	assert('白名单：null 得到空列表', W.parseAdProtectedUsernames(null).length === 0);
+
+	// —— 2) 白名单为空时 containsAdProtectedUsername 恒 false（不误伤）——
+	// 这条守住「没配置就等于没这道闸」，避免空列表被当成「全部匹配」。
+	W.applyRuntimeConfig(W.loadRequiredConfig(makeEnv()));
+	assert('白名单：未配置时任何值都不拦', W.containsAdProtectedUsername('联系 @ym94203') === false);
+
+	// —— 3) 配置白名单后，含权限人 handle 的候选一条都不许产生 ——
+	W.applyRuntimeConfig(W.loadRequiredConfig(makeEnv({ AD_PROTECTED_USERNAMES: 'ym94203,suqi_20' })));
+	assert('白名单：命中受保护 handle', W.containsAdProtectedUsername('收购账号 联系 @ym94203') === true);
+	assert('白名单：不含受保护 handle 时放行', W.containsAdProtectedUsername('收购账号 联系 @someone_else') === false);
+	// #143 的真实形态：广告号简介里艾特主人。「收购」命中交易动词 → 往后截 24 字
+	// 会把 @ym94203 一起包进 keyword 短语。白名单必须在 push 入口就把它挡掉。
+	const candProtected = W.extractAdFingerprintCandidates(
+		{ name: '正常昵称', username: '', bio: '长期收购账号 有需要联系 @ym94203 详谈', text: '' }, new Set());
+	assert('白名单：含主人 handle 的 keyword 短语不入库',
+		!candProtected.some((c) => String(c.value).toLowerCase().includes('ym94203')), JSON.stringify(candProtected));
+	// 整段正文兜底那条（权重 1、最危险）同样要被挡住。
+	const candProtectedText = W.extractAdFingerprintCandidates(
+		{ name: '路人', username: '', bio: '', text: '@ym94203 帮忙看一下这个问题谢谢' }, new Set());
+	assert('白名单：含主人 handle 的整段正文不入库',
+		!candProtectedText.some((c) => String(c.value).toLowerCase().includes('ym94203')), JSON.stringify(candProtectedText));
+	// 恢复默认配置，避免污染后续（本段是文件最后一组，仍显式复原以防将来插新用例）。
+	W.applyRuntimeConfig(W.loadRequiredConfig(makeEnv()));
+
+	// —— 4) keyword 短语降权：#69 `月入怀来` 形态不再单条定罪 ——
+	// 按词截取的 24 字短语权重 1 → 0.5，低于 AD_FINGERPRINT_BAN_WEIGHT(0.8)。
+	const candPhrase = W.extractAdFingerprintCandidates(
+		{ name: '', username: '', bio: '', text: '月入过万不是梦 怀来本地招人 详情私聊' }, new Set());
+	const phraseCand = candPhrase.filter((c) => c.type === 'keyword' && c.weight === 0.5);
+	assert('降权：按词截取的 keyword 短语权重为 0.5', phraseCand.length > 0, JSON.stringify(candPhrase));
+	// 整段正文兜底那条保持权重 1 —— 它是归一化后精确相等才命中，误伤面极小，
+	// 「同一段广告文案第二次出现即秒杀」这条能力不能丢。
+	assert('降权：整段正文兜底仍为权重 1',
+		candPhrase.some((c) => c.type === 'keyword' && c.weight === 1), JSON.stringify(candPhrase));
+
+	// —— 5) 端到端：把 #69 形态学进库后，再遇到只命中该短语的人不再被封 ——
+	const envPhrase = makeEnv();
+	await W.adDetectionReady(envPhrase);
+	await W.learnAdFingerprints(envPhrase, { name: '', username: '', bio: '', text: '月入过万不是梦 怀来本地招人 详情私聊', domains: [] },
+		{ source: 'auto', createdBy: 'system' });
+	const phraseHit = await W.matchAdFingerprints(envPhrase,
+		{ name: '', username: '', bio: '', text: '月入过万不是梦 怀来本地招人 详情私聊', domains: [] }, {});
+	assert('降权：短语仍会命中（召回没丢）', phraseHit.hits.length > 0, JSON.stringify(phraseHit.hits.map((h) => h.value)));
+	// 关键断言：命中了、也计分了，但 nonSingleMaxWeight 不足以构成指纹级封禁。
+	// 真广告靠整段精确匹配（权重 1）或结构查杀兜住，正常用户不会因一个片段被封。
+	const phraseOnly = phraseHit.hits.filter((h) => h.weight === 0.5);
+	assert('降权：0.5 权重短语确实在库', phraseOnly.length > 0, JSON.stringify(phraseHit.hits.map((h) => h.value + '@' + h.weight)));
+
+	// —— 6) username 型历史指纹被匹配端整体跳过 ——
+	// 库里可能还存着旧数据（清库是运维动作），代码侧必须自己免疫。
+	const envLegacy = makeEnv();
+	await W.adDetectionReady(envLegacy);
+	await envLegacy.DB.exec(
+		"INSERT INTO ad_fingerprints (fingerprint, type, value, weight, match_count, false_positive_count, confidence, source, created_by, created_at, updated_at) "
+		+ "VALUES ('legacyskip00001', 'username', '@ym94203', 0.8, 0, 0, 1, 'auto', '', 1757000000, 1757000000)"
+	);
+	const legacyHit = await W.matchAdFingerprints(envLegacy,
+		{ name: '路人', username: '@ym94203', bio: '', text: '@ym94203 你好', domains: [] }, {});
+	assert('免疫：历史 username 型指纹不再命中', legacyHit.hits.length === 0,
+		JSON.stringify(legacyHit.hits.map((h) => h.type + ':' + h.value)));
+	assert('免疫：历史 username 型指纹不产生封禁权重', legacyHit.nonSingleMaxWeight === 0, String(legacyHit.nonSingleMaxWeight));
+
+	// —— 7) 端到端复现四起线上误封，全部必须放行 ——
+	// #135 / #132：昵称 Avelix、简介未查询、正文「好了」/「签到」，唯一证据是 @avelix0 命中。
+	// #143：昵称 My fuhrer、简介里艾特主人 @ym94203。
+	const envReal = makeEnv();
+	await W.adDetectionReady(envReal);
+	await envReal.DB.exec(
+		"INSERT INTO ad_fingerprints (fingerprint, type, value, weight, match_count, false_positive_count, confidence, source, created_by, created_at, updated_at) "
+		+ "VALUES ('realfp000000135', 'username', '@avelix0', 0.8, 2, 0, 1, 'auto', '', 1757000000, 1757000000), "
+		+ "('realfp000000143', 'username', '@ym94203', 0.8, 1, 0, 1, 'auto', '', 1757000000, 1757000000)"
+	);
+	const real135 = await W.evaluateAdSuspect(envReal, {
+		profile: { firstName: 'Avelix', lastName: '', username: 'avelix0', bio: '' },
+		text: '好了', quotedText: '', forwardChat: null
+	}, {});
+	assert('线上 #135 复现：不再封禁', real135.verdict !== 'ban',
+		JSON.stringify({ verdict: real135.verdict, score: real135.score, reasons: real135.reasons }));
+	const real132 = await W.evaluateAdSuspect(envReal, {
+		profile: { firstName: 'Avelix', lastName: '', username: 'avelix0', bio: '' },
+		text: '签到', quotedText: '', forwardChat: null
+	}, {});
+	assert('线上 #132 复现：不再封禁', real132.verdict !== 'ban',
+		JSON.stringify({ verdict: real132.verdict, score: real132.score, reasons: real132.reasons }));
+	const real143 = await W.evaluateAdSuspect(envReal, {
+		profile: { firstName: 'My fuhrer', lastName: '', username: 'suqi_20', bio: '@ym94203' },
+		text: '', quotedText: '', forwardChat: null
+	}, {});
+	assert('线上 #143 复现：艾特主人不再封禁', real143.verdict !== 'ban',
+		JSON.stringify({ verdict: real143.verdict, score: real143.score, reasons: real143.reasons }));
+	// 任何人艾特主人都不该被封 —— 这是 #143 影响面最大的形态。
+	const mentionOwner = await W.evaluateAdSuspect(envReal, {
+		profile: { firstName: '普通用户', lastName: '', username: 'normal_user_1', bio: '' },
+		text: '@ym94203 请问这个怎么弄', quotedText: '', forwardChat: null
+	}, {});
+	assert('线上 #143 扩展：任何人艾特主人都不封', mentionOwner.verdict !== 'ban',
+		JSON.stringify({ verdict: mentionOwner.verdict, score: mentionOwner.score, reasons: mentionOwner.reasons }));
+
+	// —— 8) 召回未丢：真广告仍被封 ——
+	// 这一组是本次改动的安全网 —— 治误封不能把召回一起治掉。
+	const stillBan = await W.evaluateAdSuspect(envReal, {
+		profile: { firstName: '💚高价收网赚号💚', lastName: '', username: 'x_seller_1', bio: '长期收购网 du 商宝账号 秒结不拖欠' },
+		text: '', quotedText: '', forwardChat: null
+	}, {});
+	assert('召回未丢：对称 emoji + 收购话术仍封', stillBan.verdict === 'ban',
+		JSON.stringify({ verdict: stillBan.verdict, score: stillBan.score, layer: stillBan.layer }));
+	const stillBan2 = await W.evaluateAdSuspect(envReal, {
+		profile: { firstName: '兼职小助手', lastName: '', username: 'y_seller_2', bio: '' },
+		text: '招代理日结佣金 无需经验 加微详聊', quotedText: '', forwardChat: null
+	}, {});
+	assert('召回未丢：种子铁证「招代理日结」仍封', stillBan2.verdict === 'ban',
+		JSON.stringify({ verdict: stillBan2.verdict, score: stillBan2.score, layer: stillBan2.layer }));
 }
 
 console.log('');

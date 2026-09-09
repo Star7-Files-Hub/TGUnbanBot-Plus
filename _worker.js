@@ -219,6 +219,7 @@ function applyRuntimeConfig(config) {
 	GROUP_ID = config.GROUP_ID;
 	SUPER_ADMINS = config.SUPER_ADMINS;
 	OWNER_IDS = config.OWNER_IDS;
+	AD_PROTECTED_USERNAMES = config.AD_PROTECTED_USERNAMES || [];
 	MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
 	FLASH_MESSAGE_TTL_MS = config.FLASH_MESSAGE_TTL_MS;
 	SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
@@ -493,6 +494,7 @@ function loadRequiredConfig(env) {
 		GROUP_ID: uniqueGroupIds[0],
 		SUPER_ADMINS: superAdmins,
 		OWNER_IDS: ownerIds,
+		AD_PROTECTED_USERNAMES: parseAdProtectedUsernames(env.AD_PROTECTED_USERNAMES),
 		MSG_CACHE_SIZE: msgCacheSize,
 		FLASH_MESSAGE_TTL_MS: flashTtlMs,
 		SELF_UNBAN_KEYWORD: selfUnbanKeyword,
@@ -8980,8 +8982,49 @@ const AD_REPLY_LEARN_NEGATORS = [
 	'误封', '误判', '不是spam', 'not spam', '不是垃圾', '取消封', '解封'
 ];
 
-// 指纹类型白名单：/addword 只接受这四类，防止脏类型污染指纹库
+// 指纹类型白名单：/addword 只接受这四类，防止脏类型污染指纹库。
+// 【方案 A】'username' 保留在列表里【仅为兼容历史数据】—— loadAdFingerprints 仍要能
+// 读出库里的旧 username 行交给 markAdFingerprintFalsePositive 清理；
+// 但 matchAdFingerprints 会跳过它们、addAdFingerprint 也拒绝新写入。
 const AD_FINGERPRINT_TYPES = ['keyword', 'domain', 'username', 'bio'];
+
+// ===== 权限人 username 永不学习白名单（2026-09-10 主人下令）=====
+// 主人 / 副主人 / 超级管理员的 @handle 绝不允许进指纹库。
+//
+// 起因：广告号发言时艾特主人 → 主人的 @handle 被学成指纹 → 此后任何人艾特主人都被封。
+// 方案 A 已从结构上删掉 username 学习路径，这道白名单是【第二层保险】，防的是另一类漏法：
+// 主人的 @handle 出现在【被截取的 keyword 短语】里。例如广告号简介写
+// 「收购账号 联系 @ym94203」，「收购」命中交易动词，往后截 24 字连带把 @ym94203
+// 包进 keyword 短语 —— 那条短语权重虽已降到 0.5 不单独定罪，但仍会 +3 计分，
+// 而且一旦有人用 /spam 人工提交（source != 'auto'，跳过豁免词闸门）就会以权重入库。
+//
+// 环境变量 AD_PROTECTED_USERNAMES：逗号分隔（半角 / 全角均可），@ 前缀可省。
+// 例：`ym94203,suqi_20` 或 `@ym94203，@suqi_20`。
+// 留空则只靠方案 A 的结构性移除兜底（已足够，白名单是加固而非必需）。
+const DEFAULT_AD_PROTECTED_USERNAMES = [];
+let AD_PROTECTED_USERNAMES = [];
+
+// 解析受保护 username 列表：统一小写、去 @ 前缀、过滤非法形态。
+function parseAdProtectedUsernames(raw) {
+	const source = raw == null || String(raw).trim() === ''
+		? DEFAULT_AD_PROTECTED_USERNAMES
+		: String(raw).split(/[,，\s]+/);
+	const list = (Array.isArray(source) ? source : [source])
+		.map((v) => String(v || '').trim().replace(/^@+/, '').toLowerCase())
+		// Telegram username 规则：5-32 位字母数字下划线。不合规的丢弃，
+		// 避免把 '' 或 '@' 这类空值加进去导致 includes 全量命中。
+		.filter((v) => /^[a-z0-9_]{5,32}$/.test(v));
+	return [...new Set(list)];
+}
+
+// 候选值里是否含受保护的 username。子串判定 —— keyword 短语是截断片段，
+// 受保护 handle 可能夹在中间（「收购账号 联系 @ym94203」）。
+function containsAdProtectedUsername(value) {
+	if (!AD_PROTECTED_USERNAMES.length) return false;
+	const lower = String(value || '').toLowerCase();
+	if (!lower) return false;
+	return AD_PROTECTED_USERNAMES.some((name) => lower.includes('@' + name) || lower.includes(name));
+}
 
 // 结构化评分正则（全部来自真实样本的名称 / 用户名形态）
 // 对称 emoji：`💚高价收网赚号💚`、`7💚高价收网赚号💚` —— 广告号最强的单一信号。
@@ -9126,16 +9169,14 @@ const AD_FINGERPRINT_SEED = [
 	{ type: 'keyword', value: '招代理日结' },
 	{ type: 'keyword', value: '代理日结佣金' },
 
-	// —— 具体引流账号：只对同批号有效（换号即失效），但零误封风险、成本极低。
-	//    前两个来自图 28 —— 昵称「♻网赌账号回收h🀄」的号，
-	//    第二个正是他写「双向联系 @s88888888x_bot」用来骗豁免分 -3 的挡箭牌 bot。
-	{ type: 'username', value: '@sx8888888sx' },
-	{ type: 'username', value: '@s88888888x_bot' },
-	{ type: 'username', value: '@sx8888888x' },
-	{ type: 'username', value: '@wbwa02ir' },
-	{ type: 'username', value: '@hfzfl' },
-	{ type: 'username', value: '@uiruqnbot' },
-	{ type: 'username', value: '@yurnfbot' }
+	// 【2026-09-10 方案 A：7 条 username 种子已移除】
+	// 原有 @sx8888888sx / @s88888888x_bot / @sx8888888x / @wbwa02ir / @hfzfl /
+	// @uiruqnbot / @yurnfbot 七条引流账号种子，随 username 维度整体下线。
+	// 原注释写「零误封风险」，线上证伪了这个判断 —— username 型权重 0.8 恰好触及
+	// AD_FINGERPRINT_BAN_WEIGHT，是【单条即定罪】通道，一旦有人在正文里提到这些
+	// @handle（举报、转述、警示他人「别加这个号」）就会被当成广告号封掉。
+	// 举报者反被封是这条通道最典型的误伤形态。
+	// 具体引流账号的召回让位于误封治理，这是主人定的口径。
 ];
 
 // 运行期缓存（按 env.DB 弱引用，isolate 复用时自动隔离不同库）
@@ -10326,8 +10367,10 @@ async function matchAdFingerprints(env, payload, options = {}) {
 	const fingerprints = await loadAdFingerprints(env);
 	if (!fingerprints.length) return { score: 0, hits: [], maxWeight: 0, nonSingleMaxWeight: 0 };
 
+	// 【方案 A】haystack 去掉 payload.username —— 资料卡只看昵称 + 简介 + 正文。
+	// 用户名不参与任何指纹匹配，从匹配端也断掉这一维度。
 	const haystack = normalizeAdFingerprintValue([
-		payload?.name, payload?.username, payload?.bio, payload?.text
+		payload?.name, payload?.bio, payload?.text
 	].filter(Boolean).join(' '));
 	const domains = new Set((payload?.domains || []).map((d) => normalizeAdDomain(d)).filter(Boolean));
 
@@ -10336,14 +10379,15 @@ async function matchAdFingerprints(env, payload, options = {}) {
 	let nonSingleMaxWeight = 0; // 非单业务词命中的最大权重 —— P1：只有它才能构成指纹级封禁
 	for (const row of fingerprints) {
 		if (row.confidence < config.fingerprintMinConfidence) continue;
+		// 【方案 A】历史遗留的 username 型指纹一律跳过，不匹配、不计分、不定罪。
+		// 库里可能还存着旧数据（含 7 条种子），删库是运维动作，代码侧必须自己免疫 ——
+		// 否则清库前的每一条消息都还在踩同一个坑。
+		if (row.type === 'username') continue;
 		let matched = false;
 		if (row.type === 'domain') {
 			for (const domain of domains) {
 				if (domain === row.normalized || domain.endsWith('.' + row.normalized)) { matched = true; break; }
 			}
-		} else if (row.type === 'username') {
-			const target = row.normalized.replace(/^@/, '');
-			matched = Boolean(target) && haystack.includes('@' + target);
 		} else {
 			matched = haystack.includes(row.normalized);
 		}
@@ -10380,11 +10424,29 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 	// keyword 数量最多、单条最弱（24 字截断短语），理应让位。
 	// 原注释「放在提及扫描之前入库，避免被文本里的引流账号把上限占满」防的是
 	// username 内部互相挤占，没防到 keyword 跨类挤占，这里一并解决。
-	const AD_FINGERPRINT_QUOTA = { keyword: 6, bio: 1, domain: 3, username: 2 };
+	// username 配额已移除（方案 A）：不再抽取任何 username 候选，留 0 是显式声明而非遗漏。
+	const AD_FINGERPRINT_QUOTA = { keyword: 6, bio: 1, domain: 3, username: 0 };
 	const push = (type, value, weight) => {
 		const normalized = normalizeAdFingerprintValue(value);
 		if (!normalized || normalized.length < 2) return;
-		if (candidates.some((c) => c.type === type && normalizeAdFingerprintValue(c.value) === normalized)) return;
+		// 【权限人 username 永不学习】放在 push 最前面，覆盖【全部类型、全部抽取路径】
+		// —— keyword 短语、整段正文兜底、bio、domain 一个都不漏。
+		// 拦在这里而不是拦在 learnAdFingerprints：那里只对 source='auto' 生效，
+		// 而 /spam 人工提交（source='spam'）恰恰是绕过豁免词闸门的那条路，必须一并堵住。
+		// 原值与归一化值都查一遍：归一化可能改写大小写或剥符号，两边都比对才不留缝。
+		if (containsAdProtectedUsername(value) || containsAdProtectedUsername(normalized)) return;
+		// 同 type 同值去重：【取较高权重】而不是丢弃后来者。
+		// 【2026-09-10 修正】原实现直接 return，配合 keyword 短语降权(1→0.5)后出了个新缺陷：
+		// 短语路径截 24 字，短正文（≤24 字）会截出与「整段正文兜底」完全相同的串，
+		// 而短语先跑一步以 0.5 占位 → 后面权重 1 的整段兜底被静默丢弃。
+		// 净效果是「同一段广告文案第二次出现即秒杀」这条能力被降权连带废掉
+		// —— 整段兜底是归一化后精确相等才命中、误伤面极小，恰恰是最该保住权重 1 的一条。
+		// 取 max 后：短正文拿回权重 1（精确匹配定罪），长正文的短语片段仍是 0.5（只计分）。
+		const dup = candidates.find((c) => c.type === type && normalizeAdFingerprintValue(c.value) === normalized);
+		if (dup) {
+			if (Number(weight) > Number(dup.weight)) dup.weight = Number(weight);
+			return;
+		}
 		// 未列入配额表的 type 不设限（当前 AD_FINGERPRINT_TYPES 四类已全覆盖，
 		// 此处为将来新增 type 时的安全默认：宁可放进去，不要静默丢弃）。
 		const quota = AD_FINGERPRINT_QUOTA[type];
@@ -10407,7 +10469,15 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 		const index = combined.toLowerCase().indexOf(String(word).toLowerCase());
 		if (index === -1) continue;
 		const phrase = combined.slice(index, index + 24).split(/[\n\r]/)[0].trim();
-		if (phrase.length >= 4) push('keyword', phrase, 1);
+		// 【2026-09-10 权重 1 → 0.5】按词截取的 24 字短语是【机器切出来的片段】，
+		// 起点由词表命中位置决定、终点是硬截断，语义完整性没有任何保证。
+		// 线上 #69 学出 `[keyword] 月入怀来` 就是这么来的 —— 「月入」命中业务词，
+		// 往后截 24 字碰上「怀来」（河北县名），拼成一条既非广告、又会命中
+		// 任何提到该地名的正常发言的指纹。权重 1 让它【单条即定罪】。
+		// 降到 0.5（< AD_FINGERPRINT_BAN_WEIGHT 0.8）后这类片段只计分不定罪，
+		// 真广告仍可由「整段正文精确匹配」（下面那条，权重保持 1）秒杀，
+		// 或由结构查杀「招揽 ∧ 行业」合取兜住 —— 召回没丢，误伤面砍掉。
+		if (phrase.length >= 4) push('keyword', phrase, 0.5);
 	}
 
 	// 兜底：正文足够长时把整段（截 60 字）作为一条 keyword 指纹。
@@ -10428,19 +10498,26 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 		if (!isAdDomainWhitelisted(domain, whitelistSet)) push('domain', domain, 1);
 	}
 
-	const mentionRe = /@([A-Za-z0-9_]{5,32})/g;
-	let match;
-	// 账号自身的 username 也是一条稳定指纹：广告号换名换简介，但 @handle 常被复用。
-	// 放在提及扫描之前入库，避免被文本里的引流账号把 12 条上限占满。
-	// markAdFingerprintFalsePositive 的 haystack 本就含 payload.username，此前只有回滚侧
-	// 认这一维度、学习侧不入库，两边不对称。
-	const selfUsername = String(payload?.username ?? '').trim().replace(/^@+/, '');
-	if (/^[A-Za-z0-9_]{5,32}$/.test(selfUsername)) push('username', '@' + selfUsername, 0.8);
-	while ((match = mentionRe.exec(combined)) !== null) {
-		push('username', '@' + match[1], 0.8);
-		// 上限交给 AD_FINGERPRINT_QUOTA 判定：username 满额后继续扫描没有意义。
-		if (candidates.filter((c) => c.type === 'username').length >= AD_FINGERPRINT_QUOTA.username) break;
-	}
+	// 【2026-09-10 方案 A：彻底移除 username 维度】主人口径：资料卡只检测昵称 + 简介，
+	// 用户名不检测 —— 用户名本身没有广告语义，检测不出东西，只会造成误封。
+	//
+	// 移除的是两条学习路径，都是线上误封的直接成因：
+	//   1) 账号自身 username 学成指纹（原 `push('username', '@' + selfUsername, 0.8)`）
+	//      → 线上 #135 / #132 的 `@avelix0` 就是这么进库的。得分 5 / 2 分，
+	//        远低于阈值 7，却因 username 权重 0.8 恰好触及 AD_FINGERPRINT_BAN_WEIGHT
+	//        而【单条即定罪】，14 个群全封。
+	//   2) 扫正文 @提及 学成指纹（原 mentionRe 循环）
+	//      → 这条最严重：广告号发言时艾特了主人，主人的 @handle 就被学进指纹库；
+	//        此后【任何人艾特主人】都命中 haystack（含 payload.text），直接封。
+	//        线上 #143 正是如此：判定依据只有一行「+3 指纹库命中：@ym94203」，
+	//        得分 3 分封 14 个群，回滚记录里「受影响指纹：[username] @ym94203」是铁证。
+	//
+	// P1 的单业务词豁免管不到这里 —— 它只挡裸业务词（usdt / 价格表），
+	// username 既不是业务词，权重又刚好达标，是一条完全绕过所有纠错机制的定罪通道。
+	// 从结构上删掉学习路径，才不会 /delword 删完下一次又原样学回来。
+	//
+	// 代价是失去「广告团伙复用 @handle」这一维度的召回，但那正是误封的源头；
+	// 真广告仍由昵称 emoji、交易动词短语、域名、bio、AI 语义、四通道结构查杀六路兜住。
 
 	// 配额之和恰为 12，slice 只是防御性兜底。
 	return candidates.slice(0, 12);
@@ -10531,10 +10608,15 @@ async function addAdFingerprint(env, rawValue, options = {}) {
 
 	let type = String(options.type || '').trim().toLowerCase();
 	if (!AD_FINGERPRINT_TYPES.includes(type)) {
-		if (value.startsWith('@')) type = 'username';
-		else if (normalizeAdDomain(value)) type = 'domain';
+		// 【方案 A】以 @ 开头不再推断为 username 型 —— username 维度已整体下线，
+		// 推断出来也不会被 matchAdFingerprints 匹配，等于静默写入一条死数据。
+		// 落到 keyword：@handle 作为普通子串参与昵称/简介/正文匹配，
+		// 权重由下面统一给 1，仍能定罪，但主人是显式手工添加、心里有数。
+		if (normalizeAdDomain(value)) type = 'domain';
 		else type = 'keyword';
 	}
+	// 显式传 type='username' 也一并拒绝：不留后门写入无效数据。
+	if (type === 'username') return { ok: false, reason: 'username_disabled' };
 	const storedValue = type === 'domain' ? normalizeAdDomain(value) : value.slice(0, 200);
 	if (!storedValue) return { ok: false, reason: 'invalid' };
 
