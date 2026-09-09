@@ -84,6 +84,8 @@
 - **闪屏时长统一为可配置项**：群内闪屏提示的存活时长从散落在各调用点的硬编码（5000 / 6000 / 8000 三种）收敛为单一常量 `DEFAULT_FLASH_MESSAGE_TTL_MS = 5000`，并支持环境变量 `FLASH_MESSAGE_TTL_MS` 覆盖（0~60000，填 `0` = 永不撤回）。回复学习的回执原为 8 秒，现统一为 5 秒。`/help` 群内引导提示刻意保留 6000ms 显式传值（引导性文案要留够阅读时间，不随全局调短）。校验规则与其它数值型配置一致：空串 / 非整数 / 超范围一律回落默认值 —— 特殊点是允许 `0`，所以下界判 `>= 0` 而非 `> 0`。
 - **`/ad` 群内举报投票**：任一配置群管理员回复消息发 `/ad [原因]` 发起隐藏投票，赞成达 6 票即加黑 + 全群封禁 + 删除被举报消息。第一主人可用 `/add_ad_admin TGID` 授权普通成员发起。投票状态存 D1（保留 7 天），支持改投去重、管理员一票否决、发起人放弃举报。命令消息发出即删除以隐藏痕迹。
 - **频道自动转发帖单点早退（安全加固）**：频道发帖后 Telegram 自动转发进关联讨论群的那条消息带 `is_automatic_forward: true` + `sender_chat`，有正文、非服务消息、`from` 是 Telegram 服务账号，会一路穿过治理逻辑被广告检测当成群成员发言处理。现在在 `handleMessage` **最顶部**单点早退 —— 先于黑名单拦截、消息缓存、广告检测、命令分发的一切逻辑，一律不删、不缓存、不检测、不当命令。
+- **广告指纹单业务词不封（P1 精度加固）**：指纹库命中后，若命中的全部指纹均为「单业务词」（如单独一个 `USDT`、`收购`），则不直接触发封禁，仅将这部分权重与**结构化评分**联合计算；只有同时命中其他广告词（多词共现）时才封禁。避免正常技术讨论、二手交易话题因包含单一业务词而误封。`evaluateAdSuspect` 里通过 `isSingleBusinessWordFingerprint` 标记 + `nonSingleMaxWeight` 分离逻辑实现，不影响多词指纹的正常封禁行为。
+- **`/job` 私聊翻页改为 inline 按钮**：`/job 任务ID` 在私聊中查询批量任务详情时，用户列表超出单页（10 人）时原来用文本提示 `翻页:<code>/job 任务ID 页码</code>`；现改为直接在消息底部挂 inline 按钮，点按钮即编辑原消息跳页，无需手动输入命令。群内触发因为走审计包装路径、无法还原原始消息，保留文本翻页提示不受影响。
 
 > 全局黑名单语义：D1 中的黑名单是**永久全局黑名单**，**唯一写入来源是真人用 `/ban`、`/spam` 指令**；真人群内手动封禁、第三方机器人封禁一律不写入。命中后自助解封流程第一道闸即拒绝，复制或发送 `GKYbotSave` 只处理 GKY，不会清除本地 D1；群内管理员手动解封也会被立即封回并通知主人。只有**群管理员 / 超级管理员 / 主人 / 副主人**主动用 `/unban 用户ID` 指令才能从黑名单移除。
 
@@ -230,22 +232,23 @@
 
 ```text
 .
-├── _worker.js           # Worker 主程序（单文件，含广告检测层）
-├── wrangler.toml        # Cloudflare Wrangler 配置（D1 / Queue / AI 绑定）
-├── test_kick.mjs        # 真踢人闭环 + Queue + 命令权限完整回归（838 项）
-├── test_ad_detection.mjs # 广告检测三层判定 + 命令闭环 + 回归（452 项）
-├── test_batch.mjs       # 批量预算、D1、重试与消息分块离线测试（108 项）
-├── test_export.mjs      # 导出接口离线测试（41 项）
-├── test_leavegroup.mjs  # 退群命令离线测试（35 项）
+├── _worker.js             # Worker 主程序（单文件，含广告检测层）
+├── wrangler.toml          # Cloudflare Wrangler 配置（D1 / Queue / AI 绑定）
+├── test_kick.mjs          # 真踢人闭环 + Queue + 命令权限完整回归（849 项）
+├── test_ad_detection.mjs  # 广告检测三层判定 + 命令闭环 + 回归（891 项）
+├── test_ad_bio_gates.mjs  # 广告检测三道闸端到端 webhook 链路测试（17 场景）
+├── test_batch.mjs         # 批量预算、D1、重试与消息分块离线测试（108 项）
+├── test_export.mjs        # 导出接口离线测试（41 项）
+├── test_leavegroup.mjs    # 退群命令离线测试（35 项）
 ├── README.md
 └── LICENSE
 ```
 
-全部测试共 **1474 项**，跑法：
+全部测试共 **1924 项（含 17 端到端场景）**，跑法：
 
 ```bash
-node test_kick.mjs && node test_ad_detection.mjs && node test_batch.mjs \
-  && node test_export.mjs && node test_leavegroup.mjs
+node test_kick.mjs && node test_ad_detection.mjs && node test_ad_bio_gates.mjs \
+  && node test_batch.mjs && node test_export.mjs && node test_leavegroup.mjs
 ```
 
 > 测试全部离线运行，无需真实 Telegram / Cloudflare 环境：Telegram Bot API 全部 mock，D1 用 Node 内置 `node:sqlite` 的 `DatabaseSync(':memory:')` 做**真实 SQLite 后端**（`ON CONFLICT`、`UNIQUE` 索引、`batch` 事务语义都是真跑的），Workers AI 用固定向量函数模拟。需要 Node 22+（`node:sqlite` 要求）。

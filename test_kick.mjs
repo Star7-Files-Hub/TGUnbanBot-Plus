@@ -2014,6 +2014,48 @@ console.log('\n[11b] 群内 /ban 20 个 TGID → D1 批量任务');
 	assert('/job 第 2 页仍只查询 10 个用户资料', callsOf('getChatMember').length === 10);
 	const secondPageText = callsOf('sendMessage').map((c) => c.body.text).join('\n');
 	assert('/job 第 2 页显示后 10 个用户', secondPageText.includes('第 2/2 页') && secondPageText.includes(ids[19]));
+
+	// 2026-09-09：/job 私聊路径的文本翻页改成 inline 按钮，编辑原消息。
+	const jobKeyboard = callsOf('sendMessage').at(-1)?.body?.reply_markup?.inline_keyboard || [];
+	const jobButtons = jobKeyboard.flat().map((b) => String(b.callback_data || ''));
+	assert('/job 私聊挂上翻页按钮', jobButtons.some((d) => d.startsWith('adjob:1:')), JSON.stringify(jobKeyboard));
+	assert('/job 第 2 页无「下一页」按钮', !jobButtons.some((d) => d.startsWith('adjob:3:')), JSON.stringify(jobKeyboard));
+	assert('/job 按钮化后不再留文本翻页提示', !secondPageText.includes('翻页:<code>/job'), secondPageText);
+	assert('/job callback_data 未超 64 字节',
+		jobButtons.every((d) => new TextEncoder().encode(d).length <= 64), JSON.stringify(jobButtons));
+
+	// 点「上一页」回到第 1 页：编辑原消息，不发新消息。
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({
+			callback_query: {
+				id: 'cbjob1',
+				from: { id: 999, is_bot: false },
+				message: { message_id: 900, chat: { id: 999, type: 'private' }, text: '旧内容' },
+				data: jobButtons.find((d) => d.startsWith('adjob:1:'))
+			}
+		})
+	}), env, fakeCtx);
+	assert('/job 翻页回调编辑原消息', callsOf('editMessageText').length === 1, JSON.stringify(apiCalls.map((c) => c.method)));
+	assert('/job 翻页回调不发新消息', callsOf('sendMessage').length === 0, JSON.stringify(apiCalls.map((c) => c.method)));
+	const jobEdited = String(callsOf('editMessageText').at(-1)?.body?.text || '');
+	assert('/job 翻页回调回到第 1 页', jobEdited.includes('第 1/2 页') && jobEdited.includes(ids[0]), jobEdited);
+	assert('/job 翻页回调保留任务详情头', jobEdited.includes('批量任务状态'), jobEdited);
+	assert('/job 翻页回调应答 callback_query', callsOf('answerCallbackQuery').length === 1, JSON.stringify(apiCalls.map((c) => c.method)));
+
+	// 群内触发那条走 replyToAdmin 的审计包装消息，编辑时还原不出包装 → 保持文本翻页。
+	resetCalls();
+	await handler.fetch(new Request('https://x.com/', {
+		method: 'POST',
+		body: JSON.stringify({ message: { message_id: 819, chat: { id: -1001, type: 'supergroup' }, from: { id: 999, is_bot: false }, text: `/job ${job.id}` } })
+	}), env, fakeCtx);
+	await drainPending(pending);
+	const groupJobText = callsOf('sendMessage').map((c) => c.body.text).join('\n');
+	assert('群内 /job 保留文本翻页提示', groupJobText.includes('翻页:<code>/job'), groupJobText);
+	assert('群内 /job 不挂翻页按钮',
+		!callsOf('sendMessage').some((c) => c.body?.reply_markup?.inline_keyboard),
+		JSON.stringify(callsOf('sendMessage').map((c) => c.body?.reply_markup)));
 }
 
 // [11b1] 未绑定 Queue 时只创建 D1 任务，不后台跑大批量 /ban
