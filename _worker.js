@@ -649,12 +649,33 @@ const GROUP_ADMIN_COMMAND_MENU = [
 	{ command: 'spam', description: '举报广告号（跨群封禁）' },
 ];
 
+// 副主人菜单 = 与第一主人相同（权限一致）
 const SECONDARY_OWNER_COMMAND_MENU = [
 	{ command: 'unban', description: '解封用户（全部配置群）' },
 	{ command: 'ban', description: '封禁并加黑（只封当前群）' },
 	{ command: 'spam', description: '举报广告号（跨群封禁）' },
 	{ command: 'check', description: '查询封禁状态' },
 	{ command: 'blacklist', description: '查看黑名单' },
+	{ command: 'add_admin', description: '添加额外管理员' },
+	{ command: 'del_admin', description: '移除额外管理员' },
+	{ command: 'list_admin', description: '列出额外管理员' },
+	{ command: 'job', description: '查询批量任务进度' },
+	{ command: 'jobrun', description: '手动续跑批量任务' },
+	{ command: 'admins', description: '查看权限名单' },
+	{ command: 'groups', description: '查看配置群组' },
+	{ command: 'addgroup', description: '添加动态群组' },
+	{ command: 'delgroup', description: '移除动态群组' },
+	{ command: 'listgroups', description: '查看生效群组' },
+	{ command: 'leavegroup', description: '让机器人退出群组' },
+	{ command: 'addword', description: '添加广告词' },
+	{ command: 'delword', description: '删除广告词' },
+	{ command: 'listwords', description: '查看广告词库' },
+	{ command: 'pending', description: '待确认广告判定快照' },
+	{ command: 'confirm', description: '确认广告判定正确' },
+	{ command: 'ignore', description: '忽略错误判定并解封' },
+	{ command: 'status', description: '机器人状态' },
+	{ command: 'start', description: '自助解封入口' },
+	{ command: 'help', description: '展开全部隐藏指令' },
 ];
 
 // 第一主人菜单 = 全部命令（含隐藏运维指令）。仅投放给 OWNER_IDS[0]。
@@ -6566,7 +6587,10 @@ async function sendStatusMenu(message, env, ctx) {
 				{ text: '📋 待确认', callback_data: 'status:pending' },
 			],
 			[
+				{ text: '👁️ 观察窗口', callback_data: 'status:observation' },
 				{ text: '📚 指纹库', callback_data: 'status:words' },
+			],
+			[
 				{ text: '🛡️ 管理员', callback_data: 'status:mods' },
 			],
 		],
@@ -9535,6 +9559,30 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 			}
 			await sendTelegramMessage(cbChatId, text);
 			await answerAdVoteCallback(callbackQuery?.id, '已发送管理员列表');
+			return;
+		}
+		if (action === 'observation') {
+			try {
+				const observations = await getObservationWindow(env, 20);
+				let text = '👁️ <b>观察窗口</b>\n\n';
+				if (observations.length === 0) {
+					text += '（空）没有用户在观察窗口中。';
+				} else {
+					observations.forEach((o, i) => {
+						const hits = o.hits ? JSON.parse(o.hits) : [];
+						text += `${i + 1}. 用户:<code>${escapeHtml(o.user_id)}</code> 评分:${o.score}\n`;
+						text += `   群:<code>${escapeHtml(o.chat_id)}</code>\n`;
+						if (hits.length > 0) {
+							text += `   原因:${hits.slice(0, 3).map((h) => escapeHtml(h)).join('、')}\n`;
+						}
+						text += '\n';
+					});
+				}
+				await sendTelegramMessage(cbChatId, text);
+				await answerAdVoteCallback(callbackQuery?.id, '已发送观察窗口');
+			} catch (error) {
+				await answerAdVoteCallback(callbackQuery?.id, `查询失败: ${error.message}`, true);
+			}
 			return;
 		}
 	}
