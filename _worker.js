@@ -7140,6 +7140,103 @@ async function cleanupAdVoteSourceChatMessages(env, chatId, userId) {
 	return result;
 }
 
+// ===== 广告 Bot 触发者检测 =====
+// 当检测到广告来自 bot 时，查找是谁 @了这个 bot 触发了广告
+// 返回触发者用户 ID 数组
+async function findBotTriggerers(env, chatId, botUsername, botUserId, limit = 50) {
+	const triggerers = new Set();
+	if (!env?.DB || !chatId || (!botUsername && !botUserId)) return [];
+	try {
+		await ensureD1Table(env);
+		// 查找 moderation_messages 中 @了 bot 的消息
+		const { results } = await env.DB.prepare(
+			'SELECT from_id, mid FROM moderation_messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?'
+		).bind(String(chatId), limit).all();
+		for (const row of results || []) {
+			if (!row.from_id || String(row.from_id) === String(botUserId)) continue;
+			// 检查消息内容是否包含 @bot用户名
+			// 由于 moderation_messages 不存储文本，我们通过 recent_messages 查找
+			try {
+				const { results: msgResults } = await env.DB.prepare(
+					'SELECT text FROM recent_messages WHERE chat_id = ? AND from_id = ? AND mid = ? LIMIT 1'
+				).bind(String(chatId), String(row.from_id), row.mid).first();
+				if (msgResults && msgResults.text) {
+					const text = msgResults.text.toLowerCase();
+					const username = (botUsername || '').toLowerCase().replace('@', '');
+					if (username && (text.includes(`@${username}`) || text.includes(`@${username.toLowerCase()}`))) {
+						triggerers.add(String(row.from_id));
+					}
+				}
+			} catch (error) { /* ignore */ }
+		}
+	} catch (error) {
+		console.error('[bot_trigger] 查找失败:', error.message);
+	}
+	return [...triggerers];
+}
+
+// ===== 增强版消息清扫 =====
+// 删除用户的所有消息，包括：
+// 1. moderation_messages 缓存的消息
+// 2. recent_messages 中包含 @bot 的消息
+async function cleanupUserAllMessages(env, chatId, userId, targetBotUsername = null) {
+	const messageIds = new Set();
+	const addMessageId = (mid) => {
+		const n = Number(mid);
+		if (Number.isInteger(n) && n > 0) messageIds.add(n);
+	};
+
+	if (env.DB) {
+		try {
+			await ensureD1Table(env);
+			// 1. 从 moderation_messages 获取
+			const { results: modResults } = await env.DB.prepare(
+				'SELECT mid FROM moderation_messages WHERE chat_id = ? AND from_id = ? ORDER BY id DESC LIMIT 200'
+			).bind(String(chatId), String(userId)).all();
+			for (const row of modResults || []) addMessageId(row.mid);
+			await env.DB.prepare('DELETE FROM moderation_messages WHERE chat_id = ? AND from_id = ?')
+				.bind(String(chatId), String(userId)).run();
+
+			// 2. 如果指定了 bot 用户名，查找包含 @bot 的消息
+			if (targetBotUsername) {
+				const username = targetBotUsername.toLowerCase().replace('@', '');
+				const { results: recentResults } = await env.DB.prepare(
+					'SELECT mid FROM recent_messages WHERE chat_id = ? AND from_id = ? ORDER BY id DESC LIMIT 200'
+				).bind(String(chatId), String(userId)).all();
+				for (const row of recentResults || []) {
+					try {
+						const { results: textResult } = await env.DB.prepare(
+							'SELECT text FROM recent_messages WHERE mid = ? LIMIT 1'
+						).bind(row.mid).first();
+						if (textResult && textResult.text) {
+							const text = textResult.text.toLowerCase();
+							if (text.includes(`@${username}`)) {
+								addMessageId(row.mid);
+							}
+						}
+					} catch (error) { /* ignore */ }
+				}
+			}
+		} catch (error) {
+			console.error('[cleanup] 读取 D1 缓存失败:', error);
+		}
+	}
+
+	let ok = 0;
+	let failed = 0;
+	const errors = [];
+	for (const mid of messageIds) {
+		const result = deleteMessage(chatId, mid);
+		if (result.ok) {
+			ok += 1;
+		} else {
+			failed += 1;
+			errors.push({ messageId: mid, error: result.error || '未知错误' });
+		}
+	}
+	return { total: messageIds.size, ok, failed, errors };
+}
+
 function renderCurrentChatCleanupResult(cleanup) {
 	if (!cleanup || cleanup.total === 0) return '🧹 当前群近期消息清扫:未找到缓存消息';
 	const suffix = cleanup.failed ? `，失败 ${cleanup.failed}` : '';
@@ -10744,7 +10841,24 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 加黑成功或已存在 → Telegram 群封禁/预封(revoke_messages 默认 true:封禁同时删该用户在各群全部消息)
 			//   + 缓存清扫兜底(补删 revoke 偶尔漏的、当前群近期消息)
 			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true, _env: env });
-			const cleanupResult = await cleanupCurrentChatUserMessages(env, chatId, repliedUserId, [repliedMsg.message_id]);
+			// 使用增强版清扫：删除用户所有消息（包括 @bot 的消息）
+			const cleanupResult = await cleanupUserAllMessages(env, chatId, repliedUserId, repliedMsg?.from?.username);
+
+			// 检测广告 Bot 的触发者（@bot 的人）
+			const triggererLines = [];
+			if (repliedMsg?.from?.is_bot || repliedMsg?.from?.username?.toLowerCase().includes('bot')) {
+				const botUsername = repliedMsg.from.username;
+				const triggerers = await findBotTriggerers(env, chatId, botUsername, repliedUserId);
+				if (triggerers.length > 0) {
+					triggererLines.push('', '⚠️ <b>检测到广告 Bot 触发者</b>');
+					for (const triggererId of triggerers) {
+						// 封禁触发者（仅当前群）
+						await addToBlacklist(triggererId, env, { reason: 'ad_auto', by: 'system', note: `触发广告 Bot @${botUsername}` });
+						await banUserFromGroups(triggererId, [chatId], { probeMembership: true });
+						triggererLines.push(`  • <code>${escapeHtml(triggererId)}</code> 已封禁（触发 @${escapeHtml(botUsername)}）`);
+					}
+				}
+			}
 
 			const lines = [
 				`🎬 操作:举报加黑(/spam，跨群封禁)`,
@@ -10756,6 +10870,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					: `⚠️ 用户 ${linkedUserId} 已在黑名单中,本次已继续执行 Telegram 群封禁/预封${result.scopeExpanded ? '，并已把生效范围升级为全局' : ''}`,
 				await renderBanResultsDetail(banResults, null, { userId: repliedUserId, retryCommand: '/spam' }),
 			];
+			lines.push(renderCurrentChatCleanupResult(cleanupResult));
+			if (triggererLines.length > 0) {
+				lines.push(...triggererLines);
+			}
 			lines.push(renderCurrentChatCleanupResult(cleanupResult));
 			if (cleanupResult.failed > 0 && cleanupResult.errors.length > 0) {
 				const previews = cleanupResult.errors.slice(0, 3).map((item) => {
