@@ -117,17 +117,8 @@ const DEFAULT_BLACKLIST_REASON_LABELS = {
 //    环境变量名：GKY_BANLIST_ENDPOINT
 const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
 
-// 8) 超级管理员 TGID 白名单。用于普通管理命令鉴权，支持多个 TGID。
-//    环境变量名：SUPER_ADMINS （字符串形式，逗号分隔）
-//    例：'123456,789012'
-//    硬编码这里写数组形式，留空数组表示默认无超管。
-const DEFAULT_SUPER_ADMINS = [
-	// '123456789',
-	// '987654321',
-];
-
 // 9) 主人 TGID(项目所有者),用于"主人审计通知"系统
-//    所有管理员/超管在群里使用 /ban /unban /spam 命令、
+//    所有管理员在群里使用 /ban /unban /spam 命令、
 //    群内手动 ban/unban 时,主人会收到一份带操作人标记的私聊审计通知
 //    环境变量 OWNER_IDS(逗号分隔,中英文逗号均可):第一个是主人,后续是副主人
 //    主人收全部通知;副主人只收 /ban、/spam 这类加黑踢人通知
@@ -289,8 +280,6 @@ let GROUP_IDS = [];
 let ENV_GROUP_IDS = [];
 // D1 dynamic_groups 里合并进来的群（每请求由 mergeDynamicGroupsFromD1 重建）
 let DYNAMIC_GROUP_IDS = [];
-// 超级管理员 TGID 白名单（用于普通管理命令）
-let SUPER_ADMINS = [];
 // 主人 TGID 列表:第一个是主人,后续是副主人。空数组 = 未配置,禁用通知
 let OWNER_IDS = [];
 // 广告检测运行期配置
@@ -309,6 +298,8 @@ let AD_KEYWORDS_FRAUD = [];
 let AD_SAMPLE_FINGERPRINTS = [];
 let AD_SAMPLE_ENTRY_BY_FP = new Map();
 let AD_SIMILARITY_SAMPLES = [];
+// 额外管理员缓存（从 D1 moderation_admins 表加载）
+let isModerationAdminCache = null;
 // 正常域名白名单(内置 + D1 热更新,运行期合并;命中的链接不计分、不参与样本子串匹配)
 // 初始即为内置默认值,保证 merge 未执行(如 D1 未绑定)时正常域名白名单仍生效
 let URL_WHITELIST = [...DEFAULT_URL_WHITELIST];
@@ -331,7 +322,6 @@ function applyRuntimeConfig(config) {
 	ENV_GROUP_IDS = [...config.GROUP_IDS];
 	DYNAMIC_GROUP_IDS = [];
 	GROUP_ID = config.GROUP_ID;
-	SUPER_ADMINS = config.SUPER_ADMINS;
 	OWNER_IDS = config.OWNER_IDS;
 	AD_FILTER_ENABLED = config.AD_FILTER_ENABLED;
 	AD_SCORE_THRESHOLD = config.AD_SCORE_THRESHOLD;
@@ -504,21 +494,6 @@ function loadRequiredConfig(env) {
 	// 去重，保持顺序
 	const uniqueGroupIds = [...new Set(groupIds)];
 
-	// SUPER_ADMINS 可选：环境变量优先（字符串，逗号分隔，半角 , 与全角 ， 都兼容）；否则用顶部 DEFAULT_SUPER_ADMINS（数组）
-	const sanitizeAdmins = (list) =>
-		[...new Set(
-			(list || [])
-				.map((id) => String(id).trim())
-				.filter((id) => /^\d+$/.test(id))
-		)];
-
-	let superAdmins;
-	if (env.SUPER_ADMINS !== undefined && env.SUPER_ADMINS !== null && String(env.SUPER_ADMINS).trim() !== '') {
-		superAdmins = sanitizeAdmins(String(env.SUPER_ADMINS).split(/[,，]/));
-	} else {
-		superAdmins = sanitizeAdmins(DEFAULT_SUPER_ADMINS);
-	}
-
 	// OWNER_IDS 可选：逗号分隔（中英文逗号均可），第一个主人、后续副主人，空 = 禁用主人通知
 	let ownerIds = [];
 	const rawOwnerEnv = env.OWNER_IDS;
@@ -611,7 +586,6 @@ function loadRequiredConfig(env) {
 		BOT_TOKEN: String(env.BOT_TOKEN).trim(),
 		GROUP_IDS: uniqueGroupIds,
 		GROUP_ID: uniqueGroupIds[0],
-		SUPER_ADMINS: superAdmins,
 		OWNER_IDS: ownerIds,
 		AD_FILTER_ENABLED: adFilterEnabled,
 		AD_SCORE_THRESHOLD: adScoreThreshold,
@@ -1838,7 +1812,7 @@ async function addToBlacklist(userId, env, options = {}) {
 
 // 从黑名单中移除用户（核心实现）
 // options.scopeGroups：只解除这些群的范围（群管理员本群 /unban）。
-//   省略 = 整条删除（主人/副主人/超管的全局 /unban）。
+//   省略 = 整条删除（主人/副主人的全局 /unban）。
 //   目标记录是全局记录时，范围移除一律拒绝：全局语义不允许被"部分放行"偷偷破坏。
 async function removeFromBlacklistCore(userId, env, options = {}) {
 	if (!env.DB) {
@@ -2559,11 +2533,11 @@ function isSecondaryOwner(id) {
 	return OWNER_IDS.length > 1 && OWNER_IDS.slice(1).includes(idStr);
 }
 
-// 高级管理员：主人、副主人、SUPER_ADMINS。
-// 这三类角色保留原有全部管理命令和跨群操作权限。
+// 高级管理员：主人、副主人。
+// 这两类角色保留原有全部管理命令和跨群操作权限。
 function isPrivilegedManager(userId) {
 	const idStr = String(userId || '');
-	return isOwner(idStr) || isSuperAdmin(idStr);
+	return isOwner(idStr);
 }
 
 // 只检查用户是否为“指定当前群”的 Telegram 管理员。
@@ -2647,13 +2621,12 @@ async function notifyAllOwners(text, excludeId, includeSecondaryOwners = false) 
 	);
 }
 
-// 判定操作人角色,返回中文标签:主人 / 超级管理员 / 群管理员
-// 主人优先级最高;主人之外的 SUPER_ADMINS 是"超级管理员";其余按调用方传入的兜底标签(默认"管理员")
+// 判定操作人角色,返回中文标签:主人 / 群管理员
+// 主人优先级最高;其余按调用方传入的兜底标签(默认"管理员")
 function classifyOperatorRole(userId, fallback = '管理员') {
 	const idStr = String(userId || '');
 	if (isPrimaryOwner(idStr)) return '主人';
 	if (isSecondaryOwner(idStr)) return '副主人';
-	if (isSuperAdmin(idStr)) return '超级管理员';
 	return fallback;
 }
 
@@ -4811,7 +4784,6 @@ function renderBlacklistOperator(byId, usernames) {
 	let roleTag = '👤 群管理员';
 	if (isPrimaryOwner(raw)) roleTag = '👑 主人';
 	else if (isSecondaryOwner(raw)) roleTag = '👤 副主人';
-	else if (SUPER_ADMINS.includes(raw)) roleTag = '🛡️ 超级管理员';
 
 	// 有用户名就用纯文本 @xxx：Telegram 自动识别为用户链接，不受对方隐私设置影响。
 	// TGID 仍然照常给出，方便直接复制去 /check、/unban。
@@ -4938,11 +4910,7 @@ function isTelegramSlashCommand(text) {
 }
 
 // 判断给定 user_id 是否在超级管理员白名单内（按钮交互专用鉴权）
-function isSuperAdmin(userId) {
-	if (userId === undefined || userId === null) return false;
-	const idStr = String(userId);
-	return SUPER_ADMINS.some((id) => id === idStr);
-}
+
 
 // 清掉会让 Telegram 直接返回 400 的非法字符。
 // 旧实现是 replace(/[\uD800-\uDFFF]/g, '')，把【所有】代理对码元一律删除 —— 但合法的
@@ -5163,8 +5131,7 @@ function renderPermissionSection(title, ids, profiles) {
 async function renderPermissionAdminsList() {
 	const primaryOwner = OWNER_IDS.length ? [OWNER_IDS[0]] : [];
 	const secondaryOwners = OWNER_IDS.length > 1 ? OWNER_IDS.slice(1) : [];
-	const superAdmins = SUPER_ADMINS || [];
-	const allIds = [...primaryOwner, ...secondaryOwners, ...superAdmins];
+	const allIds = [...primaryOwner, ...secondaryOwners];
 	const profiles = await resolvePermissionUserProfiles(allIds);
 	const lines = [
 		'🔐 <b>权限名单</b>',
@@ -6161,6 +6128,23 @@ async function isModerationAdmin(env, userId) {
 	} catch (error) {
 		console.error('[mod_admin] 查询失败:', error.message);
 		return false;
+	}
+}
+
+// 刷新额外管理员缓存
+async function refreshModerationAdminCache(env) {
+	if (!env?.DB) {
+		isModerationAdminCache = null;
+		return;
+	}
+	try {
+		await ensureD1Table(env);
+		const { results } = await env.DB.prepare('SELECT user_id FROM moderation_admins').all();
+		isModerationAdminCache = new Set((results || []).map((r) => String(r.user_id)));
+		console.log(`[mod_admin] 缓存已刷新: ${isModerationAdminCache.size} 个管理员`);
+	} catch (error) {
+		console.error('[mod_admin] 缓存刷新失败:', error.message);
+		isModerationAdminCache = null;
 	}
 }
 
@@ -8628,7 +8612,6 @@ async function translateBlacklistOperator(byId) {
 	let roleTag = '👤 群管理员';
 	if (isPrimaryOwner(byId)) roleTag = '👑 主人';
 	else if (isSecondaryOwner(byId)) roleTag = '👤 副主人';
-	else if (SUPER_ADMINS.includes(byId)) roleTag = '🛡️ 超级管理员';
 
 	// 尝试查询操作人名字和类型
 	try {
@@ -9075,7 +9058,6 @@ async function resolveAdVoteTargetProtection(message, target) {
 	const targetId = String(target.targetUserId || '');
 	if (targetId === String(message?.from?.id || '')) return { protected: true, reason: '不能举报自己' };
 	if (isOwner(targetId)) return { protected: true, reason: '不能举报主人或副主人' };
-	if (isSuperAdmin(targetId)) return { protected: true, reason: '不能举报超级管理员' };
 	const botId = await getBotId();
 	if (botId && targetId === String(botId)) return { protected: true, reason: '不能举报当前机器人' };
 
@@ -10001,6 +9983,9 @@ function isChannelAutoForward(message) {
 }
 
 async function handleMessage(message, env, ctx, requestUrl = '') {
+	// 刷新额外管理员缓存
+	await refreshModerationAdminCache(env);
+
 	// 频道关联群自动转发帖直接放行:不删、不缓存、不参与广告检测、不当命令。
 	// 放在最顶部,先于一切治理逻辑,保证任意频道内容(不只是像广告的)都不被误删误取消置顶。
 	if (isChannelAutoForward(message)) {
@@ -10718,7 +10703,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const hasTgidArg = /^\d+$/.test(checkArg);
 
 		// /check 属于主人层命令：只有主人与副主人（高级管理员）可用，
-		// SUPER_ADMINS 与普通群管理员一律不开放，菜单里也不会出现。
+		// 额外管理员与普通群管理员一律不开放，菜单里也不会出现。
 		const isAdmin = isOwner(userId);
 		const quietGroupCommand = isInGroup && isConfiguredSourceGroup && !isPrimaryOwner(userId);
 
@@ -12192,8 +12177,8 @@ async function checkUserStatus(userId, groupId = GROUP_ID) {
 // 检查用户是否是任一配置群组的管理员
 // 检查用户是否是任一配置群组的管理员 / 超级管理员
 // 权限层级（高 → 低）:超级管理员 > 群管理员 > 普通用户
-// 超级管理员（SUPER_ADMINS 名单）拥有普通管理命令权限。
-// 这里直接把 super 当成 admin,所以 SUPER_ADMINS 用户即使不是任何群的成员也能使用 /ban /unban /spam 等命令
+// 额外管理员（add_admin 添加）拥有普通管理命令权限。
+// 这里直接把 extra admin 当成 admin,所以额外管理员用户即使不是任何群的成员也能使用 /ban /unban /spam 等命令
 //
 // 用 getChatAdministrators 拉群管理员列表本地匹配，比 getChatMember 更稳:
 // - 不要求 bot 是该群管理员（仅要求 bot 在群里）
@@ -12203,15 +12188,15 @@ async function checkUserStatus(userId, groupId = GROUP_ID) {
 async function checkIfUserIsAdmin(userId) {
 	const userIdStr = String(userId);
 
-	// 主人/副主人直接放行（最高权限，先于超管/群管理员检查）
+	// 主人/副主人直接放行（最高权限，先于额外管理员/群管理员检查）
 	if (isOwner(userIdStr)) {
 		console.log(`[管理员鉴权] 用户 ${userId} 是主人/副主人 ✅`);
 		return true;
 	}
 
-	// 超级管理员直接放行（最高权限,优先于群管理员检查）
-	if (isSuperAdmin(userIdStr)) {
-		console.log(`[管理员鉴权] 用户 ${userId} 是超级管理员 ✅`);
+	// 额外管理员直接放行（最高权限,优先于群管理员检查）
+	if (isModerationAdminCache && isModerationAdminCache.has(userIdStr)) {
+		console.log(`[管理员鉴权] 用户 ${userId} 是额外管理员 ✅`);
 		return true;
 	}
 
