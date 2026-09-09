@@ -1310,6 +1310,19 @@ async function ensureD1Table(env) {
 				console.error('[ad_v2] 域名白名单种子写入失败:', error.message);
 			}
 
+			// AI 语义层样本种子数据
+			try {
+				const existingSamples = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings').first();
+				if (!existingSamples || existingSamples.cnt === 0) {
+					for (const text of AD_SAMPLE_SEED_TEXTS) {
+						await env.DB.prepare('INSERT OR IGNORE INTO ad_sample_embeddings (text, embedding, created_at) VALUES (?, NULL, ?)')
+							.bind(text, new Date().toISOString()).run();
+					}
+				}
+			} catch (error) {
+				console.error('[AI] 样本种子写入失败:', error.message);
+			}
+
 			const optionalIndexes = [
 				['idx_blacklist_at_id', 'CREATE INDEX IF NOT EXISTS idx_blacklist_at_id ON blacklist(at, id);'],
 				['idx_blacklist_reason_at_id', 'CREATE INDEX IF NOT EXISTS idx_blacklist_reason_at_id ON blacklist(reason, at, id);'],
@@ -6590,6 +6603,33 @@ const AD_V2_BAN_SCORE = 7;      // 达到此分数直接封禁
 const AD_V2_OBSERVE_SCORE = 4;  // 达到此分数进入观察窗口
 const AD_V2_FINGERPRINT_BAN_WEIGHT = 0.8;  // 指纹权重达到此值直接封禁
 
+// ===== AI 语义层 =====
+const AD_EMBEDDING_MODEL = '@cf/baai/bge-m3';  // Workers AI 嵌入模型
+const AD_SAMPLE_TARGET_COUNT = 30;   // 目标样本向量数
+const AD_SAMPLE_LAZY_BATCH = 8;      // 每次懒加载补齐的样本数
+const AD_AI_SIMILARITY_THRESHOLD = 0.78;  // 相似度阈值，超过则判定为广告
+const AD_AI_SOFT_BONUS_FLOOR = 0.65;      // 软加分下限
+const AD_AI_SOFT_BONUS_SCORE = 2;         // 软加分分数
+
+// AI 语义层样本种子（真实广告文本）
+const AD_SAMPLE_SEED_TEXTS = [
+	'💚高价收网赚号💚 长期收购网 du 商宝账号，老账号优先加价',
+	'2💚高价收网赚号💚 专业收购网 du 账号',
+	'😊青山落日😊 最新项目一天稳宝8-20U，进群联系',
+	'小额洗急 两分钟一单赚几百 私聊我',
+	'7💚高价收网赚号💚 收各种赚钱包盒项目',
+	'真宝玩家注册即送88-388USDT无需实名 大额无忧',
+	'约炮极品辣妞组 真实头像 进入社区查看 黑丝反差女主妇',
+	'最新赚钱风口项目 春节前带家人来找我 薪6000+',
+	'长期收购各类账号 价格表私聊 秒结不拖欠',
+	'招代理日结佣金 无需经验 加微详聊',
+];
+
+// AI 样本向量缓存
+let _adSampleEmbeddingCache = null;
+let _adSampleEmbeddingCacheAt = 0;
+const AD_SAMPLE_EMBEDDING_CACHE_TTL = 60000;
+
 // 获取指纹库（带缓存）
 let _adFingerprintCache = null;
 let _adFingerprintCacheAt = 0;
@@ -6896,7 +6936,126 @@ async function isDomainWhitelisted(env, text) {
 	}
 }
 
-// ===== /recent 冻结快照(供 /learnlast 按固定序号引用,根治序号漂移)=====
+// ===== AI 语义层 =====
+
+// 余弦相似度计算
+function cosineSimilarity(a, b) {
+	if (!Array.isArray(a) || !Array.isArray(b)) return 0;
+	const length = Math.min(a.length, b.length);
+	if (!length) return 0;
+	let dot = 0;
+	let normA = 0;
+	let normB = 0;
+	for (let i = 0; i < length; i++) {
+		const x = Number(a[i]) || 0;
+		const y = Number(b[i]) || 0;
+		dot += x * y;
+		normA += x * x;
+		normB += y * y;
+	}
+	if (normA <= 0 || normB <= 0) return 0;
+	const value = dot / (Math.sqrt(normA) * Math.sqrt(normB));
+	return Number.isFinite(value) ? value : 0;
+}
+
+// 生成文本嵌入向量
+async function embedAdText(env, text) {
+	const source = String(text ?? '').trim().slice(0, 512);
+	if (!source) return null;
+	if (!(env?.AI && typeof env.AI.run === 'function')) return null;
+	try {
+		const response = await env.AI.run(AD_EMBEDDING_MODEL, { text: [source] });
+		const vector = response?.data?.[0];
+		if (!Array.isArray(vector) || !vector.length) return null;
+		return vector.map((v) => Number(v) || 0);
+	} catch (error) {
+		console.error('[AI] 生成文本向量失败'
+			+ ' model=' + AD_EMBEDDING_MODEL
+			+ ' name=' + (error?.name || '未知')
+			+ ' message=' + (error?.message || '（空）')
+			+ ' textLen=' + source.length);
+		return null;
+	}
+}
+
+// 懒加载补齐样本向量
+async function topUpAdSampleEmbeddings(env) {
+	if (!(env?.AI && typeof env.AI.run === 'function')) return 0;
+	try {
+		const readyRow = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL').first();
+		if ((Number(readyRow?.c) || 0) >= AD_SAMPLE_TARGET_COUNT) return 0;
+		const { results } = await env.DB.prepare(
+			'SELECT id, text FROM ad_sample_embeddings WHERE embedding IS NULL ORDER BY id ASC LIMIT ?'
+		).bind(AD_SAMPLE_LAZY_BATCH).all();
+		if (!results?.length) return 0;
+
+		let filled = 0;
+		for (const row of results) {
+			const vector = await embedAdText(env, row.text);
+			if (!vector) continue;
+			await env.DB.prepare('UPDATE ad_sample_embeddings SET embedding = ? WHERE id = ?')
+				.bind(JSON.stringify(vector), row.id).run();
+			filled += 1;
+		}
+		if (filled) {
+			_adSampleEmbeddingCache = null;
+			_adSampleEmbeddingCacheAt = 0;
+		}
+		return filled;
+	} catch (error) {
+		console.error('[AI] 补齐样本向量失败:', error);
+		return 0;
+	}
+}
+
+// 读取样本向量（带缓存）
+async function loadAdSampleEmbeddings(env) {
+	if (!env?.DB) return [];
+	const now = Date.now();
+	if (_adSampleEmbeddingCache && (now - _adSampleEmbeddingCacheAt) < AD_SAMPLE_EMBEDDING_CACHE_TTL) {
+		return _adSampleEmbeddingCache;
+	}
+	try {
+		const { results } = await env.DB.prepare(
+			'SELECT text, embedding FROM ad_sample_embeddings WHERE embedding IS NOT NULL ORDER BY id ASC LIMIT ?'
+		).bind(AD_SAMPLE_TARGET_COUNT * 2).all();
+		const rows = [];
+		for (const row of results || []) {
+			try {
+				const vector = JSON.parse(String(row.embedding));
+				if (Array.isArray(vector) && vector.length) rows.push({ text: String(row.text || ''), vector });
+			} catch { /* 脏样本跳过 */ }
+		}
+		_adSampleEmbeddingCache = rows;
+		_adSampleEmbeddingCacheAt = now;
+		return rows;
+	} catch (error) {
+		console.error('[AI] 读取样本向量失败:', error);
+		return [];
+	}
+}
+
+// 检查 AI 语义相似度
+async function checkAdAiSimilarity(env, text) {
+	const source = String(text ?? '').trim();
+	if (source.length < 4) return { available: true, similarity: 0, sample: null };
+
+	await topUpAdSampleEmbeddings(env);
+	const samples = await loadAdSampleEmbeddings(env);
+	if (!samples.length) return { available: true, similarity: 0, sample: null };
+
+	const vector = await embedAdText(env, source);
+	if (!vector) return { available: true, similarity: 0, sample: null };
+
+	let best = 0;
+	let bestSample = null;
+	for (const sample of samples) {
+		if (sample.vector.length !== vector.length) continue;
+		const similarity = cosineSimilarity(vector, sample.vector);
+		if (similarity > best) { best = similarity; bestSample = sample.text; }
+	}
+	return { available: true, similarity: best, sample: bestSample };
+}
 // /recent 把当时的疑似广告列表(已按上下文过滤+排序)冻结写入 D1;
 // /learnlast 只从这份快照读,所以期间实时缓存被新消息挤动也不影响主人看到的序号。
 
@@ -8606,6 +8765,30 @@ async function detectAdLegacy(message, env) {
 		if (await isDomainWhitelisted(env, fullText)) {
 			score = Math.max(0, score - 3);
 			hits.push('域名白名单豁免');
+		}
+	}
+
+	// AI 语义相似度检测（第三层）
+	if (env?.AI && typeof env.AI.run === 'function' && fullText.length >= 4) {
+		try {
+			const aiResult = await checkAdAiSimilarity(env, fullText);
+			if (aiResult.available && aiResult.similarity >= AD_AI_SIMILARITY_THRESHOLD) {
+				// 高相似度直接判定为广告
+				return {
+					isAd: true,
+					score: 99,
+					hits: [`AI语义相似:${aiResult.similarity.toFixed(2)}${aiResult.sample ? ' / 样本:' + aiResult.sample.slice(0, 30) : ''}`],
+					strong: 'AI语义相似',
+					source: 'AI语义',
+				};
+			}
+			// 软加分
+			if (aiResult.available && aiResult.similarity >= AD_AI_SOFT_BONUS_FLOOR) {
+				score += AD_AI_SOFT_BONUS_SCORE;
+				hits.push(`AI语义加分:${aiResult.similarity.toFixed(2)}`);
+			}
+		} catch (error) {
+			console.error('[AI] 语义检测失败:', error.message);
 		}
 	}
 
