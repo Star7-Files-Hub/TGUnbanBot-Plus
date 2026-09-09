@@ -10089,7 +10089,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const head = text.trim().match(/^\/(add_admin|del_admin|list_admin)(?:@[^\s]+)?/i)[1].toLowerCase();
 
 		// /list_admin：列出全部额外管理员
-		if (head === '/list_admin') {
+		if (head === 'list_admin') {
 			const admins = await listModerationAdmins(env);
 			const lines = ['🛡️ <b>额外管理员列表</b>（可使用 /ban 和 /spam）', ''];
 			if (admins.length === 0) {
@@ -10112,7 +10112,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 		const targetId = match[2];
 		const note = match[3] ? match[3].trim() : '';
-		if (head === '/add_admin') {
+		if (head === 'add_admin') {
 			const result = await addModerationAdmin(env, targetId, userId, note);
 			await sendTelegramMessage(chatId, result.ok
 				? `✅ 已将 <code>${escapeHtml(targetId)}</code> 添加为额外管理员${note ? '（' + escapeHtml(note) + '）' : ''}。\n可使用 /ban 和 /spam。`
