@@ -682,9 +682,9 @@ const PRIMARY_OWNER_COMMAND_MENU = [
 	{ command: 'spam', description: '举报广告号（跨群封禁）' },
 	{ command: 'check', description: '查询封禁状态' },
 	{ command: 'blacklist', description: '查看黑名单' },
-	{ command: 'ad', description: '发起广告举报投票' },
-	{ command: 'add_ad_admin', description: '添加 /ad 发起白名单' },
-	{ command: 'del_ad_admin', description: '移除 /ad 发起白名单' },
+	{ command: 'add_admin', description: '添加额外管理员' },
+	{ command: 'del_admin', description: '移除额外管理员' },
+	{ command: 'list_admin', description: '列出额外管理员' },
 	{ command: 'job', description: '查询批量任务进度' },
 	{ command: 'jobrun', description: '手动续跑批量任务' },
 	{ command: 'admins', description: '查看权限名单' },
@@ -10072,47 +10072,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 	}
 
-	// /add_ad_admin、/del_ad_admin：第一主人管理 /ad 发起白名单。
-	if (text && /^\/(add_ad_admin|del_ad_admin)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
-		const isInGroup = message.chat.type !== 'private';
-		if (!isPrimaryOwner(userId)) {
-			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/ad 发起白名单仅限第一主人管理。');
-			}
-			return;
-		}
-		await deleteAuthorizedGroupCommandMessage(message, '/ad-admin');
-		if (!env.DB) {
-			await sendAuthorizedCommandResult(message, ctx, {
-				flashText: '❌ 未绑定 D1',
-				detailText: '❌ 未绑定 D1 存储空间，无法管理 /ad 发起白名单。',
-			});
-			return;
-		}
-		const match = text.trim().match(/^\/(add_ad_admin|del_ad_admin)(?:@[^\s]+)?\s+(\d+)\s*$/i);
-		if (!match) {
-			await sendAuthorizedCommandResult(message, ctx, {
-				flashText: '❌ 用法错误',
-				detailText: '用法：<code>/add_ad_admin TGID</code> 或 <code>/del_ad_admin TGID</code>',
-			});
-			return;
-		}
-		const enabled = match[1].toLowerCase() === 'add_ad_admin';
-		const result = await setAdVoteAllowlist(env, match[2], enabled, userId);
-		const detail = result.ok
-			? (enabled
-				? '✅ 已将 <code>' + escapeHtml(match[2]) + '</code> 加入 /ad 发起白名单。'
-				: '✅ 已将 <code>' + escapeHtml(match[2]) + '</code> 从 /ad 发起白名单移除。')
-			: '❌ 更新失败：' + escapeHtml(result.error || '未知错误');
-		await sendAuthorizedCommandResult(message, ctx, {
-			flashText: result.ok ? '✅ /ad 白名单已更新' : '❌ /ad 白名单更新失败',
-			detailText: detail,
-		});
-		return;
-	}
-
-	// /add_mod、/del_mod：第一主人管理额外管理员（可使用 /ban 和 /spam 的非管理员用户）。
-	if (text && /^\/(add_mod|del_mod|list_mod)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+	// /add_admin、/del_admin：第一主人管理额外管理员（可使用 /ban 和 /spam 的非管理员用户）。
+	if (text && /^\/(add_admin|del_admin|list_admin)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
 		if (!isPrimaryOwner(userId)) {
 			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n额外管理员管理仅限第一主人。');
@@ -10122,14 +10083,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间。');
 			return;
 		}
-		const head = text.trim().match(/^\/(add_mod|del_mod|list_mod)(?:@[^\s]+)?/i)[1].toLowerCase();
+		const head = text.trim().match(/^\/(add_admin|del_admin|list_admin)(?:@[^\s]+)?/i)[1].toLowerCase();
 
-		// /list_mod：列出全部额外管理员
-		if (head === 'list_mod') {
+		// /list_admin：列出全部额外管理员
+		if (head === '/list_admin') {
 			const admins = await listModerationAdmins(env);
 			const lines = ['🛡️ <b>额外管理员列表</b>（可使用 /ban 和 /spam）', ''];
 			if (admins.length === 0) {
-				lines.push('（空）用 <code>/add_mod TGID</code> 添加。');
+				lines.push('（空）用 <code>/add_admin TGID</code> 添加。');
 			} else {
 				admins.forEach((a, i) => {
 					const note = a.note ? ` — ${escapeHtml(a.note)}` : '';
@@ -10140,15 +10101,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			return;
 		}
 
-		// /add_mod 和 /del_mod 需要 TGID 参数
-		const match = text.trim().match(/^\/(add_mod|del_mod)(?:@[^\s]+)?\s+(\d+)(?:\s+([\s\S]*))?$/i);
+		// /add_admin 和 /del_admin 需要 TGID 参数
+		const match = text.trim().match(/^\/(add_admin|del_admin)(?:@[^\s]+)?\s+(\d+)(?:\s+([\s\S]*))?$/i);
 		if (!match) {
-			await sendTelegramMessage(chatId, '❌ 用法：<code>/add_mod TGID [备注]</code> 或 <code>/del_mod TGID</code>');
+			await sendTelegramMessage(chatId, '❌ 用法：<code>/add_admin TGID [备注]</code> 或 <code>/del_admin TGID</code>');
 			return;
 		}
 		const targetId = match[2];
 		const note = match[3] ? match[3].trim() : '';
-		if (head === 'add_mod') {
+		if (head === '/add_admin') {
 			const result = await addModerationAdmin(env, targetId, userId, note);
 			await sendTelegramMessage(chatId, result.ok
 				? `✅ 已将 <code>${escapeHtml(targetId)}</code> 添加为额外管理员${note ? '（' + escapeHtml(note) + '）' : ''}。\n可使用 /ban 和 /spam。`
@@ -10375,12 +10336,6 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				]],
 			}
 		);
-		return;
-	}
-
-	// /ad 必须先于自动广告检测：白名单成员或助推者回复广告发起投票时，不能把发起人误判为传播者。
-	if (isAdCommand(text)) {
-		await handleAdCommand(message, env, ctx);
 		return;
 	}
 
@@ -10657,50 +10612,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				});
 				lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
 			}
-			// 仅主人 /spam → 学习样本(只写整句指纹入库,不污染词库)
-			const isOwnerSpam = isPrimaryOwner(userId);
-			if (isOwnerSpam && env.DB) {
-				await Promise.all([mergeAdKeywordsFromD1(env), mergeAdSamplesFromD1(env)]);
-				const learning = await resolveAdLearningPayload(repliedMsg);
-				if (learning.samples.length > 0) {
-					const learnLines = ['', '📖 <b>已学习此广告样本</b>'];
-					let sampleCount = 0;
-					const scopeLabels = {
-						body: '当前广告正文',
-						profile: '账号资料卡(姓名/用户名/bio/简介)',
-						quote: '引用中的真实广告',
-					};
-					for (const sample of learning.samples) {
-						const learn = await learnAdSample(env, sample.text, {
-							source: `spam:${sample.source}`,
-							scope: sample.scope,
-							operatorId,
-							sourceChatId: chatId,
-							sourceMessageId: repliedMsg.message_id,
-							preview: sample.text,
-						});
-						sampleCount = learn.sampleCount;
-						learnLines.push('', `🧭 学习载体:${escapeHtml(scopeLabels[sample.scope] || sample.scope)}`);
-						if (learn.fpAdded) learnLines.push('✅ 指纹已入库(只在同类载体中自动匹配)');
-						else if (learn.fpUpgraded) learnLines.push('✅ 旧样本已由人工确认并升级为可信样本');
-						else if (learn.scopeAdded) learnLines.push('✅ 已给现有指纹补充此载体作用域');
-						else learnLines.push('ℹ️ 此载体的可信指纹已存在,未重复入库');
-						if (sample.evidence.length > 0) {
-							learnLines.push(`🔍 载体依据:${escapeHtml(sample.evidence.slice(0, 4).join(' / '))}`);
-						}
-						if (learn.suggestedKeywords.length > 0) {
-							learnLines.push(`💡 建议词(不会自动入库,需手动加):${learn.suggestedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
-							learnLines.push(`   要加进词库请发:<code>/addword general ${escapeHtml(learn.suggestedKeywords.join(' '))}</code>`);
-						}
-					}
-					learnLines.push('', `📊 本次学习 ${learning.samples.length} 个独立载体；当前样本库共 ${sampleCount} 条`);
-					lines.push(...learnLines);
-				} else if (learning.source === 'proxy-exempt') {
-					lines.push('', 'ℹ️ 代理相关内容按绝对豁免口径不写入广告学习样本。');
-				} else {
-					lines.push('', 'ℹ️ 本次封禁照常执行，但正文、资料卡和引用均未达到独立广告证据门槛，未写入学习样本，避免污染样本库。');
-					if (learning.profileLookupFailed) {
-						lines.push('⚠️ 最新资料卡读取失败，本次没有用缓存资料写入学习样本。');
+			// /spam 自动学习指纹（V2：写入 ad_fingerprints 表）
+			if (env.DB) {
+				const adText = repliedMsg?.text || repliedMsg?.caption || '';
+				if (adText.length >= 4) {
+					const fpResult = await addAdFingerprint(env, adText, 'keyword', 0.8, 'spam');
+					if (fpResult.ok) {
+						lines.push('', '📖 <b>已学习广告指纹</b>');
+						lines.push(`✅ 文本已加入指纹库(权重 0.8)`);
 					}
 				}
 			}
@@ -10708,25 +10627,6 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await replyToAdmin(message, ctx, {
 				flashText: `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} ${linkedUserId}`,
 				detailText: withActionContext(message, lines.join('\n'), replySpamNote),
-				isInGroup,
-				notifySecondaryOwners: true
-			});
-		} else {
-			// 写库失败(已存在 / 未绑存储等)— 也走双通道,字段齐全
-			const plainMsg = result.message.replace(/<[^>]+>/g, '');
-			const failLines = [
-				`🎬 操作:举报加黑(/spam)`,
-				`🎯 目标用户:${linkedUserId} <code>${escapeHtml(String(repliedUserId))}</code>`,
-				'',
-			];
-			if (result.code === 'EXISTS') {
-				failLines.push('⚠️ <b>该用户已在黑名单中,请勿重复添加</b>');
-			} else {
-				failLines.push(result.message);
-			}
-			await replyToAdmin(message, ctx, {
-				flashText: `⚠️ ${linkedUserId}: ${escapeHtml(plainMsg)}`,
-				detailText: withActionContext(message, failLines.join('\n'), replySpamNote),
 				isInGroup,
 				notifySecondaryOwners: true
 			});
@@ -11035,10 +10935,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/spam　回复广告使用：删消息 + 全群封禁 + 撤回其历史发言',
 			'/unban TGID　移出黑名单 + 全群解封（裸发 /unban 是自己走自助解封，不是解封别人）',
 			'',
-			'<b>━━ 广告举报投票 ━━</b>',
-			'/ad [原因]　回复目标消息发起；或 /ad TGID [原因]。主人/副主人/超级管理员、当前群管理员或 /add_ad_admin 白名单成员可发起',
-			'/add_ad_admin TGID　允许该成员发起 /ad 投票',
-			'/del_ad_admin TGID　取消该成员的发起权限',
+			'<b>━━ 额外管理员（仅私聊）━━</b>',
+			'/add_admin TGID [备注]　添加额外管理员(可使用 /ban 和 /spam)',
+			'/del_admin TGID　移除额外管理员',
+			'/list_admin　列出全部额外管理员',
 			'',
 			'<b>━━ 动态群组（仅私聊）━━</b>',
 			'/addgroup -100xxx [备注]　新增治理群组，不用改环境变量',
