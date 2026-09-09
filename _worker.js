@@ -693,16 +693,6 @@ const PRIMARY_OWNER_COMMAND_MENU = [
 	{ command: 'delgroup', description: '移除动态群组' },
 	{ command: 'listgroups', description: '查看生效群组' },
 	{ command: 'leavegroup', description: '让机器人退出群组' },
-	{ command: 'addword', description: '添加广告词' },
-	{ command: 'delword', description: '删除广告词' },
-	{ command: 'listwords', description: '查看广告词库' },
-	{ command: 'importdefault', description: '导入推荐广告词库' },
-	{ command: 'learn', description: '学习广告文本指纹' },
-	{ command: 'learnlast', description: '按序号学习快照广告' },
-	{ command: 'recent', description: '拉取疑似广告快照' },
-	{ command: 'listsamples', description: '查看广告样本' },
-	{ command: 'delsample', description: '删除广告样本' },
-	{ command: 'clearsamples', description: '清空广告样本' },
 	{ command: 'ad_test', description: '广告检测测试模式' },
 	{ command: 'pending', description: '待确认广告判定快照' },
 	{ command: 'confirm', description: '确认广告判定正确' },
@@ -1255,8 +1245,6 @@ async function ensureD1Table(env) {
 				// 有值 = 逗号分隔的群 ID 列表，只在这些群内生效。/spam 写全局，
 				// 群内 /ban 与广告自动检测/投票/杀神只写当前群，误杀者仍可加入其它私密群。
 				['blacklist', 'CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT, scope_groups TEXT);'],
-				['ad_keywords', 'CREATE TABLE IF NOT EXISTS ad_keywords (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);'],
-				['ad_samples', 'CREATE TABLE IF NOT EXISTS ad_samples (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);'],
 				['recent_messages', 'CREATE TABLE IF NOT EXISTS recent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, chat_title TEXT, text TEXT, from_id TEXT, from_name TEXT, created_at TEXT);'],
 				['moderation_messages', 'CREATE TABLE IF NOT EXISTS moderation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, from_id TEXT, created_at TEXT);'],
 				['learn_snapshot', 'CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);'],
@@ -5768,57 +5756,8 @@ async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newSta
 // ===== 广告自动检测 =====
 
 // 从 D1 读自定义广告词库(分类对象),空/出错返回 null
-async function loadAdKeywordsFromD1(env) {
-	if (!env.DB) return null;
-	try {
-		await ensureD1Table(env);
-		const row = await env.DB.prepare('SELECT data FROM ad_keywords WHERE id = 1').first();
-		if (row && row.data) {
-			const parsed = JSON.parse(row.data);
-			if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
-		}
-	} catch (error) {
-		console.error('[广告词库] 读 D1 失败:', error);
-	}
-	return null;
-}
-
-async function loadAdKeywordsCachedFromD1(env) {
-	return loadD1RuntimeCachedValue(env, D1_AD_KEYWORDS_CACHE, loadAdKeywordsFromD1);
-}
-
 // 把 D1 自定义词库 merge 到运行期模块级变量(在 detectAd 之前调用)
 // fetch 入口每请求已把 AD_KEYWORDS_* 重置为基线(DEFAULT 空 / 环境变量),这里 push 叠加安全
-async function mergeAdKeywordsFromD1(env) {
-	// 先把域名白名单、身份广告词重置为内置默认(无论 D1 是否有数据都生效)
-	URL_WHITELIST = [...DEFAULT_URL_WHITELIST];
-	IDENTITY_SPAM_WORDS = [...DEFAULT_IDENTITY_SPAM_WORDS];
-	const norm = (a) => (Array.isArray(a) ? a : []).map((s) => String(s).toLowerCase()).filter(Boolean);
-	// 内置推荐词库自动生效(不再必须手动 /importdefault)。字符串拆分写法保证 GitHub 无明文。
-	// D1 里主人 /addword 加的词会在下面继续叠加,两者取并集去重,互不冲突。
-	AD_KEYWORDS_FINANCE = [...new Set([...AD_KEYWORDS_FINANCE, ...norm(RECOMMENDED_AD_KEYWORDS.finance)])];
-	AD_KEYWORDS_PORN = [...new Set([...AD_KEYWORDS_PORN, ...norm(RECOMMENDED_AD_KEYWORDS.porn)])];
-	AD_KEYWORDS_FRAUD = [...new Set([...AD_KEYWORDS_FRAUD, ...norm(RECOMMENDED_AD_KEYWORDS.fraud)])];
-	IDENTITY_SPAM_WORDS = [...new Set([...IDENTITY_SPAM_WORDS, ...norm(RECOMMENDED_AD_KEYWORDS.identity)])];
-	const data = await loadAdKeywordsCachedFromD1(env);
-	if (!data) return;
-	AD_KEYWORDS_FINANCE = [...new Set([...AD_KEYWORDS_FINANCE, ...norm(data.finance)])];
-	AD_KEYWORDS_PORN = [...new Set([...AD_KEYWORDS_PORN, ...norm(data.porn)])];
-	AD_KEYWORDS_SPAM = [...new Set([...AD_KEYWORDS_SPAM, ...norm(data.sa), ...norm(data.spam)])];
-	AD_KEYWORDS_FRAUD = [...new Set([...AD_KEYWORDS_FRAUD, ...norm(data.fraud)])];
-	AD_KEYWORDS = [...new Set([...AD_KEYWORDS, ...norm(data.general)])];
-	// identity 分类:只用于发言人名字/简介检测(不碰正文)
-	IDENTITY_SPAM_WORDS = [...new Set([...IDENTITY_SPAM_WORDS, ...norm(data.identity)])];
-	// whitelist 分类:像域名的项(含 . 且无空格)进 URL_WHITELIST(正常链接放行);
-	//   其余当作"命中不计分"的关键词白名单(原语义保留)。
-	//   所以主人 /addword whitelist github.com 既能加域名,也能加普通白名单词,自动分流。
-	const wlAll = norm(data.whitelist);
-	const wlDomains = wlAll.filter((w) => /^[a-z0-9.-]+\.[a-z]{2,}$/.test(w));
-	const wlWords = wlAll.filter((w) => !wlDomains.includes(w));
-	URL_WHITELIST = [...new Set([...URL_WHITELIST, ...wlDomains])];
-	AD_WHITELIST = [...new Set([...AD_WHITELIST, ...wlWords])];
-}
-
 // 新保存统一使用 spam 分类；旧 D1 data.sa 只读合并，避免历史词库失效。
 function normalizeAdKeywordsForSave(data) {
 	const normalized = data && typeof data === 'object' && !Array.isArray(data) ? { ...data } : {};
@@ -5832,40 +5771,7 @@ function normalizeAdKeywordsForSave(data) {
 }
 
 // 把词库对象写回 D1
-async function saveAdKeywordsToD1(env, data) {
-	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
-	try {
-		await ensureD1Table(env);
-		const normalizedData = normalizeAdKeywordsForSave(data);
-		await env.DB.prepare('INSERT OR REPLACE INTO ad_keywords (id, data, updated_at) VALUES (1, ?, ?)')
-			.bind(JSON.stringify(normalizedData), new Date().toISOString())
-			.run();
-		setD1RuntimeCache(D1_AD_KEYWORDS_CACHE, env.DB, normalizedData);
-		return { ok: true };
-	} catch (error) {
-		console.error('[广告词库] 写 D1 失败:', error);
-		return { ok: false, error: error.message };
-	}
-}
-
 // 读取 D1 词库,空则返回标准空结构(7 个分类)
-async function getAdKeywordsRaw(env) {
-	const data = await loadAdKeywordsFromD1(env);
-	const mergedSpam = [
-		...(Array.isArray(data?.sa) ? data.sa : []),
-		...(Array.isArray(data?.spam) ? data.spam : []),
-	];
-	return {
-		finance: Array.isArray(data?.finance) ? data.finance : [],
-		porn: Array.isArray(data?.porn) ? data.porn : [],
-		spam: [...new Set(mergedSpam.map((w) => String(w).toLowerCase()).filter(Boolean))],
-		fraud: Array.isArray(data?.fraud) ? data.fraud : [],
-		general: Array.isArray(data?.general) ? data.general : [],
-		identity: Array.isArray(data?.identity) ? data.identity : [],
-		whitelist: Array.isArray(data?.whitelist) ? data.whitelist : [],
-	};
-}
-
 // ===== 广告学习样本(第一主人 /spam 上报 → 指纹入库 → 精准查杀)=====
 
 // 归一化:把文本"洗"成标准指纹,抓"加空格/标点/全半角"变体
@@ -5924,19 +5830,6 @@ function adScanMatches(variants, pattern) {
 	return false;
 }
 
-function normalizeForFingerprint(text) {
-	try {
-		return stripInvisibleScanChars(text)   // 先去零宽/格式字符(\p{Cf} 不被下面两条覆盖)
-			.normalize('NFKC')             // 全角半角归一
-			.toLowerCase()
-			.replace(/\s+/g, '')           // 去所有空白
-			.replace(/[\p{P}\p{S}]/gu, ''); // 去标点和符号(含 emoji)
-	} catch (_) {
-		// 老环境不支持 \p{} → 退化:只去空白
-		return String(text || '').toLowerCase().replace(/\s+/g, '');
-	}
-}
-// 相似广告签名：只保留稳定的正文骨架，屏蔽广告商最常替换的账号、链接、电话、金额、数字与排版。
 // 该签名只用于第一主人亲自确认过的学习样本；代理内容仍在进入这里之前整条绝对豁免。
 function normalizeForAdSimilarity(text) {
 	let value = String(text || '');
@@ -5957,12 +5850,6 @@ function normalizeForAdSimilarity(text) {
 		value = value.replace(/[^a-z\u3400-\u9fff]+/gi, '');
 	}
 	return value.slice(0, AD_SIMILARITY_MAX_CANONICAL_LENGTH);
-}
-
-function buildAdSimilaritySignature(text) {
-	const canonical = normalizeForAdSimilarity(text);
-	if (canonical.length < AD_SIMILARITY_MIN_CANONICAL_LENGTH) return null;
-	return { version: AD_SIMILARITY_SIGNATURE_VERSION, canonical };
 }
 
 function buildAdShingleSet(canonical) {
@@ -6016,25 +5903,6 @@ function hasAdSimilarityIntent(text) {
 	return /(?:点击下方|扫码|进群|频道入口|资源入口|完整版|免费(?:看|观看|领取)|联系(?:我|客服|商家)|添加(?:我|客服)|私信(?:我|客服)|承接|出售|售卖|供应|招募|招聘|诚招|合作|代理加盟|日入|月入|佣金|返利)/i.test(scan);
 }
 
-function findSimilarTrustedAdSample(text, scope = 'body') {
-	const signature = buildAdSimilaritySignature(text);
-	if (!signature || AD_SIMILARITY_SAMPLES.length === 0) return null;
-	for (const sample of AD_SIMILARITY_SAMPLES) {
-		if (!sample.entry?.scopes?.includes(scope)) continue;
-		const metrics = compareAdSimilaritySignatures(signature, sample.signature);
-		if (metrics.shared < AD_SIMILARITY_MIN_SHARED_SHINGLES) continue;
-		const thresholdMatch = metrics.dice >= AD_SIMILARITY_DICE_THRESHOLD
-			|| metrics.containment >= AD_SIMILARITY_CONTAINMENT_THRESHOLD;
-		if (!thresholdMatch) continue;
-		const extremeTemplateMatch = metrics.shared >= 14
-			&& metrics.dice >= 0.94
-			&& metrics.containment >= 0.97;
-		if (!extremeTemplateMatch && !hasAdSimilarityIntent(text)) continue;
-		return { ...metrics, signature, entry: sample.entry };
-	}
-	return null;
-}
-
 function inferAdSampleScopes(source) {
 	const value = String(source || '').toLowerCase();
 	if (value.includes('identity-only') || value.includes('profile')) return ['profile'];
@@ -6042,214 +5910,14 @@ function inferAdSampleScopes(source) {
 	return ['body'];
 }
 
-function normalizeAdSampleScopes(scopes, source) {
-	const values = Array.isArray(scopes) ? scopes : inferAdSampleScopes(source);
-	const normalized = [...new Set(values.map((scope) => String(scope || '').toLowerCase()))]
-		.filter((scope) => AD_SAMPLE_SCOPES.includes(scope));
-	return normalized.length > 0 ? normalized : inferAdSampleScopes(source);
-}
-
 // 从广告文本提取特征词组(加入词库 general 分类,抓变体)
-function extractAdKeywords(text) {
-	const norm = String(text || '').toLowerCase();
-	const segments = [];
-	for (const m of norm.matchAll(/[一-龥]{4,12}/g)) segments.push(m[0]); // 中文 ≥4 字
-	for (const m of norm.matchAll(/[a-z0-9]{5,20}/g)) segments.push(m[0]);        // 英数 ≥5
-	return [...new Set(segments)]
-		.filter((s) => !AD_STOPWORDS.includes(s))
-		.slice(0, 5);
-}
-
-function normalizeAdSamplesData(data) {
-	const raw = data && typeof data === 'object' ? data : {};
-	const fingerprints = [...new Set(
-		(Array.isArray(raw.fingerprints) ? raw.fingerprints : [])
-			.map((fp) => String(fp || '').trim())
-			.filter(Boolean)
-	)];
-	const allowed = new Set(fingerprints);
-	const entries = [];
-	const entryIndexByFingerprint = new Map();
-	for (const item of Array.isArray(raw.entries) ? raw.entries : []) {
-		const fingerprint = String(item?.fingerprint || '').trim();
-		if (!fingerprint || !allowed.has(fingerprint)) continue;
-		const storedSignature = item?.signature && typeof item.signature === 'object'
-			? {
-				version: Number(item.signature.version) || AD_SIMILARITY_SIGNATURE_VERSION,
-				canonical: String(item.signature.canonical || '').slice(0, AD_SIMILARITY_MAX_CANONICAL_LENGTH),
-			}
-			: null;
-		const signature = storedSignature?.canonical?.length >= AD_SIMILARITY_MIN_CANONICAL_LENGTH
-			? storedSignature
-			: null;
-		const normalizedEntry = {
-			fingerprint,
-			trusted: item?.trusted === true,
-			similarityTrusted: item?.trusted === true && item?.similarityTrusted === true && Boolean(signature),
-			signature,
-			source: String(item?.source || 'legacy'),
-			scopes: normalizeAdSampleScopes(item?.scopes, item?.source),
-			operatorId: String(item?.operatorId || ''),
-			sourceChatId: String(item?.sourceChatId || ''),
-			sourceMessageId: String(item?.sourceMessageId || ''),
-			learnedAt: String(item?.learnedAt || ''),
-			preview: String(item?.preview || '').slice(0, 160),
-		};
-		const existingIndex = entryIndexByFingerprint.get(fingerprint);
-		if (existingIndex === undefined) {
-			entryIndexByFingerprint.set(fingerprint, entries.length);
-			entries.push(normalizedEntry);
-			continue;
-		}
-		const previous = entries[existingIndex];
-		entries[existingIndex] = {
-			...previous,
-			...normalizedEntry,
-			trusted: previous.trusted || normalizedEntry.trusted,
-			similarityTrusted: previous.similarityTrusted || normalizedEntry.similarityTrusted,
-			signature: normalizedEntry.signature || previous.signature,
-			scopes: [...new Set([...previous.scopes, ...normalizedEntry.scopes])],
-		};
-	}
-	return {
-		...raw,
-		fingerprints,
-		entries,
-		count: fingerprints.length,
-	};
-}
-
-function getAdSampleMatch(fingerprint, scope = 'body') {
-	if (!fingerprint || !AD_SAMPLE_FINGERPRINTS.includes(fingerprint)) return null;
-	const entry = AD_SAMPLE_ENTRY_BY_FP.get(fingerprint) || null;
-	const scopes = entry?.scopes || ['body'];
-	if (scope && !scopes.includes(scope)) return null;
-	return {
-		fingerprint,
-		entry,
-		scopes,
-		trusted: entry?.trusted === true,
-		legacy: !entry || entry.trusted !== true,
-	};
-}
-
 // 从 D1 读样本(返回 { fingerprints: [], count, updatedAt })
-async function loadAdSamplesFromD1(env) {
-	if (!env.DB) return null;
-	try {
-		await ensureD1Table(env);
-		const row = await env.DB.prepare('SELECT data FROM ad_samples WHERE id = 1').first();
-		if (row && row.data) {
-			const parsed = JSON.parse(row.data);
-			if (parsed && Array.isArray(parsed.fingerprints)) return normalizeAdSamplesData(parsed);
-		}
-	} catch (error) {
-		console.error('[广告样本] 读 D1 失败:', error);
-	}
-	return null;
-}
-
-async function loadAdSamplesCachedFromD1(env) {
-	return loadD1RuntimeCachedValue(env, D1_AD_SAMPLES_CACHE, loadAdSamplesFromD1);
-}
-
 // 写样本回 D1
-async function saveAdSamplesToD1(env, data) {
-	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
-	try {
-		await ensureD1Table(env);
-		await env.DB.prepare('INSERT OR REPLACE INTO ad_samples (id, data, updated_at) VALUES (1, ?, ?)')
-			.bind(JSON.stringify(normalizeAdSamplesData(data)), new Date().toISOString())
-			.run();
-		setD1RuntimeCache(D1_AD_SAMPLES_CACHE, env.DB, normalizeAdSamplesData(data));
-		return { ok: true };
-	} catch (error) {
-		console.error('[广告样本] 写 D1 失败:', error);
-		return { ok: false, error: error.message };
-	}
-}
-
 // 把样本指纹 merge 到运行期变量(handleMessage 入口调用)
-async function mergeAdSamplesFromD1(env) {
-	const data = await loadAdSamplesCachedFromD1(env);
-	if (data && Array.isArray(data.fingerprints)) {
-		AD_SAMPLE_FINGERPRINTS = data.fingerprints.filter(Boolean);
-		AD_SAMPLE_ENTRY_BY_FP = new Map((data.entries || []).map((entry) => [entry.fingerprint, entry]));
-		AD_SIMILARITY_SAMPLES = (data.entries || [])
-			.filter((entry) => entry.trusted === true && entry.similarityTrusted === true && entry.signature?.canonical)
-			.map((entry) => ({ entry, signature: entry.signature }));
-	}
-}
-
 // 学习一条广告样本:只写整句指纹入库(不再自动污染词库)
 // 根因修复:旧版会把自动提取的词写进 general(+2 分),导致正常消息分数虚高被误杀。
 //   现在只写指纹;提取的候选词仅作为"建议"返回,由主人自行决定是否 /addword,绝不自动入库。
 // 返回 { ok, fingerprint, fpAdded, suggestedKeywords, sampleCount }
-async function learnAdSample(env, learnText, metadata = {}) {
-	const fp = normalizeForFingerprint(learnText);
-	const signature = buildAdSimilaritySignature(learnText);
-	const suggestedKeywords = extractAdKeywords(learnText);
-	const requestedScopes = normalizeAdSampleScopes(
-		metadata.scopes || (metadata.scope ? [metadata.scope] : null),
-		metadata.source
-	);
-	if (!fp || fp.length < SAMPLE_FP_EXACT_MIN) {
-		const cur = normalizeAdSamplesData((await loadAdSamplesFromD1(env)) || {});
-		return {
-			ok: true,
-			fingerprint: fp,
-			fpAdded: false,
-			fpUpgraded: false,
-			scopeAdded: false,
-			scopes: requestedScopes,
-			suggestedKeywords,
-			sampleCount: cur.count,
-		};
-	}
-
-	const data = normalizeAdSamplesData((await loadAdSamplesFromD1(env)) || {});
-	const added = !data.fingerprints.includes(fp);
-	if (added) data.fingerprints.push(fp);
-
-	const now = new Date().toISOString();
-	const existingIndex = data.entries.findIndex((entry) => entry.fingerprint === fp);
-	const existingEntry = existingIndex >= 0 ? data.entries[existingIndex] : null;
-	const upgraded = !added && existingEntry?.trusted !== true;
-	const existingScopes = existingEntry?.scopes || [];
-	const mergedScopes = [...new Set([...existingScopes, ...requestedScopes])];
-	const scopeAdded = Boolean(existingEntry) && requestedScopes.some((scope) => !existingScopes.includes(scope));
-	const entry = {
-		fingerprint: fp,
-		trusted: true,
-		source: String(metadata.source || 'manual-confirmation'),
-		scopes: mergedScopes,
-		similarityTrusted: Boolean(signature),
-		signature,
-		operatorId: String(metadata.operatorId || ''),
-		sourceChatId: String(metadata.sourceChatId || ''),
-		sourceMessageId: String(metadata.sourceMessageId || ''),
-		learnedAt: now,
-		preview: String(metadata.preview || learnText || '').replace(/\s+/g, ' ').trim().slice(0, 160),
-	};
-	if (existingIndex >= 0) data.entries[existingIndex] = entry;
-	else data.entries.push(entry);
-	data.count = data.fingerprints.length;
-	data.updatedAt = now;
-
-	const saved = await saveAdSamplesToD1(env, data);
-	return {
-		ok: saved.ok,
-		error: saved.error,
-		fingerprint: fp,
-		fpAdded: added,
-		fpUpgraded: upgraded,
-		scopeAdded,
-		scopes: mergedScopes,
-		suggestedKeywords,
-		sampleCount: data.count,
-	};
-}
-
 async function recordAdRelayObservation(env, details = {}) {
 	if (!env.DB) return { ok: false, occurrences: 0, duplicate: false, error: '未绑定 D1 存储空间' };
 	const actorId = String(details.actorId || '').trim();
@@ -7926,42 +7594,6 @@ function logQuoteAdDiagnostic(message, quoteText, detail = {}) {
 	}
 }
 
-function scoreAdWords(text) {
-	let score = 0;
-	const hits = [];
-	// 词库匹配同时比对原文与"去混淆"文本，堵住词内插空格/标点/零宽字符的绕过。
-	const variants = buildAdScanVariants(text);
-	// 跨分类去重:同一个词无论出现在几个词库,只计一次分/一个 hit
-	const seen = new Set();
-	const scan = (words, weight, label) => {
-		for (const w of words) {
-			if (!w || seen.has(w)) continue;
-			if (adScanIncludes(variants, w)) { seen.add(w); score += weight; hits.push(`${label}:${w}`); }
-		}
-	};
-	// 金融词先收集命中，但不立即加分:需要 ≥2 个金融词才入计分
-	// 单个金融词(usdt/搬砖/套利等)在正常讨论中极其普遍，单独出现不应定罪
-	const financeHits = [];
-	const financeSeen = new Set();
-	for (const w of AD_KEYWORDS_FINANCE) {
-		if (!w || financeSeen.has(w)) continue;
-		if (adScanIncludes(variants, w)) { financeSeen.add(w); financeHits.push(`金融:${w}`); }
-	}
-	// ≥2 个金融词叠加才计入评分
-	if (financeHits.length >= 2) {
-		for (const h of financeHits) { seen.add(h.slice(3)); score += 2; hits.push(h); }
-	} else if (financeHits.length === 1) {
-		// 单个金融词：加入 seen 防止自定义库重复，但 score 不加
-		seen.add(financeHits[0].slice(3));
-		hits.push(financeHits[0]); // 保留在 hits 里供诊断日志，但 score=0
-	}
-	scan(AD_KEYWORDS_PORN,  2, '色情');
-	scan(AD_KEYWORDS_SPAM,  1, '引流');
-	scan(AD_KEYWORDS_FRAUD, 2, '诈骗');
-	scan(AD_KEYWORDS,       2, '自定义');
-	return { score, hits };
-}
-
 function scoreHighRiskAdWords(text) {
 	const hits = [];
 	// 同时比对原文与去混淆文本，防止"约·炮""六 合 彩"这类插隔符绕过高危词直杀。
@@ -8906,46 +8538,6 @@ function hasIndependentAdBodyEvidence(message, bodyText) {
 		if (!hasExplicitNormalAdContext(scan) && (scored.score >= AD_SCORE_THRESHOLD || scored.hits.length >= 2)) return true;
 	}
 	return false;
-}
-
-async function resolveAdLearningPayload(message) {
-	if (isProxyRelatedMessage(message)) {
-		return { samples: [], source: 'proxy-exempt', skippedReason: '代理相关内容绝对豁免' };
-	}
-	const samples = [];
-	const seen = new Set();
-	const addSample = (scope, text, source, evidence = []) => {
-		const value = String(text || '').trim();
-		const fingerprint = normalizeForFingerprint(value);
-		const key = `${scope}:${fingerprint}`;
-		if (!value || !fingerprint || seen.has(key)) return;
-		seen.add(key);
-		samples.push({ scope, text: value, source, evidence });
-	};
-	const bodyText = getAdLearningBodyText(message);
-	const quoteText = getQuoteText(message || {});
-	const quoteEvidence = quoteText ? detectQuotedAdEvidence(message, quoteText) : null;
-	if (quoteText && quoteEvidence) {
-		addSample('quote', quoteText, 'quoted-ad', [quoteEvidence.strong, ...(quoteEvidence.hits || [])].filter(Boolean));
-	}
-
-	const profile = await resolveAdIdentityProfile(message || {}, { forceFresh: true });
-	for (const subject of profile.subjects) {
-		if (!subject.fetchSucceeded) continue;
-		const evidence = detectProfileAdEvidence(subject.text);
-		if (evidence.isAd) {
-			addSample('profile', subject.text, 'identity-only', [evidence.strong, ...(evidence.hits || [])].filter(Boolean));
-		}
-	}
-	if (hasIndependentAdBodyEvidence(message, bodyText)) {
-		addSample('body', bodyText, 'message-body', ['正文具备独立广告证据']);
-	}
-	return {
-		samples,
-		source: samples.length > 0 ? 'multi-carrier' : 'ambiguous',
-		skippedReason: samples.length > 0 ? '' : '没有任何载体达到独立广告证据门槛',
-		profileLookupFailed: profile.subjects.some((subject) => !subject.fetchSucceeded),
-	};
 }
 
 // 广告拦截后通知主人
@@ -11429,19 +11021,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const helpLines = [
 			'🔐 <b>第一主人专属指令</b>（其他人无反应，也不出现在命令菜单里）',
 			'',
-			'<b>━━ 广告词库热更新(私聊)━━</b>',
-			'/importdefault　一键导入推荐词库(金融/色情/引流/诈骗/身份引流)',
-			'/addword [分类] 词1 词2　加词。分类:finance/porn/spam/fraud/general/identity/whitelist,默认 general',
-			'/addword whitelist example.com　加正常域名白名单(该域名链接永不被杀)',
-			'/addword identity 卡网 车队　加身份引流词(只查发言人名字/简介,不碰正文)',
-			'/delword 词1 词2　从所有分类删词',
-			'/listwords　查看当前 D1 词库全部内容',
-			'',
-			'<b>━━ 广告样本学习(两步私聊复核)━━</b>',
-			'/spam(群内回复广告)仅第一主人额外学习可信指纹；副主人/超管/群管理员只执行封禁、不学习',
-			'/learn 广告文本　直接粘贴文字学习指纹(只入库,不踢人)',
-			'/recent [N]　拉取疑似广告并冻结快照,带序号推到私聊(群/私聊均可,最多50条)',
-			'/learnlast 序号　<b>仅私聊</b>,按快照序号学指纹(只入库,不踢人)。如 /learnlast 1,3',
+			'<b>━━ 广告检测 V2(私聊)━━</b>',
+			'/v2add 关键词　添加广告指纹(自动加入指纹库)',
+			'/v2del 关键词　删除广告指纹',
+			'/v2words [页码]　查看广告指纹库',
+			'/pending [N]　查看待确认的广告判定快照',
+			'/confirm 序号　确认判定正确，学入指纹库并封禁',
+			'/ignore 序号　判定错误，解黑并解封',
+			'/ad_test　广告检测测试模式(开/关)',
 			'',
 			'<b>━━ 人工封禁 ━━</b>',
 			'/ban TGID [原因]　加入全局黑名单 + 全群封禁',
@@ -11452,11 +11039,6 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/ad [原因]　回复目标消息发起；或 /ad TGID [原因]。主人/副主人/超级管理员、当前群管理员或 /add_ad_admin 白名单成员可发起',
 			'/add_ad_admin TGID　允许该成员发起 /ad 投票',
 			'/del_ad_admin TGID　取消该成员的发起权限',
-			'',
-			'<b>━━ 样本库管理(私聊)━━</b>',
-			'/listsamples　查看已学指纹(最近50条+总数)',
-			'/delsample 序号|关键词　删样本',
-			'/clearsamples confirm　清空全部样本',
 			'',
 			'<b>━━ 动态群组（仅私聊）━━</b>',
 			'/addgroup -100xxx [备注]　新增治理群组，不用改环境变量',
@@ -11732,452 +11314,6 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		const { head, rest } = parseTelegramCommand(text);
-
-		// /listwords —— 查看当前词库
-		if (head === '/listwords') {
-			const kw = await getAdKeywordsRaw(env);
-			const cats = [
-				['金融 finance', kw.finance],
-				['色情 porn', kw.porn],
-				['引流 spam', kw.spam],
-				['诈骗 fraud', kw.fraud],
-				['自定义 general', kw.general],
-				['身份引流 identity(只查名字/简介)', kw.identity],
-				['白名单 whitelist', kw.whitelist],
-			];
-			const lines = ['📚 <b>广告词库(D1 存储)</b>', ''];
-			let total = 0;
-			for (const [label, arr] of cats) {
-				total += arr.length;
-				lines.push(`<b>${label}</b>（${arr.length}）`);
-				lines.push(arr.length ? arr.map((w) => `<code>${escapeHtml(w)}</code>`).join('、') : '（空）');
-				lines.push('');
-			}
-			lines.push(`共 ${total} 个词。空词库时仅强特征(t.me邀请链接/国际电话号)生效。`);
-			lines.push('用 <code>/importdefault</code> 一键导入推荐词库。');
-			await replyToAdmin(message, ctx, {
-				flashText: `📚 词库共 ${total} 个词`,
-				detailText: lines.join('\n'),
-				isInGroup,
-			});
-			return;
-		}
-
-		// /importdefault —— 导入推荐词库(与现有 D1 词库合并去重)
-		if (head === '/importdefault') {
-			const kw = await getAdKeywordsRaw(env);
-			let added = 0;
-			for (const cat of ['finance', 'porn', 'spam', 'fraud', 'identity']) {
-				const before = new Set(kw[cat].map((w) => String(w).toLowerCase()));
-				for (const w of (RECOMMENDED_AD_KEYWORDS[cat] || [])) {
-					const lw = String(w).toLowerCase();
-					if (!before.has(lw)) { kw[cat].push(w); before.add(lw); added++; }
-				}
-			}
-			const saved = await saveAdKeywordsToD1(env, kw);
-			await replyToAdmin(message, ctx, {
-				flashText: saved.ok ? `✅ 已导入推荐词库(新增 ${added} 个)` : `❌ 导入失败:${saved.error}`,
-				detailText: saved.ok
-					? `🎬 操作:导入推荐广告词库\n📈 新增 ${added} 个词(已去重)\n用 /listwords 查看完整词库。`
-					: `❌ 导入失败:${escapeHtml(saved.error || '未知')}`,
-				isInGroup,
-			});
-			return;
-		}
-
-		// /addword [分类] <词...> —— 加词(分类可选,默认 general)
-		if (head === '/addword') {
-			if (!rest) {
-				await sendAuthorizedCommandResult(message, ctx, {
-					flashText: '❌ /addword 用法错误，完整提示已发送给主人',
-					detailText: '用法:<code>/addword [分类] 词1 词2 ...</code>\n分类可选:finance/porn/spam/fraud/general/identity/whitelist(默认 general)\n例:<code>/addword fraud 杀猪盘 刷信誉</code>\nidentity=只查发言人名字/简介的引流词(如 卡网 发卡 车队)',
-				});
-				return;
-			}
-			const validCats = ['finance', 'porn', 'spam', 'fraud', 'general', 'identity', 'whitelist'];
-			const tokens = rest.split(/[\s,，]+/).filter(Boolean);
-			if (tokens[0]?.toLowerCase() === 'sa') {
-				await sendAuthorizedCommandResult(message, ctx, {
-					flashText: '❌ 旧引流分类已停用，完整提示已发送给主人',
-					detailText: '❌ 旧引流分类已停用，请改用 <code>/addword spam 词1 词2 ...</code>。',
-				});
-				return;
-			}
-			let cat = 'general';
-			if (validCats.includes(tokens[0].toLowerCase())) {
-				cat = tokens.shift().toLowerCase();
-			}
-			const words = [...new Set(tokens.map((w) => w.toLowerCase()))];
-			if (words.length === 0) {
-				await sendAuthorizedCommandResult(message, ctx, {
-					flashText: '❌ 没有有效词，完整提示已发送给主人',
-					detailText: '❌ 没有提供有效的词。',
-				});
-				return;
-			}
-			const kw = await getAdKeywordsRaw(env);
-			const existing = new Set(kw[cat].map((w) => String(w).toLowerCase()));
-			const newAdded = [];
-			for (const w of words) {
-				if (!existing.has(w)) { kw[cat].push(w); existing.add(w); newAdded.push(w); }
-			}
-			const saved = await saveAdKeywordsToD1(env, kw);
-			await replyToAdmin(message, ctx, {
-				flashText: saved.ok ? `✅ 已加 ${newAdded.length} 个词到 ${cat}` : `❌ 失败:${saved.error}`,
-				detailText: saved.ok
-					? `🎬 操作:添加广告词\n📂 分类:${cat}\n➕ 新增:${newAdded.map((w) => `<code>${escapeHtml(w)}</code>`).join('、') || '(全部已存在)'}`
-					: `❌ 写入失败:${escapeHtml(saved.error || '未知')}`,
-				isInGroup,
-			});
-			return;
-		}
-
-		// /delword <词...> —— 从所有分类删除
-		if (head === '/delword') {
-			if (!rest) {
-				await sendAuthorizedCommandResult(message, ctx, {
-					flashText: '❌ /delword 用法错误，完整提示已发送给主人',
-					detailText: '用法:<code>/delword 词1 词2 ...</code>(从所有分类中删除)',
-				});
-				return;
-			}
-			const words = [...new Set(rest.split(/[\s,，]+/).filter(Boolean).map((w) => w.toLowerCase()))];
-			const kw = await getAdKeywordsRaw(env);
-			const removed = [];
-			for (const cat of Object.keys(kw)) {
-				kw[cat] = kw[cat].filter((w) => {
-					if (words.includes(String(w).toLowerCase())) { removed.push(w); return false; }
-					return true;
-				});
-			}
-			const saved = await saveAdKeywordsToD1(env, kw);
-			await replyToAdmin(message, ctx, {
-				flashText: saved.ok ? `✅ 已删除 ${removed.length} 个词` : `❌ 失败:${saved.error}`,
-				detailText: saved.ok
-					? `🎬 操作:删除广告词\n➖ 已删:${removed.length ? removed.map((w) => `<code>${escapeHtml(w)}</code>`).join('、') : '(词库中无匹配)'}`
-					: `❌ 写入失败:${escapeHtml(saved.error || '未知')}`,
-				isInGroup,
-			});
-			return;
-		}
-		return;
-	}
-
-	// ===== 广告学习样本管理命令(仅主人可用)=====
-	// /listsamples /delsample /clearsamples
-	if (text && /^\/(listsamples|delsample|clearsamples)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
-		const isInGroup = message.chat.type !== 'private';
-		const isOwnerUser = isPrimaryOwner(userId);
-		if (!isOwnerUser) {
-			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告样本管理仅限主人使用。');
-			}
-			return;
-		}
-		await deleteAuthorizedGroupCommandMessage(message, 'sample-management');
-		if (!env.DB) {
-			await sendAuthorizedCommandResult(message, ctx, {
-				flashText: '❌ 未绑定 D1，完整提示已发送给主人',
-				detailText: '❌ 未绑定 D1 存储空间,无法管理学习样本。',
-			});
-			return;
-		}
-
-		const { head, rest } = parseTelegramCommand(text);
-		const data = (await loadAdSamplesFromD1(env)) || { fingerprints: [], count: 0 };
-
-		// /listsamples —— 查看已学习样本
-		if (head === '/listsamples') {
-			const fps = data.fingerprints || [];
-			const lines = [`📖 <b>广告学习样本</b>(共 ${fps.length} 条)`, ''];
-			if (fps.length === 0) {
-				lines.push('(空)主人回复广告消息发 <code>/spam</code> 即可学习。');
-			} else {
-				// 最多展示最近 50 条,避免消息超长
-				const show = fps.slice(-50);
-				const entriesByFingerprint = new Map((data.entries || []).map((entry) => [entry.fingerprint, entry]));
-				show.forEach((fp, i) => {
-					const scopes = entriesByFingerprint.get(fp)?.scopes || ['body'];
-					const scopeLabel = scopes.map((scope) => ({
-						body: '正文',
-						profile: '资料卡',
-						quote: '引用',
-					}[scope] || scope)).join('/');
-					lines.push(`${fps.length - show.length + i + 1}. [${escapeHtml(scopeLabel)}] <code>${escapeHtml(fp.slice(0, 60))}</code>`);
-				});
-				if (fps.length > 50) lines.unshift(`(仅显示最近 50 条)`);
-			}
-			lines.push('', '删除:<code>/delsample 序号</code> 或 <code>/delsample 关键词</code>');
-			await replyToAdmin(message, ctx, {
-				flashText: `📖 样本库 ${fps.length} 条`,
-				detailText: lines.join('\n'),
-				isInGroup,
-			});
-			return;
-		}
-
-		// /delsample <序号|关键词> —— 删除样本
-		if (head === '/delsample') {
-			if (!rest) {
-				await sendAuthorizedCommandResult(message, ctx, {
-					flashText: '❌ /delsample 用法错误，完整提示已发送给主人',
-					detailText: '用法:<code>/delsample 序号</code>(见 /listsamples)或 <code>/delsample 关键词</code>',
-				});
-				return;
-			}
-			const fps = data.fingerprints || [];
-			let removed = [];
-			const idx = parseInt(rest, 10);
-			if (/^\d+$/.test(rest) && idx >= 1 && idx <= fps.length) {
-				removed = fps.splice(idx - 1, 1);
-			} else {
-				// 按关键词匹配删除(包含即删)
-				const kw = normalizeForFingerprint(rest);
-				data.fingerprints = fps.filter((fp) => {
-					if (kw && fp.includes(kw)) { removed.push(fp); return false; }
-					return true;
-				});
-			}
-			data.count = data.fingerprints.length;
-			data.updatedAt = new Date().toISOString();
-			const saved = await saveAdSamplesToD1(env, data);
-			await replyToAdmin(message, ctx, {
-				flashText: saved.ok ? `✅ 已删除 ${removed.length} 条样本` : `❌ 失败:${saved.error}`,
-				detailText: saved.ok
-					? `🎬 操作:删除学习样本\n➖ 已删 ${removed.length} 条\n📊 剩余 ${data.count} 条`
-					: `❌ 写入失败:${escapeHtml(saved.error || '未知')}`,
-				isInGroup,
-			});
-			return;
-		}
-
-		// /clearsamples —— 清空所有样本(二次确认)
-		if (head === '/clearsamples') {
-			if (rest.trim().toLowerCase() !== 'confirm') {
-				const confirmText = `⚠️ 这将清空全部 ${data.count || 0} 条学习样本,不可恢复。\n确认请发送:<code>/clearsamples confirm</code>`;
-				await sendAuthorizedCommandResult(message, ctx, {
-					flashText: '⚠️ 清空操作待确认，完整提示已发送给主人',
-					detailText: confirmText,
-				});
-				return;
-			}
-			const saved = await saveAdSamplesToD1(env, { fingerprints: [], count: 0, updatedAt: new Date().toISOString() });
-			await replyToAdmin(message, ctx, {
-				flashText: saved.ok ? '✅ 已清空学习样本' : `❌ 失败:${saved.error}`,
-				detailText: saved.ok ? '🎬 操作:清空全部学习样本\n📊 样本库已归零' : `❌ 写入失败:${escapeHtml(saved.error || '未知')}`,
-				isInGroup,
-			});
-			return;
-		}
-		return;
-	}
-
-	// ===== /learn 粘贴学习 + /recent 看缓存 + /learnlast 按序号学(仅主人)=====
-	// 解决"GKY 已删消息无法回复 /spam"
-	if (text && /^\/(learn|learnlast|recent)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
-		const isInGroup = message.chat.type !== 'private';
-		const isOwnerUser = isPrimaryOwner(userId);
-		if (!isOwnerUser) {
-			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n上报学习仅限主人使用。');
-			}
-			return;
-		}
-		await deleteAuthorizedGroupCommandMessage(message, '/learn');
-		if (!env.DB) {
-			await sendAuthorizedCommandResult(message, ctx, {
-				flashText: '❌ 未绑定 D1，完整提示已发送给主人',
-				detailText: '❌ 未绑定 D1 存储空间,无法学习。',
-			});
-			return;
-		}
-
-		const { head, rest } = parseTelegramCommand(text);
-
-		// /learn <文本> —— 主人直接粘贴广告文本学习(只学指纹入库,不踢人)
-		if (head === '/learn') {
-			if (!rest) {
-				await sendAuthorizedCommandResult(message, ctx, {
-					flashText: '❌ /learn 用法错误，完整提示已发送给主人',
-					detailText: '用法:<code>/learn 广告文本</code>\n直接粘贴广告文字即可学习(不需要回复消息)。\n例:<code>/learn 世界杯红单推荐 天天收米 日赚3千</code>',
-				});
-				return;
-			}
-			const learn = await learnAdSample(env, rest, {
-				source: 'learn',
-				operatorId: userId,
-				sourceChatId: chatId,
-				sourceMessageId: message.message_id,
-				preview: rest,
-			});
-			const lines = ['📖 <b>已学习广告样本</b>'];
-			lines.push(learn.fpAdded ? '✅ 指纹已入库(以后相同广告自动秒杀)' : 'ℹ️ 指纹已存在,未重复入库');
-			// V2: 自动将学习内容写入广告指纹库
-			const fpResults = [];
-			if (env.DB) {
-				// 学习完整文本作为指纹
-				const fpResult = await addAdFingerprint(env, rest, 'keyword', 0.8, 'learn');
-				fpResults.push(fpResult.ok ? '✅ 文本已加入指纹库' : `⚠️ 文本加入失败: ${fpResult.error || '未知'}`);
-				// 提取的关键词也加入指纹库
-				if (learn.suggestedKeywords.length > 0) {
-					for (const kw of learn.suggestedKeywords) {
-						await addAdFingerprint(env, kw, 'keyword', 0.7, 'learn');
-					}
-					fpResults.push(`✅ ${learn.suggestedKeywords.length} 个关键词已加入指纹库`);
-				}
-			}
-			if (learn.suggestedKeywords.length > 0) {
-				lines.push(`💡 提取关键词:${learn.suggestedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
-			}
-			lines.push(`📊 当前样本库共 ${learn.sampleCount} 条`);
-			if (fpResults.length > 0) {
-				lines.push('');
-				lines.push('<b>V2 指纹库:</b>');
-				fpResults.forEach((r) => lines.push(`  ${r}`));
-			}
-			await replyToAdmin(message, ctx, {
-				flashText: '📖 已学习广告样本',
-				detailText: lines.join('\n'),
-				isInGroup,
-			});
-			return;
-		}
-
-		// /recent [N] —— 读取疑似广告缓存并【冻结成快照】,再把带序号列表推到主人私聊
-		// 群内=当前群,私聊=全部群。冻结后 /learnlast 按这份快照的固定序号学,序号永不漂移。
-		if (head === '/recent') {
-			let n = 50;
-			if (/^\d+$/.test(rest)) n = Math.max(1, Math.min(50, parseInt(rest, 10)));
-			const all = await loadRecentMessages(env);
-			const list = filterMessagesByContext(all, message).slice(0, n); // 最新在前,最多 50 条
-			const scopeLabel = isInGroup ? '本群' : '全部群';
-			if (list.length === 0) {
-				const emptyText = `ℹ️ ${scopeLabel}最近没有缓存到疑似广告消息。\n(只缓存含链接/@提及/长数字/长文本的群消息)`;
-				await sendAuthorizedCommandResult(message, ctx, {
-					flashText: `ℹ️ ${scopeLabel}暂无疑似广告，完整提示已发送给主人`,
-					detailText: emptyText,
-				});
-				return;
-			}
-			// 冻结快照:序号 1..N 对应 list[0..N-1],/learnlast 只认这份
-			await saveLearnSnapshot(env, list, { scope: scopeLabel, byChatId: String(chatId) });
-			const lines = [`📋 <b>疑似广告快照</b>(${scopeLabel} ${list.length} 条,已冻结)`, ''];
-			list.forEach((it, i) => {
-				const who = `${escapeHtml(it.fromName || '')}(<code>${escapeHtml(it.fromId || '?')}</code>)`;
-				const grp = isInGroup ? '' : ` [${escapeHtml(it.chatTitle || it.chatId || '?')}]`;
-				lines.push(`${i + 1}. <code>${escapeHtml(truncateTelegramText(it.text || '', 50))}</code>`);
-				lines.push(`   — ${who}${grp}`);
-			});
-			lines.push('', '✅ <b>请私聊我</b>核对后学习(群内不能学习):');
-			lines.push('学指定条:<code>/learnlast 序号</code>(如 <code>/learnlast 2</code>)');
-			lines.push('学多条:<code>/learnlast 1,3</code>');
-			lines.push('⚠️ 学习只入库不踢人;要踢发广告的人请复制上面 TGID 发 <code>/ban TGID</code>');
-			await replyToAdmin(message, ctx, {
-				flashText: `📋 ${scopeLabel}快照 ${list.length} 条已推送私聊`,
-				detailText: lines.join('\n'),
-				isInGroup,
-			});
-			return;
-		}
-
-		// /learnlast [序号|序号列表] —— 【仅私聊】按 /recent 冻结快照的序号学习(只入库,不踢人)
-		if (head === '/learnlast') {
-			// 强制私聊:群内禁止学习(防手忙脚乱点错序号误伤),闪屏引导到私聊
-			if (isInGroup) {
-				const privateOnlyText = '⚠️ 学习请私聊我操作。群内只能用 /recent 拉取快照。';
-				if (shouldSilenceAuthorizedGroupCommand(message)) {
-					await sendAuthorizedCommandResult(message, ctx, {
-						flashText: privateOnlyText,
-						detailText: privateOnlyText,
-					});
-				} else {
-					await sendFlashMessage(chatId, privateOnlyText, ctx, 8000);
-				}
-				return;
-			}
-			// 从冻结快照读(不再读实时缓存,序号永不漂移)
-			const snap = await loadLearnSnapshot(env);
-			const list = snap?.items || [];
-			if (list.length === 0) {
-				await sendTelegramMessage(chatId, 'ℹ️ 没有可用的快照。\n请先在群里(或私聊)发 <code>/recent</code> 拉取疑似广告列表,再回来 <code>/learnlast 序号</code>。');
-				return;
-			}
-			// 解析序号:无参=[1];"2"=[2];"1,3"=[1,3]
-			let indices = [1];
-			if (rest) {
-				indices = rest.split(/[,，\s]+/).map((s) => parseInt(s, 10)).filter((x) => Number.isInteger(x) && x >= 1);
-				if (indices.length === 0) indices = [1];
-			}
-			indices = [...new Set(indices)].filter((x) => x <= list.length);
-			if (indices.length === 0) {
-				await sendTelegramMessage(chatId, `❌ 序号超出范围。当前快照共 ${list.length} 条,发 <code>/recent</code> 重新查看序号。`);
-				return;
-			}
-			const scopeLabel = snap?.scope || '';
-			const lines = [`📖 <b>学习 ${indices.length} 条(序号 ${indices.join(',')}${scopeLabel ? ' · ' + escapeHtml(scopeLabel) : ''})</b>`, ''];
-			const kickHints = [];
-			for (const idx of indices) {
-				const it = list[idx - 1];
-				if (!it) continue;
-				const learn = await learnAdSample(env, it.text, {
-					source: 'learnlast',
-					operatorId: userId,
-					sourceChatId: it.chatId || chatId,
-					sourceMessageId: it.mid || '',
-					preview: it.text,
-				});
-				lines.push(`${idx}. <code>${escapeHtml((it.text || '').slice(0, 60))}</code>`);
-				lines.push(learn.fpAdded ? '  ✅ 指纹已入库' : '  ℹ️ 指纹已存在');
-				if (learn.suggestedKeywords.length > 0) {
-					lines.push(`  💡 建议词:${learn.suggestedKeywords.map((w) => `<code>${escapeHtml(w)}</code>`).join('、')}`);
-				}
-				// 只学不踢:显示发送者 TGID 供主人决定是否手动 /ban
-				if (it.fromId && /^\d+$/.test(it.fromId)) {
-					lines.push(`  👤 发送者:<code>${escapeHtml(it.fromId)}</code>(${escapeHtml(it.fromName || '')})`);
-					kickHints.push(it.fromId);
-				}
-				lines.push('');
-			}
-			if (kickHints.length > 0) {
-				lines.push(`🚫 要踢发广告的人:<code>/ban ${[...new Set(kickHints)].join(',')}</code>`);
-			}
-			lines.push('学错了?用 <code>/delsample 关键词</code> 删样本。');
-			await sendTelegramMessage(chatId, lines.join('\n'));
-			// 主人自己操作,无需再给自己发审计副本(私聊已收到上面这条);若触发者非主人已在入口被拦
-			return;
-		}
-		return;
-	}
-
-	// 处理 /ban 命令 - 添加用户到黑名单（支持批量、群内/私聊双场景；兼容 /ban@机器人名）
-	if (isBanCommand(text)) {
-		const isInGroup = message.chat.type !== 'private';
-		if (isInGroup && !isConfiguredGroup(chatId)) return;
-
-		// 仅真人可通过 /ban 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
-		if (isBotOperator(message.from)) return;
-
-		// 普通管理员必须是当前群管理员；高级管理员保持原有权限。
-		const isAdmin = await checkMessageOperatorCanBan(message, userId, env);
-		if (!isAdmin) {
-			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足
-			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /ban；私聊仅限主人、副主人或超级管理员。');
-			}
-			return;
-		}
-		await deleteAuthorizedGroupCommandMessage(message, '/ban');
-
-		// 封禁范围：群内 /ban 只封当前群（避免非广告的普通违规被跨群连坐，
-		// 误判者仍能加入其它私密群）；私聊 /ban 是主人层通道，保持全群封禁。
-		const banScopeGroups = isInGroup ? [String(chatId)] : null;
-		const banTargetGroupIds = resolveScopeTargetGroupIds(banScopeGroups);
-		const banScopeLabel = isInGroup ? '仅当前群' : '全部配置群';
-
-		// 提取 /ban 后面的参数。回复模式优先把参数当执行原因；无回复时才按 TGID 模式解析。
-		const argMatch = text.trim().match(/^\/ban(?:@[^\s]+)?\s*([\s\S]*)/i);
-		const rawArg = argMatch ? argMatch[1].trim() : '';
-		const repliedMsg = message.reply_to_message;
 
 		// ===== 回复模式：回复消息封禁（与 /spam 对称）=====
 		if (repliedMsg && !rawArg) {
