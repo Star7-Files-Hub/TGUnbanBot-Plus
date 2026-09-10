@@ -4135,10 +4135,24 @@ async function formatTargetByTgid(tgid) {
 	return `<code>${escapeHtml(idStr)}</code>`;
 }
 
+// 静态用户资料表：用于无法从配置群获取到资料的权限名单成员。
+// 格式：TGID 字符串 → { first_name, last_name, username }
+// API 实时查到资料时会覆盖此处，查不到时作为兜底显示。
+const STATIC_USER_PROFILES = {
+	'197282502': { id: 197282502, first_name: '威廉', last_name: '', username: 'RealNeoMan' },
+};
+
 async function resolvePermissionUserProfiles(ids) {
 	const wanted = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(Boolean))];
 	const wantedSet = new Set(wanted);
 	const profiles = new Map();
+
+	// 先用静态表填充兜底资料，后续 API 查到时会覆盖
+	for (const id of wanted) {
+		if (STATIC_USER_PROFILES[id]) {
+			profiles.set(id, { user: STATIC_USER_PROFILES[id], status: '', source: 'static', groupId: '' });
+		}
+	}
 
 	for (const groupId of GROUP_IDS) {
 		try {
