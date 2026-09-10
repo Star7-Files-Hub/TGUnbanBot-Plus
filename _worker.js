@@ -701,6 +701,11 @@ const PRIMARY_OWNER_COMMAND_MENU = [
 	{ command: 'confirm', description: '确认广告判定正确' },
 	{ command: 'ignore', description: '忽略错误判定并解封' },
 	{ command: 'listwords', description: '查看广告指纹库' },
+	{ command: 'addsample', description: '添加 AI 语义样本' },
+	{ command: 'clearsamples', description: '清空 AI 样本' },
+	{ command: 'warmup', description: '预热 AI 样本向量' },
+	{ command: 'whitelist', description: '管理域名白名单' },
+	{ command: 'adstats', description: '查看统计信息' },
 	{ command: 'clean_blacklist', description: '清理销号用户' },
 	{ command: 'clean_switch', description: '自动销号清理开关' },
 	{ command: 'add_admin', description: '添加额外管理员' },
@@ -10183,7 +10188,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 
 	// ===== 广告检测 V2 命令（仅第一主人私聊）=====
-	if (text && /^\/(pending|confirm|ignore|addword|delword|listwords)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+	if (text && /^\/(pending|confirm|ignore|addword|delword|listwords|addsample|clearsamples|warmup|whitelist|adstats)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
 		if (!isOwner(userId)) {
 			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告检测管理仅限主人。');
@@ -10197,8 +10202,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间。');
 			return;
 		}
-		const head = text.trim().match(/^\/(pending|confirm|ignore|addword|delword|listwords)(?:@[^\s]+)?/i)[1].toLowerCase();
-		const argMatch = text.trim().match(/^\/(?:pending|confirm|ignore|addword|delword|listwords)(?:@[^\s]+)?\s*([\s\S]*)/i);
+		const head = text.trim().match(/^\/(pending|confirm|ignore|addword|delword|listwords|addsample|clearsamples|warmup|whitelist|adstats)(?:@[^\s]+)?/i)[1].toLowerCase();
+		const argMatch = text.trim().match(/^\/(?:pending|confirm|ignore|addword|delword|listwords|addsample|clearsamples|warmup|whitelist|adstats)(?:@[^\s]+)?\s*([\s\S]*)/i);
 		const arg = argMatch ? argMatch[1].trim() : '';
 
 		// /pending [N] - 列出待确认快照
@@ -10312,6 +10317,125 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				lines.push('', `第 ${page} 页，共 ${results.length} 条`);
 			}
 			await sendTelegramMessage(chatId, lines.join('\n'));
+			return;
+		}
+		// /addsample：添加 AI 语义比对样本
+		if (head === 'addsample') {
+			if (!arg || arg.length < 4) {
+				await sendTelegramMessage(chatId, '❌ 用法：<code>/addsample 广告文本</code>\n样本至少 4 个字符。');
+				return;
+			}
+			await ensureD1Table(env);
+			const now = new Date().toISOString();
+			const existing = await env.DB.prepare('SELECT id FROM ad_sample_embeddings WHERE text = ?').bind(arg).first();
+			if (existing) {
+				await sendTelegramMessage(chatId, 'ℹ️ 样本已存在，未重复入库。');
+				return;
+			}
+			await env.DB.prepare('INSERT INTO ad_sample_embeddings (text, embedding, created_at) VALUES (NULL, NULL, ?)').bind(now).run();
+			// 更新 text 字段
+			const lastRow = await env.DB.prepare('SELECT id FROM ad_sample_embeddings WHERE text IS NULL ORDER BY id DESC LIMIT 1').first();
+			if (lastRow) {
+				await env.DB.prepare('UPDATE ad_sample_embeddings SET text = ? WHERE id = ?').bind(arg, lastRow.id).run();
+			}
+			const { results: countResult } = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings').first();
+			const { results: readyResult } = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings WHERE embedding IS NOT NULL').first();
+			await sendTelegramMessage(chatId, [
+				'✅ <b>样本已添加</b>',
+				'内容：' + escapeHtml(arg.slice(0, 120)),
+				`样本库：共 <b>${countResult?.cnt || 0}</b> 条，已生成向量 <b>${readyResult?.cnt || 0}</b> 条`
+			].join('\n'));
+			return;
+		}
+		// /clearsamples：清空全部 AI 样本
+		if (head === 'clearsamples') {
+			if (arg !== 'confirm') {
+				await sendTelegramMessage(chatId, '⚠️ 清空操作不可逆，确认请发 <code>/clearsamples confirm</code>。');
+				return;
+			}
+			await ensureD1Table(env);
+			await env.DB.prepare('DELETE FROM ad_sample_embeddings').run();
+			await sendTelegramMessage(chatId, '✅ 已清空全部 AI 样本。');
+			return;
+		}
+		// /warmup：手动补齐语义样本向量
+		if (head === 'warmup') {
+			if (!env.AI || typeof env.AI.run !== 'function') {
+				await sendTelegramMessage(chatId, '⚠️ <b>未绑定 Workers AI</b>\n第三层语义判定不可用，无需补齐向量。');
+				return;
+			}
+			const before = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings').first();
+			if (!before || before.cnt === 0) {
+				await sendTelegramMessage(chatId, '📭 样本库为空，请先用 <code>/addsample 文本</code> 添加样本。');
+				return;
+			}
+			const filled = await topUpAdSampleEmbeddings(env);
+			const after = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings WHERE embedding IS NOT NULL').first();
+			const remain = Math.max(0, before.cnt - (after?.cnt || 0));
+			const lines = [
+				filled > 0 ? `✅ <b>已生成 ${filled} 条向量</b>` : '⚠️ <b>本次未生成任何向量</b>',
+				`进度：<b>${after?.cnt || 0}</b> / ${before.cnt} 条样本已生成向量`
+			];
+			if (remain > 0) {
+				lines.push(`还差 <b>${remain}</b> 条，再发 /warmup 继续。`);
+			} else {
+				lines.push('全部样本向量已补齐，第三层 AI 语义判定现已生效。');
+			}
+			await sendTelegramMessage(chatId, lines.join('\n'));
+			return;
+		}
+		// /whitelist：管理域名白名单
+		if (head === 'whitelist') {
+			if (!arg) {
+				await ensureD1Table(env);
+				const { results } = await env.DB.prepare('SELECT domain, source FROM ad_domain_whitelist ORDER BY created_at DESC LIMIT 20').all();
+				const lines = ['🌐 <b>域名白名单</b>', ''];
+				if (results.length === 0) {
+					lines.push('（空）');
+				} else {
+					results.forEach((r, i) => lines.push(`${i + 1}. <code>${escapeHtml(r.domain)}</code> (${r.source})`));
+				}
+				lines.push('', '添加：<code>/whitelist add example.com</code>');
+				lines.push('删除：<code>/whitelist del example.com</code>');
+				await sendTelegramMessage(chatId, lines.join('\n'));
+				return;
+			}
+			const parts = arg.trim().split(/\s+/);
+			if (parts.length < 2) {
+				await sendTelegramMessage(chatId, '❌ 用法：<code>/whitelist add example.com</code> 或 <code>/whitelist del example.com</code>');
+				return;
+			}
+			const action = parts[0].toLowerCase();
+			const domain = parts[1].toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+			await ensureD1Table(env);
+			if (action === 'add') {
+				const now = new Date().toISOString();
+				await env.DB.prepare('INSERT OR IGNORE INTO ad_domain_whitelist (domain, source, created_at) VALUES (?, ?, ?)').bind(domain, 'manual', now).run();
+				await sendTelegramMessage(chatId, `✅ 已将 <code>${escapeHtml(domain)}</code> 加入白名单。`);
+			} else if (action === 'del') {
+				await env.DB.prepare('DELETE FROM ad_domain_whitelist WHERE domain = ?').bind(domain).run();
+				await sendTelegramMessage(chatId, `✅ 已将 <code>${escapeHtml(domain)}</code> 从白名单移除。`);
+			} else {
+				await sendTelegramMessage(chatId, '❌ 用法：<code>/whitelist add example.com</code> 或 <code>/whitelist del example.com</code>');
+			}
+			return;
+		}
+		// /adstats：查看统计信息
+		if (head === 'adstats') {
+			await ensureD1Table(env);
+			const fpCount = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_fingerprints').first();
+			const sampleCount = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings').first();
+			const readyCount = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings WHERE embedding IS NOT NULL').first();
+			const whitelistCount = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_domain_whitelist').first();
+			const blacklistCount = await env.DB.prepare('SELECT COUNT(*) as cnt FROM blacklist').first();
+			await sendTelegramMessage(chatId, [
+				'📊 <b>统计信息</b>',
+				'',
+				`指纹库: ${fpCount?.cnt || 0} 条`,
+				`AI 样本: ${sampleCount?.cnt || 0} 条 (已生成向量 ${readyCount?.cnt || 0} 条)`,
+				`域名白名单: ${whitelistCount?.cnt || 0} 条`,
+				`黑名单: ${blacklistCount?.cnt || 0} 人`
+			].join('\n'));
 			return;
 		}
 	}
@@ -10974,6 +11098,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/addword 关键词　添加广告指纹(自动加入指纹库)',
 			'/delword 关键词　删除广告指纹',
 			'/listwords [页码]　查看广告指纹库',
+			'/addsample 文本　添加 AI 语义比对样本',
+			'/clearsamples confirm　清空全部 AI 样本',
+			'/warmup　预热 AI 样本向量',
+			'/whitelist [add|del] 域名　管理域名白名单',
+			'/adstats　查看统计信息',
 			'/pending [N]　查看待确认的广告判定快照',
 			'/confirm 序号　确认判定正确，学入指纹库并封禁',
 			'/ignore 序号　判定错误，解黑并解封',
