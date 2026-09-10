@@ -19,11 +19,7 @@ const DEFAULT_SELF_UNBAN_KEYWORD = '我不是广告狗，我是误封的，希�
 //    环境变量名：START_WELCOME
 const DEFAULT_START_WELCOME = `👋 <b>你好，{userId}</b>
 
-我是 <b>杀神搭配专用解封</b> 的自助解封机器人。
-
-<b>━━ 我是做什么的 ━━</b>
-如果你在群里被封禁或被禁言，又确认自己没有违规，
-可以在这里自己完成解封，不需要等管理员处理。
+我是 <b>杀神弟子</b> 反广告机器人。
 
 <b>━━ 你现在可以做什么 ━━</b>
 🔓 被封禁 / 被禁言了 → 发送 /unban 开始自助解封
@@ -42,7 +38,7 @@ const DEFAULT_START_WELCOME = `👋 <b>你好，{userId}</b>
 //    主群若是私密群，显示真实群名等于把私人群名暴露给任何触发者，因此默认写固定品牌名。
 //    需要显示群名的部署者可在环境变量 SELF_UNBAN_PROMPT 里自行写 {title}。
 //    环境变量名：SELF_UNBAN_PROMPT
-const DEFAULT_SELF_UNBAN_PROMPT = `🤖 <b>亲爱的 {userId}</b>，我是 <b>杀神搭配专用解封</b> 的 自助解封机器人
+const DEFAULT_SELF_UNBAN_PROMPT = `🤖 <b>亲爱的 {userId}</b>，我是 <b>杀神弟子</b> 反广告机器人
 
 🔍 <b>请自行检查以下内容：</b>
 
@@ -65,7 +61,7 @@ const DEFAULT_SELF_UNBAN_PROMPT = `🤖 <b>亲爱的 {userId}</b>，我是 <b>�
 //    环境变量名：SELF_UNBAN_APPROVED
 const DEFAULT_SELF_UNBAN_APPROVED = `✅ 已同意给予解封
 
-📋 解封范围：全部 {groupcount} 个配置群组
+📋 已解封 {groupcount} 个配置群组
    您的封禁与禁言限制已全部解除，现在可以正常发言。
 
 💬 如有疑问，可点击下方按钮前往主群联系管理员。
@@ -76,7 +72,7 @@ const DEFAULT_SELF_UNBAN_APPROVED = `✅ 已同意给予解封
 //    环境变量名：SELF_UNBAN_APPROVED_NOLINK
 const DEFAULT_SELF_UNBAN_APPROVED_NOLINK = `✅ 已同意给予解封
 
-📋 解封范围：全部 {groupcount} 个配置群组
+📋 已解封 {groupcount} 个配置群组
    您的封禁与禁言限制已全部解除，现在可以正常发言。
 
 💬 如有疑问，请前往主群联系管理员。
@@ -307,11 +303,11 @@ export default {
 				return new Response('OK');
 			} else if (path === TOKEN) {
 				// 处理初始化命令
-				return await handleInitialization(request);
+				return await handleInitialization(request, env);
 			}
 		} else if (request.method === 'GET' && path === TOKEN) {
 			// 处理 GET 初始化请求
-			return await handleInitialization(request);
+			return await handleInitialization(request, env);
 		}
 
 		return new Response('Method Not Allowed', { status: 405 });
@@ -523,7 +519,7 @@ function jsonResponse(data, status = 200) {
 	});
 }
 
-async function handleInitialization(request) {
+async function handleInitialization(request, env) {
 	try {
 		// 设置 Webhook
 		const webhookUrl = new URL(request.url);
@@ -556,24 +552,76 @@ async function handleInitialization(request) {
 		}
 
 		// 设置机器人命令
+		// ===== 分角色设置命令列表 =====
+		// 非管理员及主人：/start、/unban
+		// 管理员（群管理员）：用户命令 + /ban /spam /check
+		// 主人/副主人：全部命令（除去 /job /jobrun）
 		const setCommandsUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
-		const setCommandsBody = {
-			commands: [
-				{ command: "unban", description: "开始自助解封" },
-				{ command: "ban", description: "添加用户到全局黑名单 (当前群管理员)" },
-				{ command: "spam", description: "举报并加入全局黑名单 (当前群管理员)" },
-				{ command: "check", description: "查询封禁状态 (高级管理员)" },
-				{ command: "blacklist", description: "查看当前黑名单 (高级管理员)" }
-			]
-		};
 
-		const commandsResponse = await fetch(setCommandsUrl, {
+		const userCommands = [
+			{ command: "start", description: "机器人介绍" },
+			{ command: "unban", description: "开始自助解封" }
+		];
+
+		const adminCommands = [
+			...userCommands,
+			{ command: "ban", description: "添加用户到全局黑名单" },
+			{ command: "spam", description: "举报并加入全局黑名单" },
+			{ command: "check", description: "查询封禁状态" }
+		];
+
+		const ownerCommands = [
+			...adminCommands,
+			{ command: "blacklist", description: "查看当前黑名单" },
+			{ command: "pending", description: "列出待复核快照" },
+			{ command: "ignore", description: "误判回滚" },
+			{ command: "rescreen", description: "重新筛查可疑用户" },
+			{ command: "adstats", description: "指纹库统计" },
+			{ command: "words", description: "翻看指纹库" },
+			{ command: "addword", description: "新增指纹" },
+			{ command: "delword", description: "删除指纹" },
+			{ command: "addsample", description: "新增AI语义样本" },
+			{ command: "warmup", description: "补齐样本向量" },
+			{ command: "clearsamples", description: "清空AI样本" },
+			{ command: "whitelist", description: "域名白名单管理" },
+			{ command: "help", description: "查看所有命令" },
+			{ command: "admins", description: "查看权限名单" },
+			{ command: "groups", description: "查看配置群组" },
+			{ command: "leavegroup", description: "退出群组" },
+			{ command: "addgroup", description: "新增治理群组" },
+			{ command: "delgroup", description: "删除治理群组" },
+			{ command: "listgroups", description: "列出全部群组" },
+			{ command: "ad", description: "发起广告举报投票" },
+			{ command: "add_ad_admin", description: "允许发起广告投票" },
+			{ command: "del_ad_admin", description: "取消发起广告投票权限" }
+		];
+
+		// 1) 默认命令（所有用户）
+		const defaultResp = await fetch(setCommandsUrl, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(setCommandsBody)
+			body: JSON.stringify({ commands: userCommands, scope: { type: 'default' } })
 		});
 
-		if (commandsResponse.ok) {
+		// 2) 群管理员命令
+		const adminResp = await fetch(setCommandsUrl, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ commands: adminCommands, scope: { type: 'all_chat_administrators' } })
+		});
+
+		// 3) 主人/副主人命令（私聊）
+		const ownerResults = [];
+		for (const ownerId of OWNER_IDS) {
+			const ownerResp = await fetch(setCommandsUrl, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ commands: ownerCommands, scope: { type: 'chat', chat_id: Number(ownerId) } })
+			});
+			ownerResults.push({ ownerId, ok: ownerResp.ok });
+		}
+
+		if (defaultResp.ok && adminResp.ok) {
 			return jsonResponse({
 				成功: true,
 				消息: 'Webhook 和命令设置成功',
@@ -583,11 +631,15 @@ async function handleInitialization(request) {
 					允许更新类型: setWebhookBody.allowed_updates
 				},
 				命令: {
-					已设置: true
+					已设置: true,
+					用户命令: userCommands.map(c => c.command),
+					管理员命令: adminCommands.map(c => c.command),
+					主人命令数量: ownerCommands.length,
+					主人设置结果: ownerResults
 				}
 			});
 		} else {
-			const result = await commandsResponse.json();
+			const result = !defaultResp.ok ? await defaultResp.json() : await adminResp.json();
 			return jsonResponse({
 				成功: false,
 				消息: '命令设置失败',
@@ -598,8 +650,10 @@ async function handleInitialization(request) {
 				},
 				命令: {
 					已设置: false,
-					HTTP状态码: commandsResponse.status,
-					Telegram返回: result
+					默认命令状态码: defaultResp.status,
+					管理员命令状态码: adminResp.status,
+					Telegram返回: result,
+					主人设置结果: ownerResults
 				}
 			}, 500);
 		}
@@ -1817,12 +1871,20 @@ async function checkIfUserIsAdminInGroup(userId, groupId) {
 // /ban、/spam 专用权限：
 // - 主人/副主人/超级管理员保持原权限；
 // - 匿名管理员仅能在其当前配置群使用；
+// - /add_ad_admin 添加的广告发起白名单成员可在当前配置群使用；
 // - 普通 Telegram 管理员必须是当前发令群的管理员，私聊不放行。
-async function checkMessageOperatorCanBan(message, userId) {
+async function checkMessageOperatorCanBan(message, userId, env) {
 	if (isPrivilegedManager(userId)) return true;
 	if (isAnonymousAdminMessage(message)) {
 		console.log(`[当前群鉴权] 匿名管理员在群 ${message.chat.id} 使用封禁命令 ✅`);
 		return true;
+	}
+	// /add_ad_admin 白名单成员可使用 /ban /spam（需在配置群内）
+	if (env && message?.chat?.type !== 'private' && isConfiguredGroup(message?.chat?.id)) {
+		if (await isAdVoteAllowlisted(env, userId)) {
+			console.log(`[当前群鉴权] 广告发起白名单成员 ${userId} 在群 ${message.chat.id} 使用封禁命令 ✅`);
+			return true;
+		}
 	}
 	if (message?.chat?.type === 'private') return false;
 	return checkIfUserIsAdminInGroup(userId, message?.chat?.id);
@@ -6573,10 +6635,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 仅真人可通过 /spam 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
 		if (isBotOperator(message.from)) return;
 
-		const isAdmin = await checkMessageOperatorCanBan(message, userId);
+		const isAdmin = await checkMessageOperatorCanBan(message, userId, env);
 		if (!isAdmin) {
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /spam；私聊仅限主人、副主人或超级管理员。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /spam；私聊仅限主人、副主人、超级管理员或广告发起白名单成员。');
 			}
 			return;
 		}
@@ -7423,11 +7485,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (isBotOperator(message.from)) return;
 
 		// 普通管理员必须是当前群管理员；高级管理员保持原有权限。
-		const isAdmin = await checkMessageOperatorCanBan(message, userId);
+		const isAdmin = await checkMessageOperatorCanBan(message, userId, env);
 		if (!isAdmin) {
 			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /ban；私聊仅限主人、副主人或超级管理员。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /ban；私聊仅限主人、副主人、超级管理员。');
 			}
 			return;
 		}
