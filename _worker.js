@@ -706,6 +706,7 @@ const PRIMARY_OWNER_COMMAND_MENU = [
 	{ command: 'warmup', description: '预热 AI 样本向量' },
 	{ command: 'whitelist', description: '管理域名白名单' },
 	{ command: 'adstats', description: '查看统计信息' },
+	{ command: 'rescreen', description: '重新筛查观察窗口' },
 	{ command: 'clean_blacklist', description: '清理销号用户' },
 	{ command: 'clean_switch', description: '自动销号清理开关' },
 	{ command: 'add_admin', description: '添加额外管理员' },
@@ -10188,7 +10189,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 
 	// ===== 广告检测 V2 命令（仅第一主人私聊）=====
-	if (text && /^\/(pending|confirm|ignore|addword|delword|listwords|addsample|clearsamples|warmup|whitelist|adstats)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+	if (text && /^\/(pending|confirm|ignore|addword|delword|listwords|addsample|clearsamples|warmup|whitelist|adstats|rescreen)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
 		if (!isOwner(userId)) {
 			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告检测管理仅限主人。');
@@ -10202,8 +10203,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间。');
 			return;
 		}
-		const head = text.trim().match(/^\/(pending|confirm|ignore|addword|delword|listwords|addsample|clearsamples|warmup|whitelist|adstats)(?:@[^\s]+)?/i)[1].toLowerCase();
-		const argMatch = text.trim().match(/^\/(?:pending|confirm|ignore|addword|delword|listwords|addsample|clearsamples|warmup|whitelist|adstats)(?:@[^\s]+)?\s*([\s\S]*)/i);
+		const head = text.trim().match(/^\/(pending|confirm|ignore|addword|delword|listwords|addsample|clearsamples|warmup|whitelist|adstats|rescreen)(?:@[^\s]+)?/i)[1].toLowerCase();
+		const argMatch = text.trim().match(/^\/(?:pending|confirm|ignore|addword|delword|listwords|addsample|clearsamples|warmup|whitelist|adstats|rescreen)(?:@[^\s]+)?\s*([\s\S]*)/i);
 		const arg = argMatch ? argMatch[1].trim() : '';
 
 		// /pending [N] - 列出待确认快照
@@ -10417,6 +10418,41 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				await sendTelegramMessage(chatId, `✅ 已将 <code>${escapeHtml(domain)}</code> 从白名单移除。`);
 			} else {
 				await sendTelegramMessage(chatId, '❌ 用法：<code>/whitelist add example.com</code> 或 <code>/whitelist del example.com</code>');
+			}
+			return;
+		}
+		// /rescreen：重新筛查观察窗口里的可疑用户
+		if (head === 'rescreen') {
+			try {
+				const observations = await getObservationWindow(env, 20);
+				if (observations.length === 0) {
+					await sendTelegramMessage(chatId, '📭 观察窗口内没有待复判的用户。');
+					return;
+				}
+				let banned = 0;
+				let cleared = 0;
+				for (const o of observations) {
+					const userId = String(o.user_id || '');
+					if (!userId) continue;
+					const score = Number(o.score) || 0;
+					if (score >= 7) {
+						await addToBlacklist(userId, env, { reason: 'ad_auto', by: 'system', note: `复判评分${score}达标` });
+						await banUserFromAllGroups(userId, { probeMembership: true, _env: env });
+						await env.DB.prepare('DELETE FROM ad_observation_window WHERE user_id = ?').bind(userId).run();
+						banned++;
+					} else if (score < 4) {
+						await env.DB.prepare('DELETE FROM ad_observation_window WHERE user_id = ?').bind(userId).run();
+						cleared++;
+					}
+				}
+				await sendTelegramMessage(chatId, [
+					'✅ <b>复判完成</b>',
+					`封禁: ${banned} 人`,
+					`清除: ${cleared} 人`,
+					`剩余: ${observations.length - banned - cleared} 人`
+				].join('\n'));
+			} catch (error) {
+				await sendTelegramMessage(chatId, `❌ 复判失败: ${error.message}`);
 			}
 			return;
 		}
@@ -11103,6 +11139,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/warmup　预热 AI 样本向量',
 			'/whitelist [add|del] 域名　管理域名白名单',
 			'/adstats　查看统计信息',
+			'/rescreen [N]　重新筛查观察窗口里的可疑用户',
 			'/pending [N]　查看待确认的广告判定快照',
 			'/confirm 序号　确认判定正确，学入指纹库并封禁',
 			'/ignore 序号　判定错误，解黑并解封',
