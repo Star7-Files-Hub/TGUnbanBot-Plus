@@ -19,11 +19,7 @@ const DEFAULT_SELF_UNBAN_KEYWORD = '我不是广告狗，我是误封的，希�
 //    环境变量名：START_WELCOME
 const DEFAULT_START_WELCOME = `👋 <b>你好，{userId}</b>
 
-我是 <b>杀神搭配专用解封</b> 的自助解封机器人。
-
-<b>━━ 我是做什么的 ━━</b>
-如果你在群里被封禁或被禁言，又确认自己没有违规，
-可以在这里自己完成解封，不需要等管理员处理。
+我是 <b>杀神弟子</b> 反广告机器人。
 
 <b>━━ 你现在可以做什么 ━━</b>
 🔓 被封禁 / 被禁言了 → 发送 /unban 开始自助解封
@@ -42,7 +38,7 @@ const DEFAULT_START_WELCOME = `👋 <b>你好，{userId}</b>
 //    主群若是私密群，显示真实群名等于把私人群名暴露给任何触发者，因此默认写固定品牌名。
 //    需要显示群名的部署者可在环境变量 SELF_UNBAN_PROMPT 里自行写 {title}。
 //    环境变量名：SELF_UNBAN_PROMPT
-const DEFAULT_SELF_UNBAN_PROMPT = `🤖 <b>亲爱的 {userId}</b>，我是 <b>杀神搭配专用解封</b> 的 自助解封机器人
+const DEFAULT_SELF_UNBAN_PROMPT = `🤖 <b>亲爱的 {userId}</b>，我是 <b>杀神弟子</b> 反广告机器人
 
 🔍 <b>请自行检查以下内容：</b>
 
@@ -65,7 +61,7 @@ const DEFAULT_SELF_UNBAN_PROMPT = `🤖 <b>亲爱的 {userId}</b>，我是 <b>�
 //    环境变量名：SELF_UNBAN_APPROVED
 const DEFAULT_SELF_UNBAN_APPROVED = `✅ 已同意给予解封
 
-📋 解封范围：全部 {groupcount} 个配置群组
+📋 已解封 {groupcount} 个配置群组
    您的封禁与禁言限制已全部解除，现在可以正常发言。
 
 💬 如有疑问，可点击下方按钮前往主群联系管理员。
@@ -76,7 +72,7 @@ const DEFAULT_SELF_UNBAN_APPROVED = `✅ 已同意给予解封
 //    环境变量名：SELF_UNBAN_APPROVED_NOLINK
 const DEFAULT_SELF_UNBAN_APPROVED_NOLINK = `✅ 已同意给予解封
 
-📋 解封范围：全部 {groupcount} 个配置群组
+📋 已解封 {groupcount} 个配置群组
    您的封禁与禁言限制已全部解除，现在可以正常发言。
 
 💬 如有疑问，请前往主群联系管理员。
@@ -90,6 +86,13 @@ const SELF_UNBAN_CONTACT_BUTTON_PREFIX = '💬 ';
 //    环境变量名：BLACKLIST_PAGE_LIMIT （要求是正整数）
 const DEFAULT_BLACKLIST_PAGE_LIMIT = 30;
 
+// 6) 群内闪屏提示存活多少毫秒后自动撤回。
+//    闪屏 = 群内执行授权命令后那条"短提示"，让操作者立刻看到结果又不长期污染群消息流。
+//    调大 = 看得更从容但残留更久；调小 = 群更干净但容易没看清就消失。
+//    设为 0 或负数则永不撤回（不推荐：回执常含 TGID 等不宜长期公开的信息）。
+//    环境变量名：FLASH_MESSAGE_TTL_MS （要求 0~60000 之间的整数，单位毫秒）
+const DEFAULT_FLASH_MESSAGE_TTL_MS = 5000;
+
 // /purge 清扫按“黑名单用户 × 配置群组”分批执行，避免单次 Worker 撞 Cloudflare 子请求限制。
 // 最坏情况下每个组合会调用 getChatMember + banChatMember 两次 Telegram API。
 const PURGE_DEFAULT_PAIR_LIMIT = 20;
@@ -99,26 +102,37 @@ const PURGE_RUN_DELAY_MS = 250;
 const PURGE_DEFAULT_REASONS = ['manual', 'sa', 'spam', 'ad_vote'];
 const TG_MUTATION_RETRY_DELAY_MS = 350;
 
-// 6) /blacklist 列表中"原因"字段的中文映射。
+// 7) /blacklist 列表中"原因"字段的中文映射。
 //    spam 表示 /spam 举报，manual 表示 /ban 手动添加；历史 reason=sa 继续按 /spam 展示。
+//    ad_auto / ad_learn / gky_global 已无写入方（自动广告治理与杀神主动查杀均已移除），
+//    但 D1 里的历史封禁记录仍带这些 reason，标签必须保留，否则旧记录会显示成裸字符串。
 //    环境变量名：BLACKLIST_REASON_LABELS （要求是 JSON 字符串，例如 {"spam":"群内举报"}）
 const DEFAULT_BLACKLIST_REASON_LABELS = {
 	sa: '群内 /spam 举报（历史记录）',
 	spam: '群内 /spam 举报',
 	manual: '管理员 /ban 指令加黑',
 	manual_ban: '旧版 Telegram 原生封禁同步记录',
-	ad_auto: '🤖 广告自动检测',
-	ad_learn: '🤖 上报学习',
+	ad_auto: '🤖 广告自动检测（历史记录）',
+	ad_learn: '🤖 上报学习（历史记录）',
 	ad_vote: '🗳️ 群内投票举报',
-	gky_global: '🌐 杀神全局封禁库命中'
+	gky_global: '🌐 杀神全局封禁库命中（历史记录）'
 };
 
-// 7) GKY 封禁记录查询后端。改动者请确保返回 HTML 与 parseBanlistHTML 兼容。
+// 8) GKY 封禁记录查询后端。改动者请确保返回 HTML 与 parseBanlistHTML 兼容。
 //    环境变量名：GKY_BANLIST_ENDPOINT
 const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
 
-// 9) 主人 TGID(项目所有者),用于"主人审计通知"系统
-//    所有管理员在群里使用 /ban /unban /spam 命令、
+// 9) 超级管理员 TGID 白名单。用于普通管理命令鉴权，支持多个 TGID。
+//    环境变量名：SUPER_ADMINS （字符串形式，逗号分隔）
+//    例：'123456,789012'
+//    硬编码这里写数组形式，留空数组表示默认无超管。
+const DEFAULT_SUPER_ADMINS = [
+	// '123456789',
+	// '987654321',
+];
+
+// 10) 主人 TGID(项目所有者),用于"主人审计通知"系统
+//    所有管理员/超管在群里使用 /ban /unban /spam 命令、
 //    群内手动 ban/unban 时,主人会收到一份带操作人标记的私聊审计通知
 //    环境变量 OWNER_IDS(逗号分隔,中英文逗号均可):第一个是主人,后续是副主人
 //    主人收全部通知;副主人只收 /ban、/spam 这类加黑踢人通知
@@ -126,48 +140,7 @@ const DEFAULT_GKY_BANLIST_ENDPOINT = 'https://gkybot.gmeow.cc/banlist';
 //    填了主人/副主人ID但账号从未私聊过 bot → 通知会投递失败,Worker 日志可见
 const DEFAULT_OWNER_IDS = [];
 
-// 10) 广告自动检测(多维度评分 + 强特征直杀),命中 → 删消息 + 加黑 + 全群踢 + 通知主人
-//    优先级:环境变量 > 这里的硬编码默认值
-//    AD_FILTER_ENABLED 默认 false,需显式设环境变量 'true' 才启用(避免刚部署误伤)
-const DEFAULT_AD_FILTER_ENABLED = false;
-//    评分阈值:各维度加权分总和 ≥ 阈值即判广告(强特征绕过评分直接判定)
-const DEFAULT_AD_SCORE_THRESHOLD = 3;
-//    分类词库默认留空(隐私:GitHub 代码零敏感词)。词库存 D1,用主人命令热更新:
-//    /importdefault 一键导入推荐词库 | /addword 加词 | /delword 删词 | /listwords 查看
-//    命中加权:金融+2 / 色情+2 / 引流+1 / 诈骗+2
-const DEFAULT_AD_KEYWORDS_FINANCE = [];
-const DEFAULT_AD_KEYWORDS_PORN = [];
-const DEFAULT_AD_KEYWORDS_SPAM = [];
-const DEFAULT_AD_KEYWORDS_FRAUD = [];
-
-// 9.1) 严格模式(A 开关):开启后【彻底关闭正文关键词加权评分】,只保留高精度强特征直杀。
-//    正文加权评分是"误杀正常人"的主因(正常用户聊 usdt/搬砖/套利 会被弱信号累加误判);
-//    严格模式下只留:全局黑名单命中 / 学习样本指纹精确匹配 / 发言人名字身份词 /
-//    名片显示名命中词库 / 外国号推广名片 / 引用@引流泛滥 / @bot+诱导词。
-//    效果:误杀正常人趋近于零,代价是"整体像广告但不命中强特征"的会漏(可事后 /learn 补)。
-//    环境变量名:AD_STRICT_MODE(默认 false)
-const DEFAULT_AD_STRICT_MODE = false;
-
-// 9.2) 杀神全局封禁库主动查杀(B 方案,最接近杀神的做法)。
-//    新成员进群时,主动查一次杀神全局库(GKY_BANLIST_ENDPOINT),命中 → 删/踢/加黑(reason:gky_global)。
-//    等于白嫖杀神跨群信誉数据:某号在别的群发广告被杀神全局标记,一进你群就被拦,不用猜消息内容。
-//    只在"新成员进群"触发(频率低,不撞 Cloudflare 子请求限制),不对每条消息查。
-//    环境变量名:GKY_ACTIVE_CHECK(默认 false,需显式开)
-const DEFAULT_GKY_ACTIVE_CHECK = false;
-
-// 9.3) 杀神命中是否写入【本项目 D1 黑名单】。默认 false —— 两套库必须分开。
-//    杀神全局库是第三方的跨群信誉数据,不是本项目的封禁决定:
-//      * 命中仍然照常处置(删消息 + 全群封禁/预封),保护群不受影响;
-//      * 但【不写】D1 黑名单 —— D1 的唯一来源仍是真人 /ban、/spam、/ad 投票。
-//    为什么必须分开:
-//      ① 第三方误标会直接变成你这边的永久黑名单,且用户无法自助解封;
-//      ② D1 有记录 → 用户复入群时又触发一次"复入群拦截"通知,与杀神处置通知重复轰炸主人;
-//      ③ 杀神那边撤销标记后,你的 D1 记录不会跟着撤销,污染无法自动回收。
-//    仍想把杀神结果并入自己黑名单的,显式设 GKY_SYNC_BLACKLIST=true。
-//    环境变量名:GKY_SYNC_BLACKLIST(默认 false)
-const DEFAULT_GKY_SYNC_BLACKLIST = false;
-
-// 10) 自助解封成功后，"联系管理员"按钮指向哪个群（主群 = 回家的入口）。
+// 11) 自助解封成功后，"联系管理员"按钮指向哪个群（主群 = 回家的入口）。
 //    留空 → 用 GROUP_IDS[0]（主群），与原行为一致。
 //    填了但该群不在 GROUP_ID 配置里 → 忽略并回落主群 + 打日志，避免把用户导向 bot 管不到的群。
 //    环境变量名：SELF_UNBAN_CONTACT_GROUP
@@ -177,85 +150,20 @@ const DEFAULT_SELF_UNBAN_CONTACT_GROUP = '';
 // =结束= 普通使用者一般无需修改下方任何内容
 // =============================================================================
 
-// 推荐广告词库种子(字符串拆分写法,避免 GitHub 公开仓库出现完整敏感词)
-// 仅在主人执行 /importdefault 时一次性写入 D1,不默认生效
-const RECOMMENDED_AD_KEYWORDS = {
-	finance: ['us' + 'dt', 'u' + '商', '承' + '兑', '刷' + '单', '日' + '入', '出' + 'u', '接' + 'u', '搬' + '砖', '套' + '利', '包' + '网', '跑' + '分', '水' + '房', '料' + '子'],
-	porn: ['约' + '炮', '萝' + '莉', '黄' + '毛', '福利' + '姬', '看' + '片', '裸' + '聊', '乱' + '伦', '不雅' + '视频', '色' + '色', '一夜' + '情', '免费' + '看', '萝' + '控',
-		'性' + '爱', '不' + '雅', '完整' + '版', '免费' + '观看', '在线' + '观看', '楼' + '凤', '上门' + '服务', '空' + '降', '嫩' + '模', '探' + '花'],
-	spam: [],
-	fraud: ['假' + '钞', '假' + '币', '代开' + '发票', '黑客' + '接单', '网' + '赚', '菠' + '菜',
-		'无' + '风险', '拍' + '单', '刷' + '信誉', '一单' + '无风险', '收' + '视频', '提供' + '设备',
-		'拍商家' + '码', '六' + '合彩', '世界杯' + '内幕', 'pc' + '28', '加群' + '手', '红包' + '福利'],
-	// identity:只用于检测发言人"名字/简介",不碰正文。色情/赌博露骨话术。
-	//   注意:只放正常用户绝不会用的露骨词,不放链接/@/域名(那些会误杀双向bot/技术讨论)。
-	identity: ['出租' + '淫妻', '淫' + '妻', '性' + '奴', '约' + '炮', '裸' + '聊', '楼' + '凤',
-		'小' + '姐', '上门' + '服务', '特殊' + '服务', '援' + '交', '菠' + '菜', '博' + '彩',
-		'赌' + '场', '六' + '合彩', '时时' + '彩', '网' + '赌',
-		'看我' + '介绍', '看我' + '主页', '搞钱' + '找我', '正品水果' + '專卖店', '正品水果' + '专卖店'],
-};
-
-// /recent 冻结快照 D1 表(供 /learnlast 按固定序号引用,根治序号漂移)
-// /recent 时把当时的疑似广告列表冻结存这里;/learnlast 只从这份快照读,
-// 所以即使期间有新消息进来挤动实时缓存,主人私聊里看到的序号也永远对得上同一条。
-// 消息缓存开关与容量(默认开,只缓存"疑似广告"消息以省 D1 写入)
-const DEFAULT_MSG_CACHE_ENABLED = true;
+// 清扫回看上限:/spam 删完当事人消息后，按这个条数回看 moderation_messages 做当前群清扫。
+// 环境变量名:MSG_CACHE_SIZE(1~500，默认 50)
 const DEFAULT_MSG_CACHE_SIZE = 50;
 
-// 学习样本指纹匹配阈值(根因修复:防止学短广告后误杀正常人)
-//   完全相等:归一化后 ≥ 此长度即允许"精确秒杀"(保留"相同广告一定抓"的能力)
-const SAMPLE_FP_EXACT_MIN = 6;
-const AD_SIMILARITY_SIGNATURE_VERSION = 1;
-const AD_SIMILARITY_MIN_CANONICAL_LENGTH = 12;
-const AD_SIMILARITY_SHINGLE_SIZE = 3;
-const AD_SIMILARITY_MIN_SHARED_SHINGLES = 8;
-const AD_SIMILARITY_DICE_THRESHOLD = 0.82;
-const AD_SIMILARITY_CONTAINMENT_THRESHOLD = 0.9;
-const AD_SIMILARITY_MAX_CANONICAL_LENGTH = 2000;
-const AD_SAMPLE_SCOPES = ['body', 'profile', 'quote'];
-const AD_RELAY_REPEAT_THRESHOLD = 2;
+// ===== 群内广告举报投票(/ad)=====
 const AD_VOTE_THRESHOLD = 6;
 const AD_VOTE_DURATION_SECONDS = 60 * 60;
 const AD_VOTE_COMMAND_MAX_AGE_SECONDS = 30;
 const AD_VOTE_RETENTION_SECONDS = 7 * 24 * 60 * 60;
 const AD_VOTE_BUTTON_PREFIX = 'adv:';
+const AD_WORDS_PAGINATION_PREFIX = 'adwords:';
+const AD_JOB_PAGINATION_PREFIX = 'adjob:';
+const AD_WORDS_PAGE_LIMIT = 20;
 const AD_VOTE_HISTORY_FALLBACK_LIMIT = 20;
-const AD_IDENTITY_CACHE_TTL_MS = 10 * 60 * 1000;
-const AD_IDENTITY_FAILURE_CACHE_TTL_MS = 60 * 1000;
-const AD_IDENTITY_CACHE_MAX = 500;
-const AD_IDENTITY_PROFILE_CACHE = new Map();
-
-
-// ===== 链接识别(区分正常链接 vs 广告链接,防止链接误判)=====
-// 正常域名白名单(主人可用 /addword whitelist <域名> 写入 D1 热更新)
-// 内置正常域名白名单:命中这些域名的链接【不计分、不参与样本子串匹配】,正常链接绝不误杀。
-// 匹配规则:消息里链接的主机名 等于白名单项 或 是其子域名(如 gist.github.com 命中 github.com)。
-// 主人想加自己的域名:私聊 /addword whitelist example.com(复用白名单分类,改完即时生效不用重部署)。
-const DEFAULT_URL_WHITELIST = [
-	'github.com', 'githubusercontent.com', 'gitlab.com', 'gitee.com',
-	'google.com', 'youtube.com', 'youtu.be', 'wikipedia.org',
-	'stackoverflow.com', 'stackexchange.com', 'npmjs.com', 'pypi.org',
-	'cloudflare.com', 'developers.cloudflare.com', 'workers.dev',
-	'microsoft.com', 'apple.com', 'mozilla.org', 'docker.com',
-	'twitter.com', 'x.com', 'reddit.com', 'medium.com',
-	'bilibili.com', 'zhihu.com', 'juejin.cn', 'csdn.net', 'segmentfault.com',
-];
-// 可疑域名:命中这些(短链 / 群组邀请类)单独加分,因为常被广告用来藏落地页。
-const SUSPICIOUS_URL_DOMAINS = [];
-
-// 身份广告词:通过 /importdefault 或 /addword identity 写入 D1 管理。
-// GitHub 代码零明文敏感词,所有词库由部署者自行导入。
-const DEFAULT_IDENTITY_SPAM_WORDS = [];
-// 运行期身份广告词(D1 热更新加载)
-let IDENTITY_SPAM_WORDS = [...DEFAULT_IDENTITY_SPAM_WORDS];
-
-// 关键词提取停用词表(过滤常见无害中文4字组,避免误学成广告词)
-// 字符串拆分写法避免明文特征
-const AD_STOPWORDS = [
-	'大' + '家好', '请' + '问一下', '怎' + '么样', '谢' + '谢大家', '有' + '没有人',
-	'是' + '不是', '可' + '以吗', '在' + '不在', '什' + '么意思', '哈' + '哈哈哈',
-	'早' + '上好', '晚' + '上好', '不' + '客气', '没' + '关系',
-];
 
 // 运行期生效的可配置项（每次请求开始时由 loadRequiredConfig 写入）
 let SELF_UNBAN_KEYWORD;
@@ -267,6 +175,9 @@ let SELF_UNBAN_CONTACT_GROUP;
 let BLACKLIST_PAGE_LIMIT;
 let BLACKLIST_REASON_LABELS;
 let GKY_BANLIST_ENDPOINT;
+// 群内闪屏存活毫秒数。给初值是因为 sendFlashMessage 可能在 getConfig 之前被调用
+// （例如配置解析本身报错时的提示），此时不该因为 undefined 退化成"永不撤回"。
+let FLASH_MESSAGE_TTL_MS = DEFAULT_FLASH_MESSAGE_TTL_MS;
 
 // Telegram Bot Token
 let TOKEN;
@@ -280,31 +191,15 @@ let GROUP_IDS = [];
 let ENV_GROUP_IDS = [];
 // D1 dynamic_groups 里合并进来的群（每请求由 mergeDynamicGroupsFromD1 重建）
 let DYNAMIC_GROUP_IDS = [];
+// 超级管理员 TGID 白名单（用于普通管理命令）
+let SUPER_ADMINS = [];
 // 主人 TGID 列表:第一个是主人,后续是副主人。空数组 = 未配置,禁用通知
 let OWNER_IDS = [];
-// 广告检测运行期配置
-let AD_FILTER_ENABLED = false;
-let AD_SCORE_THRESHOLD = 3;
-let AD_STRICT_MODE = false;      // 严格模式:关闭正文加权评分,只留强特征(A 开关)
-let GKY_ACTIVE_CHECK = false;    // 新成员进群主动查杀神全局库(B 方案)
-let GKY_SYNC_BLACKLIST = false;  // 杀神命中是否写入本项目 D1 黑名单(默认不写,两套库分开)
-let AD_KEYWORDS = [];          // 环境变量追加的自定义广告词
-let AD_WHITELIST = [];         // 白名单词(命中不计分)
-let AD_KEYWORDS_FINANCE = [];
-let AD_KEYWORDS_PORN = [];
-let AD_KEYWORDS_SPAM = [];
-let AD_KEYWORDS_FRAUD = [];
-// 广告学习样本指纹(运行期从 D1 加载)
-let AD_SAMPLE_FINGERPRINTS = [];
-let AD_SAMPLE_ENTRY_BY_FP = new Map();
-let AD_SIMILARITY_SAMPLES = [];
-// 额外管理员缓存（从 D1 moderation_admins 表加载）
-let isModerationAdminCache = null;
-// 正常域名白名单(内置 + D1 热更新,运行期合并;命中的链接不计分、不参与样本子串匹配)
-// 初始即为内置默认值,保证 merge 未执行(如 D1 未绑定)时正常域名白名单仍生效
-let URL_WHITELIST = [...DEFAULT_URL_WHITELIST];
-// 消息缓存配置
-let MSG_CACHE_ENABLED = true;
+// 静态用户资料表：bot 不在其所在群时作为 /admins 权限名单的兜底显示
+// 格式：TGID 字符串 → { id, first_name, last_name, username }
+// 环境变量 STATIC_USER_PROFILES（JSON 字符串）优先，留空则为空表
+let STATIC_USER_PROFILES = {};
+// 清扫回看上限(/spam 按它决定 moderation_messages 回看多少条)
 let MSG_CACHE_SIZE = 50;
 // 机器人用户名缓存
 let BOT_USERNAME = null;
@@ -322,20 +217,12 @@ function applyRuntimeConfig(config) {
 	ENV_GROUP_IDS = [...config.GROUP_IDS];
 	DYNAMIC_GROUP_IDS = [];
 	GROUP_ID = config.GROUP_ID;
+	SUPER_ADMINS = config.SUPER_ADMINS;
 	OWNER_IDS = config.OWNER_IDS;
-	AD_FILTER_ENABLED = config.AD_FILTER_ENABLED;
-	AD_SCORE_THRESHOLD = config.AD_SCORE_THRESHOLD;
-	AD_STRICT_MODE = config.AD_STRICT_MODE;
-	GKY_ACTIVE_CHECK = config.GKY_ACTIVE_CHECK;
-	GKY_SYNC_BLACKLIST = config.GKY_SYNC_BLACKLIST;
-	AD_KEYWORDS = config.AD_KEYWORDS;
-	AD_WHITELIST = config.AD_WHITELIST;
-	AD_KEYWORDS_FINANCE = config.AD_KEYWORDS_FINANCE;
-	AD_KEYWORDS_PORN = config.AD_KEYWORDS_PORN;
-	AD_KEYWORDS_SPAM = config.AD_KEYWORDS_SPAM;
-	AD_KEYWORDS_FRAUD = config.AD_KEYWORDS_FRAUD;
-	MSG_CACHE_ENABLED = config.MSG_CACHE_ENABLED;
+	STATIC_USER_PROFILES = config.STATIC_USER_PROFILES || {};
+	AD_PROTECTED_USERNAMES = config.AD_PROTECTED_USERNAMES || [];
 	MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
+	FLASH_MESSAGE_TTL_MS = config.FLASH_MESSAGE_TTL_MS;
 	SELF_UNBAN_KEYWORD = config.SELF_UNBAN_KEYWORD;
 	START_WELCOME = config.START_WELCOME;
 	SELF_UNBAN_PROMPT = config.SELF_UNBAN_PROMPT;
@@ -416,28 +303,14 @@ export default {
 				return new Response('OK');
 			} else if (path === TOKEN) {
 				// 处理初始化命令
-				return await handleInitialization(request);
+				return await handleInitialization(request, env);
 			}
 		} else if (request.method === 'GET' && path === TOKEN) {
 			// 处理 GET 初始化请求
-			return await handleInitialization(request);
+			return await handleInitialization(request, env);
 		}
 
 		return new Response('Method Not Allowed', { status: 405 });
-	},
-
-	// Cloudflare Cron Trigger：每天凌晨 4 点自动清理销号用户
-	async scheduled(event, env, ctx) {
-		console.log('[Cron] 定时任务触发:', new Date().toISOString(), 'cron:', event.cron);
-		await applyRuntimeConfig(loadRequiredConfig(env));
-		await mergeDynamicGroupsFromD1(env);
-		const enabled = await getAutoCleanEnabled(env);
-		if (!enabled) {
-			console.log('[Cron] 自动清理已关闭，跳过');
-			return;
-		}
-		const result = await cleanDeletedAccountsFromBlacklist(env);
-		console.log('[Cron] 清理完成:', JSON.stringify(result));
 	},
 
 	async queue(batch, env, ctx) {
@@ -467,6 +340,33 @@ export default {
 				source: 'queue'
 			});
 		}
+	},
+
+	// Cron 入口（闸三）。触发器在 wrangler.toml 的 [triggers] crons 里配置。
+	// 只做一件事：滚动复查发言者名册的 bio，抓「先干净过检、事后改 bio」的逃逸。
+	// 与 fetch / queue 一样必须先 applyRuntimeConfig —— BOT_TOKEN 等运行期配置
+	// 是模块级变量，不初始化的话所有 Telegram 调用都会带空 token 静默失败。
+	// mergeDynamicGroupsFromD1 同样必要：enforceAdDetection 的全群封禁要遍历
+	// 配置群 + 动态群，不合并会漏掉动态群里的封禁。
+	async scheduled(controller, env, ctx) {
+		try {
+			applyRuntimeConfig(loadRequiredConfig(env));
+		} catch (error) {
+			// 配置缺失时直接返回而不 throw：cron 抛异常只会被记一条失败，
+			// 无人接收，重试也仍然缺配置。日志里写清原因更有用。
+			console.error('[广告检测·扫描] Cron 初始化失败:', error);
+			return;
+		}
+		try {
+			await mergeDynamicGroupsFromD1(env);
+			const summary = await runAdBioRescan(env);
+			// 顺手清一次过期数据。原先只搭在 detectAdOnJoin 上，
+			// 没人入群的日子就不会剪枝；挂到 cron 上有个稳定节拍。
+			await pruneAdDetectionData(env);
+			console.log('[广告检测·扫描] Cron ' + (controller?.cron || '') + ' 结果: ' + JSON.stringify(summary));
+		} catch (error) {
+			console.error('[广告检测·扫描] Cron 执行失败:', error);
+		}
 	}
 };
 
@@ -494,13 +394,20 @@ function loadRequiredConfig(env) {
 	// 去重，保持顺序
 	const uniqueGroupIds = [...new Set(groupIds)];
 
-	// 管理员 ID 清洗：去重、trim、过滤非数字
+	// SUPER_ADMINS 可选：环境变量优先（字符串，逗号分隔，半角 , 与全角 ， 都兼容）；否则用顶部 DEFAULT_SUPER_ADMINS（数组）
 	const sanitizeAdmins = (list) =>
 		[...new Set(
 			(list || [])
 				.map((id) => String(id).trim())
 				.filter((id) => /^\d+$/.test(id))
 		)];
+
+	let superAdmins;
+	if (env.SUPER_ADMINS !== undefined && env.SUPER_ADMINS !== null && String(env.SUPER_ADMINS).trim() !== '') {
+		superAdmins = sanitizeAdmins(String(env.SUPER_ADMINS).split(/[,，]/));
+	} else {
+		superAdmins = sanitizeAdmins(DEFAULT_SUPER_ADMINS);
+	}
 
 	// OWNER_IDS 可选：逗号分隔（中英文逗号均可），第一个主人、后续副主人，空 = 禁用主人通知
 	let ownerIds = [];
@@ -558,56 +465,39 @@ function loadRequiredConfig(env) {
 	}
 
 	const gkyEndpoint = pickStr(env.GKY_BANLIST_ENDPOINT, DEFAULT_GKY_BANLIST_ENDPOINT);
-	// ===== 广告检测配置 =====
-	const parseBool = (v, dflt) => {
-		if (v === undefined || v === null || String(v).trim() === '') return dflt;
-		return String(v).trim().toLowerCase() === 'true';
-	};
-	const parseList = (v) =>
-		[...new Set(
-			String(v || '').split(/[,，]/).map((s) => s.trim().toLowerCase()).filter(Boolean)
-		)];
-
-	const adFilterEnabled = parseBool(env.AD_FILTER_ENABLED, DEFAULT_AD_FILTER_ENABLED);
-	const adStrictMode = parseBool(env.AD_STRICT_MODE, DEFAULT_AD_STRICT_MODE);
-	const gkyActiveCheck = parseBool(env.GKY_ACTIVE_CHECK, DEFAULT_GKY_ACTIVE_CHECK);
-	const gkySyncBlacklist = parseBool(env.GKY_SYNC_BLACKLIST, DEFAULT_GKY_SYNC_BLACKLIST);
-	let adScoreThreshold = DEFAULT_AD_SCORE_THRESHOLD;
-	if (env.AD_SCORE_THRESHOLD !== undefined && env.AD_SCORE_THRESHOLD !== null && String(env.AD_SCORE_THRESHOLD).trim() !== '') {
-		const n = parseInt(String(env.AD_SCORE_THRESHOLD).trim(), 10);
-		if (Number.isInteger(n) && n > 0) adScoreThreshold = n;
-	}
-	const adKeywords = parseList(env.AD_KEYWORDS);     // 环境变量追加
-	const adWhitelist = parseList(env.AD_WHITELIST);
-	// 消息缓存配置
-	const msgCacheEnabled = parseBool(env.MSG_CACHE_ENABLED, DEFAULT_MSG_CACHE_ENABLED);
+	// ===== 清扫缓存配置 =====
+	// 旧版自动广告治理已移除，AD_FILTER_ENABLED / AD_STRICT_MODE / AD_KEYWORDS /
+	// AD_WHITELIST / GKY_ACTIVE_CHECK / GKY_SYNC_BLACKLIST / CROSS_GROUP_SPAM_* /
+	// MSG_CACHE_ENABLED 全部不再解析。
+	// 注意：AD_SCORE_THRESHOLD 已被广告检测 v2 重新启用，但不在此处解析——
+	// v2 的全部 AD_* 配置由 loadAdDetectionConfig(env) 直接读 env 并做范围校验，
+	// 不进 getConfig 的返回对象，也不写任何模块级变量，避免与旧实现的语义混淆。
+	// MSG_CACHE_SIZE 保留：/spam 清扫按它决定 moderation_messages 的回看上限。
 	let msgCacheSize = DEFAULT_MSG_CACHE_SIZE;
 	if (env.MSG_CACHE_SIZE !== undefined && env.MSG_CACHE_SIZE !== null && String(env.MSG_CACHE_SIZE).trim() !== '') {
 		const n = parseInt(String(env.MSG_CACHE_SIZE).trim(), 10);
 		if (Number.isInteger(n) && n > 0 && n <= 500) msgCacheSize = n;
 	}
-	// 词库统一小写化(检测时也小写比对)
-	const lower = (arr) => (arr || []).map((s) => String(s).toLowerCase());
+
+	// 闪屏存活时长。允许 0（= 永不撤回），所以下界判 n >= 0 而不是 n > 0；
+	// 上界 60 秒：再长就失去"闪屏"语义，且 ctx.waitUntil 挂太久没意义。
+	// 空串/非整数/超范围一律回落默认值，避免误配把闪屏变成永久消息。
+	let flashTtlMs = DEFAULT_FLASH_MESSAGE_TTL_MS;
+	if (env.FLASH_MESSAGE_TTL_MS !== undefined && env.FLASH_MESSAGE_TTL_MS !== null && String(env.FLASH_MESSAGE_TTL_MS).trim() !== '') {
+		const n = parseInt(String(env.FLASH_MESSAGE_TTL_MS).trim(), 10);
+		if (Number.isInteger(n) && n >= 0 && n <= 60000) flashTtlMs = n;
+	}
 
 	return {
 		TOKEN: String(env.TOKEN).trim(),
 		BOT_TOKEN: String(env.BOT_TOKEN).trim(),
 		GROUP_IDS: uniqueGroupIds,
 		GROUP_ID: uniqueGroupIds[0],
+		SUPER_ADMINS: superAdmins,
 		OWNER_IDS: ownerIds,
-		AD_FILTER_ENABLED: adFilterEnabled,
-		AD_SCORE_THRESHOLD: adScoreThreshold,
-		AD_STRICT_MODE: adStrictMode,
-		GKY_ACTIVE_CHECK: gkyActiveCheck,
-		GKY_SYNC_BLACKLIST: gkySyncBlacklist,
-		AD_KEYWORDS: adKeywords,
-		AD_WHITELIST: adWhitelist,
-		AD_KEYWORDS_FINANCE: lower(DEFAULT_AD_KEYWORDS_FINANCE),
-		AD_KEYWORDS_PORN: lower(DEFAULT_AD_KEYWORDS_PORN),
-		AD_KEYWORDS_SPAM: lower(DEFAULT_AD_KEYWORDS_SPAM),
-		AD_KEYWORDS_FRAUD: lower(DEFAULT_AD_KEYWORDS_FRAUD),
-		MSG_CACHE_ENABLED: msgCacheEnabled,
+		AD_PROTECTED_USERNAMES: parseAdProtectedUsernames(env.AD_PROTECTED_USERNAMES),
 		MSG_CACHE_SIZE: msgCacheSize,
+		FLASH_MESSAGE_TTL_MS: flashTtlMs,
 		SELF_UNBAN_KEYWORD: selfUnbanKeyword,
 		START_WELCOME: startWelcome,
 		SELF_UNBAN_PROMPT: selfUnbanPrompt,
@@ -616,7 +506,8 @@ function loadRequiredConfig(env) {
 		SELF_UNBAN_CONTACT_GROUP: selfUnbanContactGroup,
 		BLACKLIST_PAGE_LIMIT: blacklistPageLimit,
 		BLACKLIST_REASON_LABELS: blacklistReasonLabels,
-		GKY_BANLIST_ENDPOINT: gkyEndpoint
+		GKY_BANLIST_ENDPOINT: gkyEndpoint,
+		STATIC_USER_PROFILES: parseStaticUserProfiles(env.STATIC_USER_PROFILES),
 	};
 }
 
@@ -628,184 +519,7 @@ function jsonResponse(data, status = 200) {
 	});
 }
 
-// ===== 分级命令菜单 =====
-// Telegram 按 scope 决定"某个人在某个聊天里看到哪些命令"，优先级从高到低：
-//   chat_member(群+人) > chat_administrators(群) > chat(单聊天) >
-//   all_chat_administrators > all_group_chats / all_private_chats > default
-// 所以分级方式是：
-//   * 普通用户 → default / all_group_chats / all_private_chats，只有 /start、/unban
-//   * 群管理员 → all_chat_administrators，加上 /ban、/spam
-//   * 副主人（OWNER_IDS[1..]，即高级管理员）→ 私聊 chat + 各配置群 chat_member，再加 /check、/blacklist
-//   * 第一主人（OWNER_IDS[0]）→ 私聊 chat + 各配置群 chat_member，投放全部命令
-// 高优先级 scope 只投给具体的人，其他人查询到的仍是低优先级菜单，因此主人命令对他人不可见。
-const NORMAL_USER_COMMAND_MENU = [
-	{ command: 'start', description: '开始自助解封' },
-	{ command: 'unban', description: '申请解封（按提示确认）' },
-];
-
-const GROUP_ADMIN_COMMAND_MENU = [
-	{ command: 'unban', description: '解除本群封禁' },
-	{ command: 'ban', description: '封禁并加黑（只封当前群）' },
-	{ command: 'spam', description: '举报广告号（跨群封禁）' },
-];
-
-// 副主人菜单 = 与第一主人相同（权限一致）
-const SECONDARY_OWNER_COMMAND_MENU = [
-	{ command: 'unban', description: '解封用户（全部配置群）' },
-	{ command: 'ban', description: '封禁并加黑（只封当前群）' },
-	{ command: 'spam', description: '举报广告号（跨群封禁）' },
-	{ command: 'check', description: '查询封禁状态' },
-	{ command: 'blacklist', description: '查看黑名单' },
-	{ command: 'add_admin', description: '添加额外管理员' },
-	{ command: 'del_admin', description: '移除额外管理员' },
-	{ command: 'list_admin', description: '列出额外管理员' },
-	{ command: 'job', description: '查询批量任务进度' },
-	{ command: 'jobrun', description: '手动续跑批量任务' },
-	{ command: 'admins', description: '查看权限名单' },
-	{ command: 'groups', description: '查看配置群组' },
-	{ command: 'addgroup', description: '添加动态群组' },
-	{ command: 'delgroup', description: '移除动态群组' },
-	{ command: 'listgroups', description: '查看生效群组' },
-	{ command: 'leavegroup', description: '让机器人退出群组' },
-	{ command: 'addword', description: '添加广告词' },
-	{ command: 'delword', description: '删除广告词' },
-	{ command: 'listwords', description: '查看广告词库' },
-	{ command: 'pending', description: '待确认广告判定快照' },
-	{ command: 'confirm', description: '确认广告判定正确' },
-	{ command: 'ignore', description: '忽略错误判定并解封' },
-	{ command: 'status', description: '机器人状态' },
-	{ command: 'start', description: '自助解封入口' },
-	{ command: 'help', description: '展开全部隐藏指令' },
-];
-
-// 第一主人菜单 = 全部命令（含隐藏运维指令）。仅投放给 OWNER_IDS[0]。
-const PRIMARY_OWNER_COMMAND_MENU = [
-	{ command: 'unban', description: '解封用户（全部配置群）' },
-	{ command: 'ban', description: '封禁并加黑（只封当前群）' },
-	{ command: 'spam', description: '举报广告号（跨群封禁）' },
-	{ command: 'check', description: '查询封禁状态' },
-	{ command: 'blacklist', description: '查看黑名单' },
-	{ command: 'add_admin', description: '添加额外管理员' },
-	{ command: 'del_admin', description: '移除额外管理员' },
-	{ command: 'list_admin', description: '列出额外管理员' },
-	{ command: 'job', description: '查询批量任务进度' },
-	{ command: 'jobrun', description: '手动续跑批量任务' },
-	{ command: 'admins', description: '查看权限名单' },
-	{ command: 'groups', description: '查看配置群组' },
-	{ command: 'addgroup', description: '添加动态群组' },
-	{ command: 'delgroup', description: '移除动态群组' },
-	{ command: 'listgroups', description: '查看生效群组' },
-	{ command: 'leavegroup', description: '让机器人退出群组' },
-	{ command: 'ad_test', description: '广告检测测试模式' },
-	{ command: 'pending', description: '待确认广告判定快照' },
-	{ command: 'confirm', description: '确认广告判定正确' },
-	{ command: 'ignore', description: '忽略错误判定并解封' },
-	{ command: 'listwords', description: '查看广告指纹库' },
-	{ command: 'addsample', description: '添加 AI 语义样本' },
-	{ command: 'clearsamples', description: '清空 AI 样本' },
-	{ command: 'warmup', description: '预热 AI 样本向量' },
-	{ command: 'whitelist', description: '管理域名白名单' },
-	{ command: 'adstats', description: '查看统计信息' },
-	{ command: 'rescreen', description: '重新筛查观察窗口' },
-	{ command: 'clean_blacklist', description: '清理销号用户' },
-	{ command: 'clean_switch', description: '自动销号清理开关' },
-	{ command: 'add_admin', description: '添加额外管理员' },
-	{ command: 'del_admin', description: '移除额外管理员' },
-	{ command: 'list_admin', description: '列出额外管理员' },
-	{ command: 'status', description: '查看机器人状态' },
-	{ command: 'start', description: '自助解封入口' },
-	{ command: 'help', description: '展开全部隐藏指令' },
-];
-
-// 每次初始化最多投放的"精确到人"菜单数量。Cloudflare Workers 单请求有子请求上限，
-// 群数 × 主人数不设限会把预算耗尽，因此超出部分跳过并在回执里明确报告。
-const TIERED_MENU_PER_MEMBER_CALL_LIMIT = 30;
-
-async function callTelegramMenuApi(method, body) {
-	const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(body)
-	});
-	let result = null;
-	try {
-		result = await response.json();
-	} catch (_) { /* 非 JSON 响应按失败处理 */ }
-	return {
-		ok: response.ok && result?.ok === true,
-		status: response.status,
-		description: result?.description || '',
-		result
-	};
-}
-
-async function applyBotCommandMenu(label, commands, scope) {
-	const payload = { commands, scope };
-	const outcome = await callTelegramMenuApi('setMyCommands', payload);
-	return {
-		菜单: label,
-		作用域: scope.type,
-		命令数: commands.length,
-		已设置: outcome.ok,
-		...(outcome.ok ? {} : { HTTP状态码: outcome.status, Telegram返回: outcome.description || outcome.result })
-	};
-}
-
-// 分级菜单投放。返回逐条结果，调用方汇总进初始化回执，失败项不阻断其它 scope。
-async function applyTieredCommandMenus() {
-	const menus = [];
-
-	// 1) 兜底三层：任何人（含普通成员）只看到 /start、/unban
-	menus.push(await applyBotCommandMenu('普通用户(默认)', NORMAL_USER_COMMAND_MENU, { type: 'default' }));
-	menus.push(await applyBotCommandMenu('普通用户(私聊)', NORMAL_USER_COMMAND_MENU, { type: 'all_private_chats' }));
-	menus.push(await applyBotCommandMenu('普通用户(群聊)', NORMAL_USER_COMMAND_MENU, { type: 'all_group_chats' }));
-
-	// 2) 群管理员：所有群的管理员统一菜单
-	menus.push(await applyBotCommandMenu('群管理员', GROUP_ADMIN_COMMAND_MENU, { type: 'all_chat_administrators' }));
-
-	// 3) 主人层：精确到人投放，别人拿不到这些 scope
-	const primaryOwnerId = OWNER_IDS[0] || '';
-	const secondaryOwnerIds = OWNER_IDS.slice(1);
-	let perMemberCalls = 0;
-	const skipped = [];
-
-	if (primaryOwnerId) {
-		menus.push(await applyBotCommandMenu('第一主人(私聊)', PRIMARY_OWNER_COMMAND_MENU, {
-			type: 'chat',
-			chat_id: primaryOwnerId
-		}));
-	}
-	for (const ownerId of secondaryOwnerIds) {
-		menus.push(await applyBotCommandMenu(`副主人 ${ownerId}(私聊)`, SECONDARY_OWNER_COMMAND_MENU, {
-			type: 'chat',
-			chat_id: ownerId
-		}));
-	}
-
-	// 群内 chat_member：让主人/副主人在群里也能看到自己那一层菜单，
-	// 而不是被 all_chat_administrators 的群管理员菜单覆盖。
-	for (const groupId of GROUP_IDS) {
-		for (const [ownerId, commands, label] of [
-			...(primaryOwnerId ? [[primaryOwnerId, PRIMARY_OWNER_COMMAND_MENU, '第一主人']] : []),
-			...secondaryOwnerIds.map((id) => [id, SECONDARY_OWNER_COMMAND_MENU, `副主人 ${id}`]),
-		]) {
-			if (perMemberCalls >= TIERED_MENU_PER_MEMBER_CALL_LIMIT) {
-				skipped.push(`${label} @ ${groupId}`);
-				continue;
-			}
-			perMemberCalls += 1;
-			menus.push(await applyBotCommandMenu(`${label}(群 ${groupId})`, commands, {
-				type: 'chat_member',
-				chat_id: groupId,
-				user_id: ownerId
-			}));
-		}
-	}
-
-	return { menus, skipped };
-}
-
-async function handleInitialization(request) {
+async function handleInitialization(request, env) {
 	try {
 		// 设置 Webhook
 		const webhookUrl = new URL(request.url);
@@ -837,44 +551,112 @@ async function handleInitialization(request) {
 			}, 500);
 		}
 
-		// 设置分级机器人命令菜单
-		const { menus, skipped } = await applyTieredCommandMenus();
-		const failed = menus.filter((item) => !item.已设置);
-		// 兜底菜单（default / 私聊 / 群聊 / 群管理员）必须成功；
-		// 精确到人的 chat / chat_member 允许失败（主人没私聊过 bot、或不在某个群）。
-		const baselineFailed = failed.filter((item) => ['default', 'all_private_chats', 'all_group_chats', 'all_chat_administrators'].includes(item.作用域));
-		const webhookInfo = {
-			已设置: true,
-			目标地址: webhookUrl.toString(),
-			允许更新类型: setWebhookBody.allowed_updates
-		};
-		const commandInfo = {
-			已设置: baselineFailed.length === 0,
-			分级说明: {
-				普通用户: NORMAL_USER_COMMAND_MENU.map((c) => `/${c.command}`),
-				群管理员: GROUP_ADMIN_COMMAND_MENU.map((c) => `/${c.command}`),
-				副主人: SECONDARY_OWNER_COMMAND_MENU.map((c) => `/${c.command}`),
-				第一主人: `全部 ${PRIMARY_OWNER_COMMAND_MENU.length} 条命令`
-			},
-			投放结果: menus,
-			...(skipped.length ? { 已跳过: skipped, 跳过原因: `单次初始化最多投放 ${TIERED_MENU_PER_MEMBER_CALL_LIMIT} 个精确到人的菜单，请再次访问初始化地址补齐` } : {}),
-			...(failed.length && !baselineFailed.length ? { 提示: '精确到人的菜单存在失败项：通常是该主人尚未私聊过机器人，或不在该配置群内；不影响其它菜单。' } : {})
-		};
+		// 设置机器人命令
+		// ===== 分角色设置命令列表 =====
+		// 非管理员及主人：/start、/unban
+		// 管理员（群管理员）：用户命令 + /ban /spam /check
+		// 主人/副主人：全部命令（除去 /job /jobrun）
+		const setCommandsUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
 
-		if (baselineFailed.length === 0) {
+		const userCommands = [
+			{ command: "start", description: "机器人介绍" },
+			{ command: "unban", description: "开始自助解封" }
+		];
+
+		const adminCommands = [
+			...userCommands,
+			{ command: "ban", description: "添加用户到全局黑名单" },
+			{ command: "spam", description: "举报并加入全局黑名单" },
+			{ command: "check", description: "查询封禁状态" }
+		];
+
+		const ownerCommands = [
+			...adminCommands,
+			{ command: "blacklist", description: "查看当前黑名单" },
+			{ command: "pending", description: "列出待复核快照" },
+			{ command: "ignore", description: "误判回滚" },
+			{ command: "rescreen", description: "重新筛查可疑用户" },
+			{ command: "adstats", description: "指纹库统计" },
+			{ command: "words", description: "翻看指纹库" },
+			{ command: "addword", description: "新增指纹" },
+			{ command: "delword", description: "删除指纹" },
+			{ command: "addsample", description: "新增AI语义样本" },
+			{ command: "warmup", description: "补齐样本向量" },
+			{ command: "clearsamples", description: "清空AI样本" },
+			{ command: "whitelist", description: "域名白名单管理" },
+			{ command: "help", description: "查看所有命令" },
+			{ command: "admins", description: "查看权限名单" },
+			{ command: "groups", description: "查看配置群组" },
+			{ command: "leavegroup", description: "退出群组" },
+			{ command: "addgroup", description: "新增治理群组" },
+			{ command: "delgroup", description: "删除治理群组" },
+			{ command: "listgroups", description: "列出全部群组" },
+			{ command: "ad", description: "发起广告举报投票" },
+			{ command: "add_ad_admin", description: "允许发起广告投票" },
+			{ command: "del_ad_admin", description: "取消发起广告投票权限" }
+		];
+
+		// 1) 默认命令（所有用户）
+		const defaultResp = await fetch(setCommandsUrl, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ commands: userCommands, scope: { type: 'default' } })
+		});
+
+		// 2) 群管理员命令
+		const adminResp = await fetch(setCommandsUrl, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ commands: adminCommands, scope: { type: 'all_chat_administrators' } })
+		});
+
+		// 3) 主人/副主人命令（私聊）
+		const ownerResults = [];
+		for (const ownerId of OWNER_IDS) {
+			const ownerResp = await fetch(setCommandsUrl, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ commands: ownerCommands, scope: { type: 'chat', chat_id: Number(ownerId) } })
+			});
+			ownerResults.push({ ownerId, ok: ownerResp.ok });
+		}
+
+		if (defaultResp.ok && adminResp.ok) {
 			return jsonResponse({
 				成功: true,
-				消息: 'Webhook 和分级命令菜单设置成功',
-				Webhook: webhookInfo,
-				命令: commandInfo
+				消息: 'Webhook 和命令设置成功',
+				Webhook: {
+					已设置: true,
+					目标地址: webhookUrl.toString(),
+					允许更新类型: setWebhookBody.allowed_updates
+				},
+				命令: {
+					已设置: true,
+					用户命令: userCommands.map(c => c.command),
+					管理员命令: adminCommands.map(c => c.command),
+					主人命令数量: ownerCommands.length,
+					主人设置结果: ownerResults
+				}
 			});
+		} else {
+			const result = !defaultResp.ok ? await defaultResp.json() : await adminResp.json();
+			return jsonResponse({
+				成功: false,
+				消息: '命令设置失败',
+				Webhook: {
+					已设置: true,
+					目标地址: webhookUrl.toString(),
+					允许更新类型: setWebhookBody.allowed_updates
+				},
+				命令: {
+					已设置: false,
+					默认命令状态码: defaultResp.status,
+					管理员命令状态码: adminResp.status,
+					Telegram返回: result,
+					主人设置结果: ownerResults
+				}
+			}, 500);
 		}
-		return jsonResponse({
-			成功: false,
-			消息: '命令设置失败',
-			Webhook: webhookInfo,
-			命令: commandInfo
-		}, 500);
 	} catch (error) {
 		return jsonResponse({
 			成功: false,
@@ -898,10 +680,6 @@ const BULK_TASK_D1_RETRY_DELAY_MS = 200;
 const BULK_TASK_FAILURE_LIMIT = 100;
 const BULK_TASK_LEASE_MS = 45000;
 const D1_BATCH_MUTATION_SIZE = 20;
-// 黑名单 INSERT 每条记录 6 列（含 scope_groups），D1 单条语句绑定参数上限 100，
-// 因此每批最多 16 行（16×6=96 ≤ 100）。DELETE / SELECT IN 仍按 20 一批。
-const D1_BLACKLIST_INSERT_COLUMNS = 6;
-const D1_BLACKLIST_INSERT_BATCH_SIZE = Math.floor(100 / D1_BLACKLIST_INSERT_COLUMNS);
 const BATCH_USER_PROFILE_CONCURRENCY = 3;
 const BATCH_USER_NAME_MAX_LENGTH = 48;
 const BULK_JOB_PROFILE_PAGE_SIZE = 10;
@@ -997,14 +775,11 @@ async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 // 读取并归一化黑名单
 // === D1 工具函数 ===
 // 首次访问 D1 时建表（幂等），避免人工建表步骤
-const D1_SCHEMA_VERSION = 7;
+const D1_SCHEMA_VERSION = 6;
 const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
 const D1_INIT_PROMISES = new WeakMap();
-const D1_AD_RELAY_INIT_PROMISES = new WeakMap();
 const D1_AD_VOTE_INIT_PROMISES = new WeakMap();
-const D1_AD_KEYWORDS_CACHE = new WeakMap();
-const D1_AD_SAMPLES_CACHE = new WeakMap();
 const D1_DYNAMIC_GROUPS_CACHE = new WeakMap();
 
 function cloneD1RuntimeValue(value) {
@@ -1043,101 +818,6 @@ async function loadD1RuntimeCachedValue(env, cache, loader) {
 	}
 }
 
-// ===== 黑名单生效群范围（scope_groups）=====
-// 语义：null = 全局黑名单（全部配置群生效，且自助解封被全局拒绝）；
-//       非空数组 = 仅在这些群生效，其它群完全不受影响（误杀者仍能加入别的私密群）。
-// 唯一全局来源 = 真人 /spam；群内 /ban、广告自动检测、/ad 投票、杀神库都只写"当前群"。
-// 历史记录 scope_groups 为 NULL，按全局解释，与本次改动前行为一致。
-function normalizeBlacklistScope(value) {
-	if (value === null || value === undefined) return null;
-	const tokens = Array.isArray(value)
-		? value
-		: String(value).split(/[,，\s]+/);
-	const ids = [...new Set(
-		tokens
-			.map((id) => String(id ?? '').trim())
-			.filter((id) => /^-?\d{5,20}$/.test(id))
-	)].sort();
-	// 空字符串 / 全是垃圾值 → 视为全局，绝不产出"谁都不生效"的空范围记录。
-	return ids.length > 0 ? ids : null;
-}
-
-function serializeBlacklistScope(scope) {
-	const normalized = normalizeBlacklistScope(scope);
-	return normalized ? normalized.join(',') : null;
-}
-
-// 合并两个范围：任一为全局则结果为全局（范围只会放大，不会因再次加黑被收窄）。
-function mergeBlacklistScopes(current, incoming) {
-	const a = normalizeBlacklistScope(current);
-	const b = normalizeBlacklistScope(incoming);
-	if (a === null || b === null) return null;
-	return normalizeBlacklistScope([...a, ...b]);
-}
-
-// 该记录是否在指定群生效。范围为全局时恒为 true。
-function blacklistScopeCoversGroup(scope, chatId) {
-	const normalized = normalizeBlacklistScope(scope);
-	if (normalized === null) return true;
-	const id = String(chatId ?? '').trim();
-	return id !== '' && normalized.includes(id);
-}
-
-// 从范围中移除若干群（群管理员 /unban 只解除本群）。
-// 返回 { scope, changed, emptied }：emptied=true 表示范围被清空，调用方应删除整条记录。
-function removeGroupsFromBlacklistScope(scope, groupIds) {
-	const normalized = normalizeBlacklistScope(scope);
-	if (normalized === null) {
-		// 全局记录无法被"部分解除"：全局语义就是所有群都封，收窄等于偷偷放行。
-		return { scope: null, changed: false, emptied: false, global: true };
-	}
-	const removing = new Set(
-		(Array.isArray(groupIds) ? groupIds : [groupIds])
-			.map((id) => String(id ?? '').trim())
-			.filter(Boolean)
-	);
-	const kept = normalized.filter((id) => !removing.has(id));
-	return {
-		scope: kept.length > 0 ? kept : null,
-		changed: kept.length !== normalized.length,
-		emptied: kept.length === 0,
-		global: false,
-	};
-}
-
-// 把范围解析为"本次真正要操作的配置群列表"。范围里已被移除的群自动被过滤掉。
-function resolveScopeTargetGroupIds(scope) {
-	const normalized = normalizeBlacklistScope(scope);
-	if (normalized === null) return [...GROUP_IDS];
-	return GROUP_IDS.filter((groupId) => normalized.includes(String(groupId)));
-}
-
-function describeBlacklistScope(scope) {
-	const normalized = normalizeBlacklistScope(scope);
-	if (normalized === null) return '全部配置群（全局）';
-	return `仅 ${normalized.length} 个群：${normalized.join('、')}`;
-}
-
-// 带群名的范围描述（给人看的回执用，如 /check）。拉群名失败时回落纯 ID，不影响主流程。
-async function describeBlacklistScopeWithTitles(scope) {
-	const normalized = normalizeBlacklistScope(scope);
-	if (normalized === null) return '全部配置群（全局）';
-	const labels = [];
-	for (const groupId of normalized) {
-		const configured = isConfiguredGroup(groupId);
-		let title = '';
-		if (configured) {
-			try {
-				const info = await getChatInfoFromId(groupId);
-				title = String(info?.title || '').trim();
-			} catch (_) {}
-		}
-		const suffix = configured ? '' : '（已不在 GROUP_ID 配置）';
-		labels.push(title ? `${title} ${groupId}${suffix}` : `${groupId}${suffix}`);
-	}
-	return `仅 ${normalized.length} 个群：${labels.join('、')}`;
-}
-
 function normalizeD1BlacklistRow(row) {
 	if (!row) return null;
 	return {
@@ -1145,8 +825,7 @@ function normalizeD1BlacklistRow(row) {
 		reason: row.reason ?? null,
 		by: row.by_user ?? null,
 		at: row.at ?? null,
-		note: row.note ?? null,
-		scopeGroups: normalizeBlacklistScope(row.scope_groups ?? null)
+		note: row.note ?? null
 	};
 }
 
@@ -1170,15 +849,9 @@ async function d1TablesExist(env, tables) {
 }
 
 async function d1CoreTablesExist(env) {
-	// scope_groups 是"黑名单记录生效群范围"的载体，缺列时范围判定会整体退化成全局，
-	// 因此与 note 一样纳入核心结构判定，逼迫 ensureD1Table 走一次补列迁移。
-	if (!(await d1ColumnExists(env, 'blacklist', 'note'))) return false;
-	return d1ColumnExists(env, 'blacklist', 'scope_groups');
+	return d1ColumnExists(env, 'blacklist', 'note');
 }
 
-async function d1AdRelayTablesExist(env) {
-	return d1TablesExist(env, ['ad_relay_observations']);
-}
 
 async function d1AdVoteTablesExist(env) {
 	return d1TablesExist(env, ['ad_votes', 'ad_vote_allowlist']);
@@ -1251,74 +924,18 @@ async function ensureD1Table(env) {
 
 			const tableStatements = [
 				['schema_meta', 'CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, updated_at TEXT);'],
-				// scope_groups：该黑名单记录的【生效群范围】。NULL/空 = 全局（全部配置群）；
-				// 有值 = 逗号分隔的群 ID 列表，只在这些群内生效。/spam 写全局，
-				// 群内 /ban 与广告自动检测/投票/杀神只写当前群，误杀者仍可加入其它私密群。
-				['blacklist', 'CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT, scope_groups TEXT);'],
-				['recent_messages', 'CREATE TABLE IF NOT EXISTS recent_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, chat_title TEXT, text TEXT, from_id TEXT, from_name TEXT, created_at TEXT);'],
+				['blacklist', 'CREATE TABLE IF NOT EXISTS blacklist (id TEXT PRIMARY KEY, reason TEXT, by_user TEXT, at TEXT, note TEXT);'],
+				// 清扫缓存：/spam 删完当事人消息后按它回看当前群近期发言。唯一保留的消息缓存表。
+				// 原先的 ad_keywords / ad_samples / recent_messages / cross_group_posts /
+				// learn_snapshot 随自动广告治理一并移除，不再建表（旧库里的表不受影响，可手动清理）。
 				['moderation_messages', 'CREATE TABLE IF NOT EXISTS moderation_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, mid INTEGER, chat_id TEXT, from_id TEXT, created_at TEXT);'],
-				['learn_snapshot', 'CREATE TABLE IF NOT EXISTS learn_snapshot (id INTEGER PRIMARY KEY CHECK (id = 1), data TEXT NOT NULL, updated_at TEXT);'],
 				['batch_jobs', 'CREATE TABLE IF NOT EXISTS batch_jobs (id TEXT PRIMARY KEY, type TEXT, status TEXT, payload TEXT NOT NULL, created_at TEXT, updated_at TEXT);'],
 				// 动态群组：第一主人用 /addgroup 加进来的群。与 GROUP_ID 环境变量彻底分离
 				// （Worker 无法写自己的环境变量），合并时环境变量群永远在前，主群身份不受影响。
 				['dynamic_groups', 'CREATE TABLE IF NOT EXISTS dynamic_groups (chat_id TEXT PRIMARY KEY, title TEXT, added_by TEXT NOT NULL, added_at TEXT NOT NULL, note TEXT);'],
-				// 额外管理员：第一主人通过 /add_mod 添加的非管理员用户，可使用 /ban 和 /spam。
-				// 不需要是 Telegram 群管理员，只需是本项目认可的额外管理员。
-				['moderation_admins', 'CREATE TABLE IF NOT EXISTS moderation_admins (user_id TEXT PRIMARY KEY, added_by TEXT NOT NULL, added_at TEXT NOT NULL, note TEXT);'],
-				// 频道转发警告记录：记录用户转发频道帖子的次数，满3次后自动封禁。
-				['warning_records', 'CREATE TABLE IF NOT EXISTS warning_records (user_id TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, last_warned_at TEXT, history TEXT);'],
-			// ===== 广告检测 V2 =====
-			// 广告指纹库：存储关键词/域名/用户名/Bio 模式的指纹，用于快速匹配。
-				['ad_fingerprints', `CREATE TABLE IF NOT EXISTS ad_fingerprints (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT UNIQUE NOT NULL, type TEXT NOT NULL, weight REAL NOT NULL DEFAULT 0.6, source TEXT NOT NULL DEFAULT 'auto', hit_count INTEGER NOT NULL DEFAULT 0, created_at TEXT, last_hit_at TEXT);`],
-			// 观察窗口：记录可疑用户，24 小时内累计分数达标才封禁。
-				['ad_observation_window', `CREATE TABLE IF NOT EXISTS ad_observation_window (user_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, score REAL NOT NULL DEFAULT 0, hits TEXT, first_seen TEXT, last_seen TEXT, status TEXT NOT NULL DEFAULT 'observing');`],
-			// 待确认快照：自动判定为广告时推给主人复核的快照。
-				['ad_pending_snapshots', `CREATE TABLE IF NOT EXISTS ad_pending_snapshots (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, chat_id TEXT NOT NULL, message_id INTEGER, score REAL, hits TEXT, preview TEXT, created_at TEXT, status TEXT NOT NULL DEFAULT 'pending');`],
-			// 域名白名单：命中即豁免广告检测。
-				['ad_domain_whitelist', `CREATE TABLE IF NOT EXISTS ad_domain_whitelist (domain TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'manual', created_at TEXT);`],
-			// AI 语义比对样本（可选，需要 Workers AI 绑定）。
-				['ad_sample_embeddings', `CREATE TABLE IF NOT EXISTS ad_sample_embeddings (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, embedding TEXT NOT NULL, created_at TEXT);`],
 			];
 			for (const [label, sql] of tableStatements) {
 				await runD1SchemaStatement(env, label, sql);
-			}
-
-			// V2 索引
-			const v2Indexes = [
-				['idx_ad_fingerprints_value', 'CREATE INDEX IF NOT EXISTS idx_ad_fingerprints_value ON ad_fingerprints(value);'],
-				['idx_ad_fingerprints_type', 'CREATE INDEX IF NOT EXISTS idx_ad_fingerprints_type ON ad_fingerprints(type);'],
-				['idx_ad_observation_status', 'CREATE INDEX IF NOT EXISTS idx_ad_observation_status ON ad_observation_window(status);'],
-				['idx_ad_pending_status', 'CREATE INDEX IF NOT EXISTS idx_ad_pending_status ON ad_pending_snapshots(status);'],
-			];
-			for (const [label, sql] of v2Indexes) {
-				await runD1SchemaStatement(env, label, sql, { optional: true });
-			}
-
-			// V2 域名白名单种子数据
-			try {
-				const existingWhitelist = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_domain_whitelist').first();
-				if (!existingWhitelist || existingWhitelist.cnt === 0) {
-					const seedDomains = ['github.com', 'gitlab.com', 'google.com', 'youtube.com', 'bilibili.com', 'telegram.org', 'wikipedia.org', 'stackoverflow.com', 'zhihu.com', 'juejin.cn'];
-					for (const domain of seedDomains) {
-						await env.DB.prepare('INSERT OR IGNORE INTO ad_domain_whitelist (domain, source, created_at) VALUES (?, ?, ?)')
-							.bind(domain, 'seed', new Date().toISOString()).run();
-					}
-				}
-			} catch (error) {
-				console.error('[ad_v2] 域名白名单种子写入失败:', error.message);
-			}
-
-			// AI 语义层样本种子数据
-			try {
-				const existingSamples = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings').first();
-				if (!existingSamples || existingSamples.cnt === 0) {
-					for (const text of AD_SAMPLE_SEED_TEXTS) {
-						await env.DB.prepare('INSERT OR IGNORE INTO ad_sample_embeddings (text, embedding, created_at) VALUES (?, NULL, ?)')
-							.bind(text, new Date().toISOString()).run();
-					}
-				}
-			} catch (error) {
-				console.error('[AI] 样本种子写入失败:', error.message);
 			}
 
 			const optionalIndexes = [
@@ -1333,19 +950,6 @@ async function ensureD1Table(env) {
 			try {
 				if (!(await d1ColumnExists(env, 'blacklist', 'note'))) {
 					await runD1SchemaStatement(env, 'blacklist.note', 'ALTER TABLE blacklist ADD COLUMN note TEXT;');
-				}
-			} catch (error) {
-				const message = formatD1SchemaError(error).toLowerCase();
-				if (!message.includes('duplicate') && !message.includes('exists')) {
-					throw error;
-				}
-			}
-
-			// 旧库补列：历史记录 scope_groups 为 NULL，按"全局黑名单"解释，
-			// 与本次改动前的行为完全一致，零迁移。
-			try {
-				if (!(await d1ColumnExists(env, 'blacklist', 'scope_groups'))) {
-					await runD1SchemaStatement(env, 'blacklist.scope_groups', 'ALTER TABLE blacklist ADD COLUMN scope_groups TEXT;');
 				}
 			} catch (error) {
 				const message = formatD1SchemaError(error).toLowerCase();
@@ -1385,41 +989,6 @@ async function ensureD1Table(env) {
 	return initialized;
 }
 
-async function ensureAdRelayTables(env) {
-	if (!env.DB) return false;
-	const cached = D1_AD_RELAY_INIT_PROMISES.get(env.DB);
-	if (cached) return cached;
-
-	const initPromise = (async () => {
-		try {
-			if (!(await ensureD1Table(env))) {
-				throw new Error('D1 核心结构不可用');
-			}
-			await runD1SchemaStatement(
-				env,
-				'ad_relay_observations',
-				'CREATE TABLE IF NOT EXISTS ad_relay_observations (actor_id TEXT PRIMARY KEY, occurrences INTEGER NOT NULL DEFAULT 1, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, last_chat_id TEXT, last_message_id TEXT, last_original_author_id TEXT, last_quote_fingerprint TEXT, quote_preview TEXT, wrapper_preview TEXT, evidence TEXT);',
-			);
-			await runD1SchemaStatement(
-				env,
-				'idx_ad_relay_observations_last_seen',
-				'CREATE INDEX IF NOT EXISTS idx_ad_relay_observations_last_seen ON ad_relay_observations(last_seen_at);',
-				{ optional: true },
-			);
-			if (!(await d1AdRelayTablesExist(env))) {
-				throw new Error('D1 引用观察表迁移不完整');
-			}
-			return true;
-		} catch (error) {
-			console.error('D1 引用观察表初始化失败: ' + formatD1SchemaError(error));
-			return false;
-		}
-	})();
-	D1_AD_RELAY_INIT_PROMISES.set(env.DB, initPromise);
-	const initialized = await initPromise;
-	if (!initialized) D1_AD_RELAY_INIT_PROMISES.delete(env.DB);
-	return initialized;
-}
 
 async function ensureAdVoteTables(env) {
 	if (!env.DB) return false;
@@ -1588,7 +1157,7 @@ async function removeDynamicGroup(env, chatId) {
 
 async function readD1Blacklist(env) {
 	await ensureD1Table(env);
-	const stmt = env.DB.prepare('SELECT id, reason, by_user, at, note, scope_groups FROM blacklist ORDER BY at ASC, id ASC');
+	const stmt = env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at ASC, id ASC');
 	const { results } = await stmt.all();
 	return (results || []).map(normalizeD1BlacklistRow).filter(Boolean);
 }
@@ -1597,7 +1166,7 @@ async function readD1BlacklistEntry(env, userId) {
 	await ensureD1Table(env);
 	const id = String(userId ?? '').trim();
 	if (!id) return null;
-	const row = await env.DB.prepare('SELECT id, reason, by_user, at, note, scope_groups FROM blacklist WHERE id = ? LIMIT 1')
+	const row = await env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist WHERE id = ? LIMIT 1')
 		.bind(id)
 		.first();
 	return normalizeD1BlacklistRow(row);
@@ -1606,7 +1175,7 @@ async function readD1BlacklistEntry(env, userId) {
 async function readD1BlacklistRecent(env, limit) {
 	await ensureD1Table(env);
 	const safeLimit = Math.max(1, Math.min(Number(limit) || BLACKLIST_PAGE_LIMIT, 200));
-	const { results } = await env.DB.prepare('SELECT id, reason, by_user, at, note, scope_groups FROM blacklist ORDER BY at DESC, id DESC LIMIT ?')
+	const { results } = await env.DB.prepare('SELECT id, reason, by_user, at, note FROM blacklist ORDER BY at DESC, id DESC LIMIT ?')
 		.bind(safeLimit)
 		.all();
 	return (results || []).map(normalizeD1BlacklistRow).filter(Boolean);
@@ -1623,7 +1192,7 @@ function shouldPruneD1Cache(insertResult) {
 }
 
 async function pruneAutoincrementCacheTable(env, table, keepLimit) {
-	if (table !== 'recent_messages' && table !== 'moderation_messages') {
+	if (table !== 'moderation_messages') {
 		throw new Error(`Unsupported D1 cache table: ${table}`);
 	}
 	const safeLimit = Math.max(1, Math.floor(Number(keepLimit) || 1));
@@ -1666,7 +1235,7 @@ async function readD1BlacklistWindow(env, offset, limit, reasons = null) {
 
 	const filter = buildD1BlacklistReasonFilter(reasons);
 	const stmt = env.DB.prepare(`
-		SELECT id, reason, by_user, at, note, scope_groups
+		SELECT id, reason, by_user, at, note
 		FROM blacklist
 		${filter.where}
 		ORDER BY at ASC, id ASC
@@ -1678,8 +1247,7 @@ async function readD1BlacklistWindow(env, offset, limit, reasons = null) {
 		reason: r.reason ?? null,
 		by: r.by_user ?? null,
 		at: r.at ?? null,
-		note: r.note ?? null,
-		scopeGroups: normalizeBlacklistScope(r.scope_groups ?? null)
+		note: r.note ?? null
 	}));
 }
 
@@ -1697,8 +1265,6 @@ async function getBlacklist(env) {
 }
 
 // 检查用户是否在黑名单中
-// options.chatId：只在该群判定命中（范围外的记录视为"未命中"，让误杀者仍能加入其它群）。
-//   不传 chatId = 只问"库里有没有这条记录"，用于自助解封硬闸门与 /check 查询展示。
 async function checkBlacklist(userId, env, options = {}) {
 	if (!env.DB) {
 		if (options.strict) {
@@ -1715,18 +1281,10 @@ async function checkBlacklist(userId, env, options = {}) {
 	try {
 		const hit = await readD1BlacklistEntry(env, userId);
 		if (hit) {
-			const scopeCovers = options.chatId === undefined || options.chatId === null
-				? true
-				: blacklistScopeCoversGroup(hit.scopeGroups, options.chatId);
-			if (!scopeCovers) {
-				// 有记录但本群不在生效范围内：本群完全不拦，等同于没这条记录。
-				return { isBlacklisted: false, message: null, entry: hit, scopeCovers: false };
-			}
 			return {
 				isBlacklisted: true,
 				message: '❌ 您的TGID在黑名单中，请自行联系管理员解封。',
-				entry: hit,
-				scopeCovers: true
+				entry: hit
 			};
 		}
 
@@ -1775,9 +1333,6 @@ async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, option
 }
 
 // 添加用户到黑名单（核心实现）
-// options.scopeGroups：生效群范围。省略 / null = 全局（仅 /spam 使用）；
-//   数组或逗号串 = 只在这些群生效（群内 /ban、广告自动检测、/ad 投票、杀神库）。
-// 记录已存在时不覆盖原有 reason/note，但会把新范围【并入】旧范围（范围只放大不收窄）。
 async function addToBlacklistCore(userId, env, options = {}) {
 	if (!env.DB) {
 		return { success: false, code: 'NO_DB', message: '❌ 未绑定 D1 存储空间' };
@@ -1789,50 +1344,19 @@ async function addToBlacklistCore(userId, env, options = {}) {
 	const noteRaw = options.note != null ? String(options.note).trim() : '';
 	const note = noteRaw ? noteRaw : null;
 	const at = new Date().toISOString();
-	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
-	const scopeValue = serializeBlacklistScope(scopeGroups);
 
 	try {
 		await ensureD1Table(env);
 		const result = await env.DB
-			.prepare('INSERT OR IGNORE INTO blacklist (id, reason, by_user, at, note, scope_groups) VALUES (?, ?, ?, ?, ?, ?)')
-			.bind(userIdStr, reason, by, at, note, scopeValue)
+			.prepare('INSERT OR IGNORE INTO blacklist (id, reason, by_user, at, note) VALUES (?, ?, ?, ?, ?)')
+			.bind(userIdStr, reason, by, at, note)
 			.run();
 		const changed = result?.meta?.changes ?? result?.changes ?? 0;
 		if (!changed) {
-			// 已存在：把本次范围并进旧范围（例如先在 A 群 /ban，再 /spam 就升级为全局）。
-			const existing = await readD1BlacklistEntry(env, userIdStr);
-			const mergedScope = mergeBlacklistScopes(existing?.scopeGroups ?? null, scopeGroups);
-			const mergedValue = serializeBlacklistScope(mergedScope);
-			const previousValue = serializeBlacklistScope(existing?.scopeGroups ?? null);
-			if (mergedValue !== previousValue) {
-				await env.DB
-					.prepare('UPDATE blacklist SET scope_groups = ? WHERE id = ?')
-					.bind(mergedValue, userIdStr)
-					.run();
-				return {
-					success: false,
-					code: 'EXISTS',
-					scopeExpanded: true,
-					scopeGroups: mergedScope,
-					message: `⚠️ 该用户已在黑名单中，本次已把生效范围扩展为${describeBlacklistScope(mergedScope)}`
-				};
-			}
-			return {
-				success: false,
-				code: 'EXISTS',
-				scopeExpanded: false,
-				scopeGroups: existing?.scopeGroups ?? null,
-				message: '⚠️ 该用户已在黑名单中'
-			};
+			return { success: false, code: 'EXISTS', message: '⚠️ 该用户已在黑名单中' };
 		}
 
-		return {
-			success: true,
-			code: 'ADDED',
-			scopeGroups,
-			message: `✅ 已将用户 <code>${userId}</code> 添加到黑名单（${describeBlacklistScope(scopeGroups)}）`
-		};
+		return { success: true, code: 'ADDED', message: `✅ 已将用户 <code>${userId}</code> 添加到黑名单` };
 	} catch (error) {
 		console.error('添加黑名单时出错:', error);
 		return { success: false, code: 'ERROR', message: '❌ 添加黑名单失败: ' + error.message };
@@ -1846,67 +1370,15 @@ async function addToBlacklist(userId, env, options = {}) {
 }
 
 // 从黑名单中移除用户（核心实现）
-// options.scopeGroups：只解除这些群的范围（群管理员本群 /unban）。
-//   省略 = 整条删除（主人/副主人的全局 /unban）。
-//   目标记录是全局记录时，范围移除一律拒绝：全局语义不允许被"部分放行"偷偷破坏。
-async function removeFromBlacklistCore(userId, env, options = {}) {
+async function removeFromBlacklistCore(userId, env) {
 	if (!env.DB) {
 		return { success: false, code: 'NO_DB', message: '❌ 未绑定 D1 存储空间' };
 	}
 
 	const userIdStr = String(userId);
-	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
 
 	try {
 		await ensureD1Table(env);
-
-		if (scopeGroups !== null) {
-			const existing = await readD1BlacklistEntry(env, userIdStr);
-			if (!existing) {
-				return { success: false, code: 'NOT_FOUND', message: '⚠️ 该用户不在黑名单中' };
-			}
-			const next = removeGroupsFromBlacklistScope(existing.scopeGroups, scopeGroups);
-			if (next.global) {
-				return {
-					success: false,
-					code: 'GLOBAL_SCOPE',
-					entry: existing,
-					message: '⛔ 该记录是<b>全局黑名单</b>（由 /spam 写入），不能只解除单个群。请联系主人、副主人或超级管理员执行全局 <code>/unban</code>。'
-				};
-			}
-			if (!next.changed) {
-				return {
-					success: false,
-					code: 'SCOPE_MISS',
-					entry: existing,
-					message: '⚠️ 该用户的黑名单记录不包含本群，本群无需解除。'
-				};
-			}
-			if (next.emptied) {
-				const deleted = await env.DB.prepare('DELETE FROM blacklist WHERE id = ?').bind(userIdStr).run();
-				const removed = deleted?.meta?.changes ?? deleted?.changes ?? 0;
-				if (!removed) {
-					return { success: false, code: 'NOT_FOUND', message: '⚠️ 该用户不在黑名单中' };
-				}
-				return {
-					success: true,
-					code: 'REMOVED',
-					scopeEmptied: true,
-					message: `✅ 已解除本群限制，且该用户已无其它生效群，黑名单记录已删除`
-				};
-			}
-			await env.DB
-				.prepare('UPDATE blacklist SET scope_groups = ? WHERE id = ?')
-				.bind(serializeBlacklistScope(next.scope), userIdStr)
-				.run();
-			return {
-				success: true,
-				code: 'SCOPE_REDUCED',
-				scopeGroups: next.scope,
-				message: `✅ 已解除本群限制；该记录仍在其它群生效（${describeBlacklistScope(next.scope)}）`
-			};
-		}
-
 		const result = await env.DB
 			.prepare('DELETE FROM blacklist WHERE id = ?')
 			.bind(userIdStr)
@@ -1924,133 +1396,18 @@ async function removeFromBlacklistCore(userId, env, options = {}) {
 }
 
 // 从黑名单中移除用户（薄包装）
-async function removeFromBlacklist(userId, env, options = {}) {
-	const result = await removeFromBlacklistCore(userId, env, options);
+async function removeFromBlacklist(userId, env) {
+	const result = await removeFromBlacklistCore(userId, env);
 	return result;
 }
 
-// ===== 销号清理功能 =====
-// 通过 getChat 判断 Telegram 用户是否已销号。
-// 返回: { status: 'alive'|'deleted'|'error', details?: string }
-// - alive: 用户存在
-// - deleted: 用户已销号（user is deleted / account was deactivated）
-// - error: 查询失败（网络问题、权限不足等）
-async function checkTelegramUserExists(env, userId) {
-	const id = String(userId ?? '').trim();
-	if (!id) return { status: 'error', details: 'TGID 为空' };
-	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ chat_id: id }),
-		});
-		const data = await response.json();
-		if (response.ok && data?.ok && data.result) {
-			return { status: 'alive', details: data.result.first_name || data.result.title || data.result.username || '' };
-		}
-		// 解析错误信息判断是否销号
-		const desc = String(data?.description || '').toLowerCase();
-		const errorCode = data?.error_code;
-		// 400 + "user is deleted" / "account was deactivated" / "USER_DEACTIVAT" → 已销号
-		if (errorCode === 400 && (desc.includes('user is deleted') || desc.includes('account was deactivated') || desc.includes('user_deactivat'))) {
-			return { status: 'deleted', details: data.description || 'user is deleted' };
-		}
-		// 400 + "chat not found" 可能是销号或从未存在
-		if (errorCode === 400 && desc.includes('chat not found')) {
-			return { status: 'deleted', details: data.description || 'chat not found' };
-		}
-		// 403 + "bot was blocked by the user" → 用户存在但拉黑了 bot
-		if (errorCode === 403 && desc.includes('bot was blocked')) {
-			return { status: 'alive', details: 'bot was blocked (user exists)' };
-		}
-		// 其他错误（网络、限流等）
-		return { status: 'error', details: data.description || `HTTP ${response.status}` };
-	} catch (error) {
-		return { status: 'error', details: error.message || 'fetch failed' };
-	}
-}
-
-// 清理黑名单中已销号的 Telegram 账号。
-// 逐条调 getChat 判断是否已销号，命中则从黑名单删除。
-// 限流：每条之间间隔 200ms，避免 Telegram API 限流（30 次/秒）。
-// 返回统计结果供调用方展示。
-async function cleanDeletedAccountsFromBlacklist(env) {
-	const result = {
-		total: 0,
-		cleaned: 0,
-		failed: 0,
-		alive: 0,
-		cleanedIds: [],
-		failedIds: [],
-	};
-
-	if (!env.DB) {
-		console.error('[销号清理] 未绑定 D1');
-		return result;
-	}
-
-	// 获取全部黑名单用户（只取 id）
-	let blacklist;
-	try {
-		await ensureD1Table(env);
-		const { results } = await env.DB.prepare('SELECT id FROM blacklist ORDER BY id ASC').all();
-		blacklist = (results || []).map((r) => String(r.id)).filter(Boolean);
-	} catch (error) {
-		console.error('[销号清理] 读取黑名单失败:', error.message);
-		return result;
-	}
-
-	result.total = blacklist.length;
-	if (blacklist.length === 0) {
-		console.log('[销号清理] 黑名单为空，无需清理');
-		return result;
-	}
-
-	console.log(`[销号清理] 开始检测 ${blacklist.length} 个黑名单用户`);
-
-	// 逐条检测，带限流
-	for (const id of blacklist) {
-		const check = await checkTelegramUserExists(env, id);
-		if (check.status === 'deleted') {
-			// 已销号，从黑名单删除
-			try {
-				await env.DB.prepare('DELETE FROM blacklist WHERE id = ?').bind(id).run();
-				result.cleaned++;
-				result.cleanedIds.push(id);
-				console.log(`[销号清理] 已清理销号用户: ${id} (${check.details})`);
-			} catch (error) {
-				result.failed++;
-				result.failedIds.push(id);
-				console.error(`[销号清理] 删除失败: ${id} - ${error.message}`);
-			}
-		} else if (check.status === 'alive') {
-			result.alive++;
-			console.log(`[销号清理] 用户存活: ${id} (${check.details})`);
-		} else {
-			// 查询失败，不删除，记录到 failedIds
-			result.failed++;
-			result.failedIds.push(id);
-			console.error(`[销号清理] 检测失败: ${id} - ${check.details}`);
-		}
-
-		// 限流：每条之间间隔 200ms
-		await new Promise((resolve) => setTimeout(resolve, 200));
-	}
-
-	console.log(`[销号清理] 完成: 总计 ${result.total}, 清理 ${result.cleaned}, 失败 ${result.failed}, 存活 ${result.alive}`);
-	return result;
-}
-
-// 对指定群列表执行 Telegram 封禁/预封，逐群结果数组返回。
+// 对目标用户执行所有配置群的 Telegram 封禁/预封，逐群结果数组返回。
 // 用户在群内时 banChatMember 会把人移出并封禁；用户不在群内但 Telegram 可识别时，会加入群封禁列表（预封）。
 // bot 不在群 / 没权限 / Telegram 无法识别用户时，单群失败不影响其它群；串行避免 Telegram API 限流。
 // 返回 [{ groupId, userId, ok, error, memberProbe }]
-async function banUserFromGroups(userId, groupIds, options = {}) {
+async function banUserFromAllGroups(userId, options = {}) {
 	const results = [];
-	const targets = (Array.isArray(groupIds) ? groupIds : [groupIds])
-		.map((id) => String(id ?? '').trim())
-		.filter(Boolean);
-	for (const groupId of targets) {
+	for (const groupId of GROUP_IDS) {
 		const memberProbe = options.probeMembership
 			? await probeTargetMemberBeforeBan(groupId, userId)
 			: null;
@@ -2060,84 +1417,12 @@ async function banUserFromGroups(userId, groupIds, options = {}) {
 	return results;
 }
 
-// 检测 bot 是否在指定群里（通过 getChat 判断）。
-// 返回: { inGroup: boolean, details?: string }
-async function checkBotInGroup(env, groupId) {
-	if (!env.DB) return { inGroup: false, details: '未绑定 D1' };
-	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ chat_id: groupId }),
-		});
-		const result = await response.json();
-		if (response.ok && result?.ok && result.result) {
-			return { inGroup: true, details: result.result.title || result.result.username || '' };
-		}
-		const desc = String(result?.description || '').toLowerCase();
-		if (desc.includes('bot is not a member') || desc.includes('chat not found')) {
-			return { inGroup: false, details: result?.description || 'bot 不在该群' };
-		}
-		return { inGroup: false, details: result?.description || `HTTP ${response.status}` };
-	} catch (error) {
-		return { inGroup: false, details: error.message || 'fetch failed' };
-	}
-}
-
-// 过滤出 bot 仍在的群组。
-// 输入: groupIds 数组
-// 输出: { accessible: string[], inaccessible: { groupId, reason }[] }
-async function filterGroupsBotIsIn(env, groupIds) {
-	const accessible = [];
-	const inaccessible = [];
-	for (const groupId of groupIds) {
-		const id = String(groupId ?? '').trim();
-		if (!id) continue;
-		const check = await checkBotInGroup(env, id);
-		if (check.inGroup) {
-			accessible.push(id);
-		} else {
-			inaccessible.push({ groupId: id, reason: check.details });
-		}
-		// 限流：每条检测间隔 200ms
-		await new Promise((resolve) => setTimeout(resolve, 200));
-	}
-	return { accessible, inaccessible };
-}
-
-// 全群封禁：只有真人 /spam（以及主人私聊 /ban 的全局通道）才使用。
-// 先过滤掉 bot 不在的群组，避免无效尝试。
-async function banUserFromAllGroups(userId, options = {}) {
-	// 从 options 中获取 env（由调用方传入）
-	const envRef = options._env;
-	if (envRef?.DB && options.filterBotGroups !== false) {
-		const { accessible, inaccessible } = await filterGroupsBotIsIn(envRef, GROUP_IDS);
-		if (inaccessible.length > 0) {
-			console.log(`[封禁] bot 不在 ${inaccessible.length} 个群中，已跳过: ${inaccessible.map((i) => i.groupId).join(', ')}`);
-		}
-		if (accessible.length === 0) {
-			return inaccessible.map((i) => ({
-				groupId: i.groupId,
-				userId: String(userId),
-				ok: false,
-				error: `bot 不在该群: ${i.reason}`,
-				skipped: true,
-			}));
-		}
-		return banUserFromGroups(userId, accessible, options);
-	}
-	return banUserFromGroups(userId, GROUP_IDS, options);
-}
-
-// 把用户从指定群列表解除 Telegram 原生/手动封禁，逐群结果数组返回。
-// 调用方必须先确认目标在这些群不再受 D1 黑名单约束；管理层命中 D1 时应先成功移除/收窄记录。
+// 把用户从所有配置群解除 Telegram 原生/手动封禁，逐群结果数组返回。
+// 调用方必须先确认目标不在 D1 黑名单；管理层命中 D1 时应先成功移除记录。
 // 本函数本身不修改 D1，也绝不调用封禁接口。
-async function unbanUserFromGroups(userId, groupIds) {
+async function unbanUserFromAllGroups(userId) {
 	const results = [];
-	const targets = (Array.isArray(groupIds) ? groupIds : [groupIds])
-		.map((id) => String(id ?? '').trim())
-		.filter(Boolean);
-	for (const groupId of targets) {
+	for (const groupId of GROUP_IDS) {
 		try {
 			const r = await unbanUser(userId, groupId);
 			results.push({
@@ -2151,27 +1436,6 @@ async function unbanUserFromGroups(userId, groupIds) {
 		}
 	}
 	return results;
-}
-
-async function unbanUserFromAllGroups(userId, options = {}) {
-	const envRef = options._env;
-	if (envRef?.DB && options.filterBotGroups !== false) {
-		const { accessible, inaccessible } = await filterGroupsBotIsIn(envRef, GROUP_IDS);
-		if (inaccessible.length > 0) {
-			console.log(`[解封] bot 不在 ${inaccessible.length} 个群中，已跳过: ${inaccessible.map((i) => i.groupId).join(', ')}`);
-		}
-		if (accessible.length === 0) {
-			return inaccessible.map((i) => ({
-				groupId: i.groupId,
-				userId: String(userId),
-				ok: false,
-				error: `bot 不在该群: ${i.reason}`,
-				skipped: true,
-			}));
-		}
-		return unbanUserFromGroups(userId, accessible);
-	}
-	return unbanUserFromGroups(userId, GROUP_IDS);
 }
 
 // 渲染单个用户多群踢人结果为简短 HTML 文案
@@ -2554,9 +1818,7 @@ async function checkMessageOperatorIsAdmin(message, userId) {
 }
 
 function isOwner(id) {
-	const result = OWNER_IDS.length > 0 && OWNER_IDS.includes(String(id || ''));
-	console.log(`[权限检查] isOwner(${id}) => ${result}, OWNER_IDS=${JSON.stringify(OWNER_IDS)}`);
-	return result;
+	return OWNER_IDS.length > 0 && OWNER_IDS.includes(String(id || ''));
 }
 
 function isPrimaryOwner(id) {
@@ -2568,11 +1830,11 @@ function isSecondaryOwner(id) {
 	return OWNER_IDS.length > 1 && OWNER_IDS.slice(1).includes(idStr);
 }
 
-// 高级管理员：主人、副主人。
-// 这两类角色保留原有全部管理命令和跨群操作权限。
+// 高级管理员：主人、副主人、SUPER_ADMINS。
+// 这三类角色保留原有全部管理命令和跨群操作权限。
 function isPrivilegedManager(userId) {
 	const idStr = String(userId || '');
-	return isOwner(idStr);
+	return isOwner(idStr) || isSuperAdmin(idStr);
 }
 
 // 只检查用户是否为“指定当前群”的 Telegram 管理员。
@@ -2608,16 +1870,21 @@ async function checkIfUserIsAdminInGroup(userId, groupId) {
 
 // /ban、/spam 专用权限：
 // - 主人/副主人/超级管理员保持原权限；
-// - 额外管理员（/add_mod 添加）可使用 /ban 和 /spam；
 // - 匿名管理员仅能在其当前配置群使用；
+// - /add_ad_admin 添加的广告发起白名单成员可在当前配置群使用；
 // - 普通 Telegram 管理员必须是当前发令群的管理员，私聊不放行。
-async function checkMessageOperatorCanBan(message, userId, env = null) {
+async function checkMessageOperatorCanBan(message, userId, env) {
 	if (isPrivilegedManager(userId)) return true;
-	// 额外管理员（/add_mod 添加的非管理员用户）
-	if (env && (await isModerationAdmin(env, userId))) return true;
 	if (isAnonymousAdminMessage(message)) {
 		console.log(`[当前群鉴权] 匿名管理员在群 ${message.chat.id} 使用封禁命令 ✅`);
 		return true;
+	}
+	// /add_ad_admin 白名单成员可使用 /ban /spam（需在配置群内）
+	if (env && message?.chat?.type !== 'private' && isConfiguredGroup(message?.chat?.id)) {
+		if (await isAdVoteAllowlisted(env, userId)) {
+			console.log(`[当前群鉴权] 广告发起白名单成员 ${userId} 在群 ${message.chat.id} 使用封禁命令 ✅`);
+			return true;
+		}
 	}
 	if (message?.chat?.type === 'private') return false;
 	return checkIfUserIsAdminInGroup(userId, message?.chat?.id);
@@ -2656,12 +1923,13 @@ async function notifyAllOwners(text, excludeId, includeSecondaryOwners = false) 
 	);
 }
 
-// 判定操作人角色,返回中文标签:主人 / 群管理员
-// 主人优先级最高;其余按调用方传入的兜底标签(默认"管理员")
+// 判定操作人角色,返回中文标签:主人 / 超级管理员 / 群管理员
+// 主人优先级最高;主人之外的 SUPER_ADMINS 是"超级管理员";其余按调用方传入的兜底标签(默认"管理员")
 function classifyOperatorRole(userId, fallback = '管理员') {
 	const idStr = String(userId || '');
 	if (isPrimaryOwner(idStr)) return '主人';
 	if (isSecondaryOwner(idStr)) return '副主人';
+	if (isSuperAdmin(idStr)) return '超级管理员';
 	return fallback;
 }
 
@@ -2788,10 +2056,11 @@ async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, no
 		await sendFlashMessage(chatId, flashText, ctx);
 	}
 	if (targets.length) {
+		const chatTitle = message.chat?.title ? `${message.chat.title}（<code>${escapeHtml(String(chatId))}</code>）` : `<code>${escapeHtml(String(chatId))}</code>`;
 		await mapWithConcurrency(targets, BATCH_USER_PROFILE_CONCURRENCY, async (oid) => {
 			const auditText = (triggerIdStr === oid)
-				? `🔔 <b>主人操作通知</b>\n👤 操作人:${operator}（你自己）\n📍 来源:群内\n\n${detailText}`
-				: renderAuditNotification(operator, detailText, '群内', classifyMessageOperatorRole(message, '群管理员'));
+				? `🔔 <b>主人操作通知</b>\n👤 操作人:${operator}（你自己）\n📍 来源:${chatTitle}\n\n${detailText}`
+				: renderAuditNotification(operator, detailText, chatTitle, classifyMessageOperatorRole(message, '群管理员'));
 			const result = await sendTelegramMessageChunks(oid, auditText, replyMarkup);
 			if (!result?.ok) console.error(`[审计通知] 私聊主人${oid}失败:${result?.description || result?.error || '未知'}`);
 		});
@@ -2844,10 +2113,8 @@ function chunkBatchItems(items, size = D1_BATCH_MUTATION_SIZE) {
 }
 
 // 批量添加：每 20 个 TGID 一条多行 SQL；RETURNING 精确区分新增与已存在。
-// options.scopeGroups：本批记录的生效群范围（null = 全局，仅 /spam 批量走这里）。
-// 已存在的记录不改 reason/note，但会把本次范围并入旧范围（范围只放大不收窄）。
 async function addManyToBlacklist(ids, env, options = {}) {
-	const results = { success: [], exists: [], failed: [], scopeExpanded: [] };
+	const results = { success: [], exists: [], failed: [] };
 	const uniqueIds = normalizeBatchMutationIds(ids);
 	if (!env.DB) {
 		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间' })));
@@ -2860,15 +2127,13 @@ async function addManyToBlacklist(ids, env, options = {}) {
 	const by = options.by != null ? String(options.by) : null;
 	const note = normalizeActionNote(options.note) || null;
 	const at = new Date().toISOString();
-	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
-	const scopeValue = serializeBlacklistScope(scopeGroups);
 
-	for (const chunk of chunkBatchItems(uniqueIds, D1_BLACKLIST_INSERT_BATCH_SIZE)) {
+	for (const chunk of chunkBatchItems(uniqueIds)) {
 		try {
-			const valuesSql = chunk.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
-			const params = chunk.flatMap((id) => [id, reason, by, at, note, scopeValue]);
+			const valuesSql = chunk.map(() => '(?, ?, ?, ?, ?)').join(', ');
+			const params = chunk.flatMap((id) => [id, reason, by, at, note]);
 			const response = await env.DB
-				.prepare(`INSERT OR IGNORE INTO blacklist (id, reason, by_user, at, note, scope_groups) VALUES ${valuesSql} RETURNING id`)
+				.prepare(`INSERT OR IGNORE INTO blacklist (id, reason, by_user, at, note) VALUES ${valuesSql} RETURNING id`)
 				.bind(...params)
 				.all();
 			const inserted = new Set((response?.results || []).map((row) => String(row.id)));
@@ -2881,62 +2146,15 @@ async function addManyToBlacklist(ids, env, options = {}) {
 			results.failed.push(...chunk.map((id) => ({ id, msg: `❌ 添加黑名单失败: ${error.message || error}` })));
 		}
 	}
-
-	if (results.exists.length > 0) {
-		const expanded = await expandManyBlacklistScopes(results.exists, env, scopeGroups);
-		results.scopeExpanded = expanded;
-	}
 	return results;
-}
-
-// 把一批已存在记录的生效范围并入 scopeGroups；返回真正被扩大的 TGID 列表。
-// scopeGroups = null（全局）时一条 UPDATE 就能把整批升级为全局，无需逐条读。
-async function expandManyBlacklistScopes(ids, env, scopeGroups) {
-	const uniqueIds = normalizeBatchMutationIds(ids);
-	if (uniqueIds.length === 0) return [];
-	const expanded = [];
-	for (const chunk of chunkBatchItems(uniqueIds)) {
-		const placeholders = chunk.map(() => '?').join(', ');
-		try {
-			if (scopeGroups === null) {
-				const response = await env.DB
-					.prepare(`UPDATE blacklist SET scope_groups = NULL WHERE id IN (${placeholders}) AND scope_groups IS NOT NULL RETURNING id`)
-					.bind(...chunk)
-					.all();
-				expanded.push(...(response?.results || []).map((row) => String(row.id)));
-				continue;
-			}
-			const current = await env.DB
-				.prepare(`SELECT id, scope_groups FROM blacklist WHERE id IN (${placeholders})`)
-				.bind(...chunk)
-				.all();
-			for (const row of current?.results || []) {
-				const id = String(row.id);
-				const previous = normalizeBlacklistScope(row.scope_groups ?? null);
-				const merged = mergeBlacklistScopes(previous, scopeGroups);
-				const mergedValue = serializeBlacklistScope(merged);
-				if (mergedValue === serializeBlacklistScope(previous)) continue;
-				await env.DB
-					.prepare('UPDATE blacklist SET scope_groups = ? WHERE id = ?')
-					.bind(mergedValue, id)
-					.run();
-				expanded.push(id);
-			}
-		} catch (error) {
-			console.error('批量扩展黑名单生效范围时出错:', error);
-		}
-	}
-	return expanded;
 }
 
 // 批量 /unban 资格检查：
 // - 普通权限只读检查，D1 命中即拒绝；
 // - 第一主人、副主人、超级管理员可显式传 allowD1Removal，先移除 D1 再允许 Telegram 解封。
-// - options.scopeGroups：群管理员本群解封。只判定/只解除这些群的范围；
-//   记录本来就不覆盖这些群 → 视为无阻碍；记录是全局（/spam 写入）→ 一律拒绝，落入 globalScoped。
 // 查询或移除失败时严格拒绝对应目标，任何分支都不调用 Telegram 封禁接口。
 async function checkManyUnbanEligibility(ids, env, options = {}) {
-	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [], d1RemovalFailed: [], globalScoped: [] };
+	const results = { eligible: [], blacklisted: [], failed: [], d1Removed: [], d1RemovalFailed: [] };
 	const uniqueIds = normalizeBatchMutationIds(ids);
 	if (!env.DB) {
 		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间，无法确认解封资格' })));
@@ -2951,30 +2169,17 @@ async function checkManyUnbanEligibility(ids, env, options = {}) {
 		return results;
 	}
 
-	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
-
 	for (const chunk of chunkBatchItems(uniqueIds)) {
 		try {
 			const placeholders = chunk.map(() => '?').join(', ');
 			const response = await env.DB
-				.prepare(`SELECT id, scope_groups FROM blacklist WHERE id IN (${placeholders})`)
+				.prepare(`SELECT id FROM blacklist WHERE id IN (${placeholders})`)
 				.bind(...chunk)
 				.all();
-			const rows = new Map(
-				(response?.results || []).map((row) => [String(row.id), normalizeBlacklistScope(row.scope_groups ?? null)])
-			);
+			const blocked = new Set((response?.results || []).map((row) => String(row.id)));
 			for (const id of chunk) {
-				if (!rows.has(id)) {
-					results.eligible.push(id);
-					continue;
-				}
-				const scope = rows.get(id);
-				// 本群解封场景：记录不覆盖本群 → 本群本来就没被这条记录封，不构成阻碍。
-				if (scopeGroups !== null && !scopeGroups.some((groupId) => blacklistScopeCoversGroup(scope, groupId))) {
-					results.eligible.push(id);
-					continue;
-				}
-				results.blacklisted.push(id);
+				if (blocked.has(id)) results.blacklisted.push(id);
+				else results.eligible.push(id);
 			}
 		} catch (error) {
 			console.error('批量检查 /unban D1 资格时出错:', error);
@@ -2985,14 +2190,12 @@ async function checkManyUnbanEligibility(ids, env, options = {}) {
 		return results;
 	}
 
-	const removal = await removeManyFromBlacklist(results.blacklisted, env, { scopeGroups });
+	const removal = await removeManyFromBlacklist(results.blacklisted, env);
 	const eligibleSet = new Set([...results.eligible, ...removal.success, ...removal.notFound]);
 	results.d1Removed = [...removal.success];
 	results.d1RemovalFailed = removal.failed.map((item) => String(item.id));
 	results.eligible = uniqueIds.filter((id) => eligibleSet.has(id));
-	results.globalScoped = [...removal.globalScoped];
-	// 全局记录在本群解封场景下仍然是"被封"状态，必须留在 blacklisted 里被拒绝。
-	results.blacklisted = [...removal.globalScoped];
+	results.blacklisted = [];
 	for (const failure of removal.failed) {
 		results.failed.push({
 			id: String(failure.id),
@@ -3003,11 +2206,8 @@ async function checkManyUnbanEligibility(ids, env, options = {}) {
 }
 
 // 批量移除：每 20 个 TGID 一条 DELETE ... RETURNING，无需逐条预查询。
-// options.scopeGroups：只解除这些群的生效范围（群管理员本群 /unban）。
-//   范围清空 → 整条删除并计入 success；仍有其它群 → 收窄并计入 success（本群已放行）；
-//   记录是全局 → 计入 globalScoped 并拒绝，绝不把全局封禁悄悄降级。
-async function removeManyFromBlacklist(ids, env, options = {}) {
-	const results = { success: [], notFound: [], failed: [], globalScoped: [], scopeReduced: [] };
+async function removeManyFromBlacklist(ids, env) {
+	const results = { success: [], notFound: [], failed: [] };
 	const uniqueIds = normalizeBatchMutationIds(ids);
 	if (!env.DB) {
 		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间' })));
@@ -3016,49 +2216,9 @@ async function removeManyFromBlacklist(ids, env, options = {}) {
 	if (uniqueIds.length === 0) return results;
 
 	await ensureD1Table(env);
-	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
-
 	for (const chunk of chunkBatchItems(uniqueIds)) {
 		try {
 			const placeholders = chunk.map(() => '?').join(', ');
-
-			if (scopeGroups !== null) {
-				const current = await env.DB
-					.prepare(`SELECT id, scope_groups FROM blacklist WHERE id IN (${placeholders})`)
-					.bind(...chunk)
-					.all();
-				const rows = new Map(
-					(current?.results || []).map((row) => [String(row.id), normalizeBlacklistScope(row.scope_groups ?? null)])
-				);
-				for (const id of chunk) {
-					if (!rows.has(id)) {
-						results.notFound.push(id);
-						continue;
-					}
-					const next = removeGroupsFromBlacklistScope(rows.get(id), scopeGroups);
-					if (next.global) {
-						results.globalScoped.push(id);
-						continue;
-					}
-					if (!next.changed) {
-						results.notFound.push(id);
-						continue;
-					}
-					if (next.emptied) {
-						await env.DB.prepare('DELETE FROM blacklist WHERE id = ?').bind(id).run();
-						results.success.push(id);
-						continue;
-					}
-					await env.DB
-						.prepare('UPDATE blacklist SET scope_groups = ? WHERE id = ?')
-						.bind(serializeBlacklistScope(next.scope), id)
-						.run();
-					results.success.push(id);
-					results.scopeReduced.push(id);
-				}
-				continue;
-			}
-
 			const response = await env.DB
 				.prepare(`DELETE FROM blacklist WHERE id IN (${placeholders}) RETURNING id`)
 				.bind(...chunk)
@@ -3128,18 +2288,13 @@ function renderBatchUnbanEligibilityResult(results, invalid, userProfiles = null
 
 	lines.push('', '<b>详情</b>:');
 	const removedIds = new Set(results.d1Removed || []);
-	const globalScopedIds = new Set((results.globalScoped || []).map((id) => String(id)));
 	for (const id of results.eligible) {
 		const status = removedIds.has(id)
-			? 'D1 黑名单记录已移除/收窄，可执行群解封'
-			: '不在 D1 黑名单（或本群不在生效范围），可执行群解封';
+			? 'D1 黑名单记录已移除，可执行群解封'
+			: '不在 D1 黑名单，可执行群解封';
 		lines.push(`✅ ${formatBatchUserTarget(id, userProfiles)} ${status}`);
 	}
-	for (const id of results.blacklisted) {
-		lines.push(globalScopedIds.has(String(id))
-			? `⛔ ${formatBatchUserTarget(id, userProfiles)} 全局黑名单（/spam 写入），本群无法单独解封，需主人层全局 /unban`
-			: `⛔ ${formatBatchUserTarget(id, userProfiles)} 在 D1 黑名单，拒绝解封（记录已保留）`);
-	}
+	for (const id of results.blacklisted) lines.push(`⛔ ${formatBatchUserTarget(id, userProfiles)} 在 D1 黑名单，拒绝解封（记录已保留）`);
 	for (const id of invalid) lines.push(`❌ <code>${escapeHtml(id)}</code> 格式错误`);
 	for (const f of results.failed) lines.push(`❌ ${formatBatchUserTarget(f.id, userProfiles)} ${escapeHtml(f.msg)}`);
 
@@ -3272,7 +2427,7 @@ function estimateBulkTaskSubrequests(userCount, groupCount, options = {}) {
 	const profileRequests = options.probeMembership === true && users === 1 ? groups : users;
 	const telegramMutationAttempts = 2 * operations;
 	const groupInfoRequests = groups;
-	const d1MutationBatches = Math.ceil(users / D1_BLACKLIST_INSERT_BATCH_SIZE);
+	const d1MutationBatches = Math.ceil(users / D1_BATCH_MUTATION_SIZE);
 	return {
 		fixedReserve: BULK_TASK_FIXED_SUBREQUEST_RESERVE,
 		authorizationRequests,
@@ -3312,14 +2467,10 @@ function estimateBulkAuthorizationRequests(message) {
 	return message?.chat?.type !== 'private' && isConfiguredGroup(message?.chat?.id) ? 1 : 0;
 }
 
-// options.scopeGroups：本任务的生效群范围。null = 全局（/spam、私聊 /ban、全局 /unban）；
-//   数组 = 只在这些群写入 D1 范围并只对这些群执行 Telegram 操作（群内 /ban、群管理员本群 /unban）。
-function createBulkJobPayload(action, ids, invalid, note, message, options = {}) {
+function createBulkJobPayload(action, ids, invalid, note, message) {
 	const now = new Date().toISOString();
 	const operator = formatMessageActorMention(message);
-	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
-	// 范围内的群才是本任务真正要操作的群：估算、切片、回执统计全部据此对齐。
-	const groupIds = resolveScopeTargetGroupIds(scopeGroups).map((id) => String(id));
+	const groupIds = GROUP_IDS.map((id) => String(id));
 	const normalizedAction = normalizeBulkJobAction(action);
 	const isUnban = normalizedAction === 'unban';
 	const budget = shouldUseBulkQueue(ids.length, groupIds.length, {
@@ -3337,12 +2488,8 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 		invalid: (invalid || []).map((id) => String(id)),
 		note: normalizeActionNote(note),
 		groupIds,
-		// scopeGroups 随任务持久化：Queue 续跑时不再依赖创建时的命令上下文。
-		scopeGroups: scopeGroups ? [...scopeGroups] : null,
 		createdBy: getMessageActorId(message),
-		// 范围解封（群管理员本群 /unban）也需要写 D1：把本群从范围里摘掉。
-		// 全局记录仍会被 removeManyFromBlacklist 挡在 globalScoped 里，不会被降级。
-		unbanAllowD1Removal: isUnban && (isPrivilegedManager(getMessageActorId(message)) || scopeGroups !== null),
+		unbanAllowD1Removal: isUnban && isPrivilegedManager(getMessageActorId(message)),
 		operator,
 		operatorRole: classifyMessageOperatorRole(message, message.chat?.type === 'private' ? '管理员' : '群管理员'),
 		sourceChatId: String(message.chat?.id ?? ''),
@@ -3392,12 +2539,12 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 	return job;
 }
 
-async function createBulkJob(env, action, ids, invalid, note, message, options = {}) {
+async function createBulkJob(env, action, ids, invalid, note, message) {
 	if (!env.DB) {
 		throw new Error('大批量任务需要绑定 D1 存储空间');
 	}
 	await ensureD1Table(env);
-	const job = createBulkJobPayload(action, ids, invalid, note, message, options);
+	const job = createBulkJobPayload(action, ids, invalid, note, message);
 	await env.DB
 		.prepare('INSERT INTO batch_jobs (id, type, status, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
 		.bind(job.id, job.action, job.status, JSON.stringify(job), job.createdAt, job.updatedAt)
@@ -3417,9 +2564,6 @@ function pushBulkJobFailure(job, failure) {
 
 function formatBulkJobFailureLine(failure) {
 	const groupText = failure.groupId ? ` 群 <code>${escapeHtml(failure.groupId)}</code>` : '';
-	if (failure.phase === 'unban_blocked_global') {
-		return `⛔ <code>${escapeHtml(failure.userId || '')}</code>: 该记录是<b>全局黑名单</b>（/spam 写入），本群无法单独解封，需主人/副主人/超级管理员执行全局 <code>/unban</code>`;
-	}
 	if (failure.phase === 'unban_blocked') {
 		return `⛔ <code>${escapeHtml(failure.userId || '')}</code>: D1 黑名单拒绝解封，记录已保留，未调用 Telegram`;
 	}
@@ -3483,7 +2627,6 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 		...formatStoredBulkJobContext(job),
 		'',
 		`目标用户:${totalUsers}`,
-		`生效范围:${describeBlacklistScope(getBulkJobScopeGroups(job))}`,
 		`配置群数:${totalGroups}`,
 		`总操作数:${totalOps}`,
 		`已处理用户:${cursor}/${totalUsers} (${percent}%)`,
@@ -3561,7 +2704,7 @@ function getBulkJobPageIds(job, requestedPage) {
 	};
 }
 
-function formatBulkJobUserPage(job, requestedPage, profiles) {
+function formatBulkJobUserPage(job, requestedPage, profiles, options = {}) {
 	const pageInfo = getBulkJobPageIds(job, requestedPage);
 	const cursor = Math.max(0, Number(job?.cursor) || 0);
 	const failedUsers = new Set((job?.failures || []).map((failure) => String(failure.userId || '')).filter(Boolean));
@@ -3575,10 +2718,32 @@ function formatBulkJobUserPage(job, requestedPage, profiles) {
 			: '⏳ 待处理';
 		lines.push(`${absoluteIndex + 1}. ${formatBatchUserTarget(id, profiles)} — ${state}`);
 	});
-	if (pageInfo.pageCount > 1) {
+	// textPager=false 由按钮翻页路径传入：按钮已经承担翻页，再留一行文本提示就是两套并存。
+	if (pageInfo.pageCount > 1 && options.textPager !== false) {
 		lines.push('', `翻页:<code>/job ${escapeHtml(job.id)} ${pageInfo.page < pageInfo.pageCount ? pageInfo.page + 1 : 1}</code>`);
 	}
 	return lines.join('\n');
+}
+
+// /job 主人视角完整消息（任务详情 + 目标用户当页）。命令首发与按钮翻页共用，
+// 保证编辑后的排版与首发一字不差 —— 两处各写一份迟早会漂移。
+async function renderBulkJobOwnerView(env, job, requestedPage) {
+	const pageInfo = getBulkJobPageIds(job, requestedPage);
+	const profiles = await resolveBatchUserProfiles(pageInfo.ids, job.sourceChatId);
+	const keyboard = buildAdPaginationKeyboard(
+		AD_JOB_PAGINATION_PREFIX, pageInfo.page, pageInfo.pageCount, encodeAdCallbackToken(job.id)
+	);
+	const userPage = formatBulkJobUserPage(job, pageInfo.page, profiles, { textPager: !keyboard });
+	return {
+		text: `${formatBulkJobDetail(job, '📦 <b>批量任务状态</b>')}\n\n${userPage}`,
+		keyboard,
+		// 按钮挂不上（消息分块）时的兜底提示。keyboard 为空时 userPage 里已经带了文本翻页，
+		// 这里返回空串避免重复。
+		fallbackLine: keyboard && pageInfo.pageCount > 1
+			? `翻页:<code>/job ${escapeHtml(job.id)} ${pageInfo.page < pageInfo.pageCount ? pageInfo.page + 1 : 1}</code>`
+			: '',
+		pageInfo
+	};
 }
 
 async function notifyBulkJobTargets(job, detailText) {
@@ -3598,24 +2763,17 @@ function incrementBulkJobStat(job, key, amount = 1) {
 	job.stats[key] = (Number(job.stats[key]) || 0) + amount;
 }
 
-// 任务的生效群范围。旧任务（无 scopeGroups 字段）按全局解释，行为与改动前一致。
-function getBulkJobScopeGroups(job) {
-	return normalizeBlacklistScope(job?.scopeGroups ?? null);
-}
-
 async function performBulkJobD1Mutation(job, env, ids) {
 	let lastResults = null;
-	const scopeGroups = getBulkJobScopeGroups(job);
 	const allowD1Removal = job.unbanAllowD1Removal === true
 		|| (job.unbanAllowD1Removal == null && isPrivilegedManager(job.createdBy));
 	for (let attempt = 0; attempt <= BULK_TASK_D1_RETRY_LIMIT; attempt += 1) {
 		lastResults = job.action === 'unban'
-			? await checkManyUnbanEligibility(ids, env, { allowD1Removal, scopeGroups })
+			? await checkManyUnbanEligibility(ids, env, { allowD1Removal })
 			: await addManyToBlacklist(ids, env, {
 				reason: job.reason,
 				by: job.createdBy,
-				note: job.note,
-				scopeGroups
+				note: job.note
 			});
 		if (!lastResults.failed.length) return lastResults;
 		if (attempt < BULK_TASK_D1_RETRY_LIMIT) {
@@ -3654,12 +2812,10 @@ async function prepareBulkJobActiveBatch(job, env) {
 	if (isUnban) {
 		incrementBulkJobStat(job, 'unbanEligible', results.eligible.length);
 		incrementBulkJobStat(job, 'unbanBlacklisted', results.blacklisted.length);
-		const globalScoped = new Set((results.globalScoped || []).map((id) => String(id)));
 		for (const id of results.blacklisted) {
 			pushBulkJobFailure(job, {
 				userId: id,
-				// 本群解封遇到全局记录：单独标记，回执要说清"只有主人层能全局解封"。
-				phase: globalScoped.has(String(id)) ? 'unban_blocked_global' : 'unban_blocked'
+				phase: 'unban_blocked'
 			});
 		}
 	} else {
@@ -3898,11 +3054,7 @@ async function runBulkModerationJob(env, jobId, options = {}) {
 
 async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 	const { action, valid, invalid, note, isInGroup } = options;
-	// scopeGroups：null = 全局；数组 = 只操作这些群。预算估算必须按真实目标群数算，
-	// 否则群内 /ban 这种"1 个群"的任务会被按全群规模误判成需要排队。
-	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
-	const targetGroupIds = resolveScopeTargetGroupIds(scopeGroups);
-	const budget = shouldUseBulkQueue(valid.length, targetGroupIds.length, {
+	const budget = shouldUseBulkQueue(valid.length, GROUP_IDS.length, {
 		probeMembership: action !== 'unban' && valid.length === 1,
 		authorizationRequests: estimateBulkAuthorizationRequests(message)
 	});
@@ -3921,7 +3073,7 @@ async function startBulkModerationJobFromCommand(message, env, ctx, options) {
 		});
 		return true;
 	}
-	const job = await createBulkJob(env, action, valid, invalid, note, message, { scopeGroups });
+	const job = await createBulkJob(env, action, valid, invalid, note, message);
 	const autoQueueAvailable = Boolean(getBulkQueue(env));
 	if (!autoQueueAvailable) {
 		job.autoContinue = false;
@@ -4009,16 +3161,9 @@ async function handleExport(env, url) {
 			const s = v === null || v === undefined ? '' : String(v);
 			return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 		};
-		const lines = ['id,reason,scope_groups,by,at'];
+		const lines = ['id,reason,by,at'];
 		for (const e of sorted) {
-			const scope = normalizeBlacklistScope(e.scopeGroups ?? null);
-			lines.push([
-				csvEscape(e.id),
-				csvEscape(e.reason),
-				csvEscape(scope === null ? 'global' : scope.join('|')),
-				csvEscape(e.by),
-				csvEscape(e.at)
-			].join(','));
+			lines.push([csvEscape(e.id), csvEscape(e.reason), csvEscape(e.by), csvEscape(e.at)].join(','));
 		}
 		// UTF-8 BOM 让 Excel 自动识别中文不乱码
 		const body = '\uFEFF' + lines.join('\r\n');
@@ -4036,13 +3181,10 @@ async function handleExport(env, url) {
 	const reasonLabels = BLACKLIST_REASON_LABELS || {};
 	const rows = sorted.map((e, i) => {
 		const reasonText = e.reason ? (reasonLabels[e.reason] || e.reason) : '—';
-		const scope = normalizeBlacklistScope(e.scopeGroups ?? null);
-		const scopeText = scope === null ? '全局' : scope.join('、');
 		return `<tr>
 			<td class="num">${i + 1}</td>
 			<td class="id"><code>${escapeHtml(e.id)}</code></td>
 			<td>${escapeHtml(reasonText)}</td>
-			<td>${escapeHtml(scopeText)}</td>
 			<td>${e.by ? `<code>${escapeHtml(e.by)}</code>` : '—'}</td>
 			<td class="at">${escapeHtml(e.at || '—')}</td>
 		</tr>`;
@@ -4090,9 +3232,9 @@ async function handleExport(env, url) {
 	</div>
 	<div class="box">
 		${sorted.length === 0 ? '<div class="empty">黑名单为空</div>' : `
-		<div class="search"><input id="q" type="text" placeholder="🔍 输入 TGID / 原因 / 生效范围 / 操作人 过滤..." autocomplete="off"></div>
+		<div class="search"><input id="q" type="text" placeholder="🔍 输入 TGID / 原因 / 操作人 过滤..." autocomplete="off"></div>
 		<table>
-			<thead><tr><th>#</th><th>TGID</th><th>原因</th><th>生效范围</th><th>操作人</th><th>时间</th></tr></thead>
+			<thead><tr><th>#</th><th>TGID</th><th>原因</th><th>操作人</th><th>时间</th></tr></thead>
 			<tbody id="tb">${rows}</tbody>
 		</table>`}
 	</div>
@@ -4612,7 +3754,6 @@ async function handlePurge(env, url) {
 		next_url: nextCursor === null ? null : buildPurgeNextUrl(url, nextCursor, limit),
 		已踢出: 0,
 		不在群: 0,
-		范围外跳过: 0,
 		失败: 0,
 		详情: []
 	};
@@ -4646,11 +3787,6 @@ async function handlePurge(env, url) {
 				type: 'failed',
 				detail: { 游标: cursor, 群ID: groupId, 结果: '黑名单行不存在', 错误: '清扫期间黑名单发生变化，请从 cursor=0 重新开始' }
 			};
-		}
-
-		// 每条记录只在自己的生效范围内清扫：单群封禁的人不会被 /purge 顺手踢出其它群。
-		if (!blacklistScopeCoversGroup(entry.scopeGroups, groupId)) {
-			return { type: 'out_of_scope' };
 		}
 
 		let status = null;
@@ -4691,8 +3827,6 @@ async function handlePurge(env, url) {
 			summary.详情.push(result.detail);
 		} else if (result?.type === 'left') {
 			summary.不在群 += 1;
-		} else if (result?.type === 'out_of_scope') {
-			summary.范围外跳过 += 1;
 		} else {
 			summary.失败 += 1;
 			if (result?.detail) {
@@ -4819,6 +3953,7 @@ function renderBlacklistOperator(byId, usernames) {
 	let roleTag = '👤 群管理员';
 	if (isPrimaryOwner(raw)) roleTag = '👑 主人';
 	else if (isSecondaryOwner(raw)) roleTag = '👤 副主人';
+	else if (SUPER_ADMINS.includes(raw)) roleTag = '🛡️ 超级管理员';
 
 	// 有用户名就用纯文本 @xxx：Telegram 自动识别为用户链接，不受对方隐私设置影响。
 	// TGID 仍然照常给出，方便直接复制去 /check、/unban。
@@ -4859,11 +3994,6 @@ function renderBlacklist(blacklist, options = {}) {
 		if (entry.reason) {
 			block.push(`　　原因：${escapeHtml(reasonLabels[entry.reason] || entry.reason)}`);
 		}
-		// 生效范围：全局记录标「全局」，单群记录列出群 ID，便于一眼分辨跨群封禁与单群封禁。
-		const scopeGroups = normalizeBlacklistScope(entry.scopeGroups ?? null);
-		block.push(scopeGroups === null
-			? '　　范围：全局'
-			: `　　范围：${escapeHtml(scopeGroups.join('、'))}`);
 		if (entry.by) {
 			block.push(`　　操作人：${renderBlacklistOperator(entry.by, usernames)}`);
 		}
@@ -4945,7 +4075,11 @@ function isTelegramSlashCommand(text) {
 }
 
 // 判断给定 user_id 是否在超级管理员白名单内（按钮交互专用鉴权）
-
+function isSuperAdmin(userId) {
+	if (userId === undefined || userId === null) return false;
+	const idStr = String(userId);
+	return SUPER_ADMINS.some((id) => id === idStr);
+}
 
 // 清掉会让 Telegram 直接返回 400 的非法字符。
 // 旧实现是 replace(/[\uD800-\uDFFF]/g, '')，把【所有】代理对码元一律删除 —— 但合法的
@@ -4982,6 +4116,14 @@ function formatUserMention(user) {
 
 	const displayName = [user.first_name, user.last_name].filter(Boolean).join(' ') || user.username || user.id;
 	return `<a href="tg://user?id=${user.id}">${escapeHtml(displayName)}</a>`;
+}
+
+// 「有 user 对象就渲染 mention，否则退回可复制的纯 id」这个模式在本文件里反复出现
+// （formatAdVoteUser、批量结果渲染、回复学习回执都要它），统一收敛到这里。
+// user 可能为 undefined（Telegram 匿名管理员的 message.from 就没有可用身份），
+// 此时 formatUserMention 返回 null，走 id 兜底而不是把 'null' 拼进 HTML。
+function formatUserReference(id, user) {
+	return formatUserMention(user) || '<code>' + escapeHtml(String(id ?? '未知')) + '</code>';
 }
 
 function normalizeBatchUserDisplayName(user) {
@@ -5065,6 +4207,13 @@ async function resolvePermissionUserProfiles(ids) {
 	const wanted = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(Boolean))];
 	const wantedSet = new Set(wanted);
 	const profiles = new Map();
+
+	// 先用静态表填充兜底资料，后续 API 查到时会覆盖
+	for (const id of wanted) {
+		if (STATIC_USER_PROFILES[id]) {
+			profiles.set(id, { user: STATIC_USER_PROFILES[id], status: '', source: 'static', groupId: '' });
+		}
+	}
 
 	for (const groupId of GROUP_IDS) {
 		try {
@@ -5166,7 +4315,8 @@ function renderPermissionSection(title, ids, profiles) {
 async function renderPermissionAdminsList() {
 	const primaryOwner = OWNER_IDS.length ? [OWNER_IDS[0]] : [];
 	const secondaryOwners = OWNER_IDS.length > 1 ? OWNER_IDS.slice(1) : [];
-	const allIds = [...primaryOwner, ...secondaryOwners];
+	const superAdmins = SUPER_ADMINS || [];
+	const allIds = [...primaryOwner, ...secondaryOwners, ...superAdmins];
 	const profiles = await resolvePermissionUserProfiles(allIds);
 	const lines = [
 		'🔐 <b>权限名单</b>',
@@ -5254,8 +4404,6 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 	let localCheck = { isBlacklisted: false, entry: null };
 	let localBlacklistInfo = '';
 	if (options.env) {
-		// /check 是"查库"，不传 chatId：无论范围如何都要把记录展示出来，
-		// 生效范围单独一行呈现，让管理员能判断自己这个群到底受不受影响。
 		localCheck = await checkBlacklist(queryTgid, options.env);
 		if (localCheck.isBlacklisted) {
 			const entry = localCheck.entry;
@@ -5263,14 +4411,12 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 			const operator = await translateBlacklistOperator(entry?.by);
 			const addedAt = entry?.at || '未知';
 			const noteText = String(entry?.note || '').trim();
-			const scopeGroups = entry?.scopeGroups ?? null;
 			localBlacklistInfo = `\n🚫 <b>本地黑名单:在黑名单中</b>\n` +
 				`├ 加黑方式:${reason}\n`;
 			if (noteText) {
 				localBlacklistInfo += `├ 执行原因:${escapeHtml(noteText)}\n`;
 			}
-			localBlacklistInfo += `├ 生效范围:${escapeHtml(await describeBlacklistScopeWithTitles(scopeGroups))}\n` +
-				`├ 操作人:${operator}\n` +
+			localBlacklistInfo += `├ 操作人:${operator}\n` +
 				`└ 时间:${escapeHtml(addedAt)}\n`;
 		} else {
 			localBlacklistInfo = `\n✅ <b>本地黑名单:不在黑名单中</b>\n`;
@@ -5363,7 +4509,7 @@ async function buildBanlistCheckResponse(tgidToCheck, options = {}) {
 				text: '📋 点击复制 GKY 添加全局白名单代码',
 				copy_text: { text: `GKYbotSave\n${queryTgid}` }
 			}]);
-	}
+		}
 	}
 
 	if (localCheck.isBlacklisted) {
@@ -5519,88 +4665,10 @@ async function handleNewChatMemberBots(message) {
 // 对单个用户查一次 GKY 全局库(GKY_BANLIST_ENDPOINT)。命中(banned=true)→ 删/踢/加黑(reason:gky_global)+ 通知主人。
 // 精度极高:杀神在别的群已判定过的广告号,一进本群就被拦,不用猜消息内容。
 // 返回 true 表示已命中并处置(调用方可据此跳过后续)。异常/未命中 → false(绝不误伤)。
-async function checkGkyGlobalBanAndPunish(userId, chat, env, ctx, options = {}) {
-	if (!GKY_ACTIVE_CHECK) return false;
-	const userIdStr = String(userId);
-	if (!/^\d+$/.test(userIdStr)) return false;
-	try {
-		const raw = await handleBanlist(userIdStr);
-		const data = JSON.parse(raw);
-		if (!data || !data.success || !data.banned) return false;
 
-		// 命中全局库 → 处置。管理员豁免(防误伤配置群管理员)。
-		const isAdmin = await checkIfUserIsAdmin(userIdStr);
-		if (isAdmin) {
-			console.log(`[杀神全局库] 命中但为管理员,豁免: ${userIdStr}`);
-			return false;
-		}
 
-		console.log(`[杀神全局库] 命中: 用户=${userIdStr} 群=${chat?.id} 原因=${data.reason || '无'}`);
-		// 删除触发消息(如果有,进群消息本身也删掉)
-		if (options.messageId && chat?.id != null) {
-			await deleteMessage(chat.id, options.messageId);
-		}
-		// 杀神库与本项目 D1 黑名单是两套独立状态,默认【不合并】:
-		//   命中仍照常封禁/预封(保护群),但不写 D1 —— D1 的唯一来源仍是真人 /ban /spam /ad 投票。
-		//   第三方误标不会变成本项目的永久黑名单,也不会再触发"复入群拦截"重复通知。
-		//   显式设 GKY_SYNC_BLACKLIST=true 才并入 D1。
-		// 处置范围 = 命中的那个群：第三方数据只用于保护当前群，不做跨群连坐，
-		//   否则第三方误标会让一个正常用户同时失去全部私密群的入群资格。
-		const gkyScopeGroups = isConfiguredGroup(chat?.id) ? [String(chat.id)] : null;
-		let syncedToBlacklist = false;
-		if (GKY_SYNC_BLACKLIST) {
-			const addResult = await addToBlacklist(userIdStr, env, {
-				reason: 'gky_global',
-				by: 'system',
-				note: `杀神全局库命中${data.reason ? ':' + data.reason : ''}`,
-				scopeGroups: gkyScopeGroups,
-			});
-			syncedToBlacklist = addResult?.success === true || addResult?.code === 'EXISTS';
-		}
-		const banResults = await banUserFromGroups(userIdStr, resolveScopeTargetGroupIds(gkyScopeGroups));
-		// 通知主人
-		if (OWNER_IDS.length) {
-			const okCount = banResults.filter((r) => r.ok).length;
-			const target = options.user
-				? (formatUserMention(options.user) || `<code>${escapeHtml(userIdStr)}</code>`)
-				: `<code>${escapeHtml(userIdStr)}</code>`;
-			const scopeText = describeBlacklistScope(gkyScopeGroups);
-			const blacklistLine = GKY_SYNC_BLACKLIST
-				? `🚫 已加黑(gky_global) + 封禁 ${okCount}/${banResults.length}\n📍 生效范围:${escapeHtml(scopeText)}`
-				: `🚫 封禁/预封 ${okCount}/${banResults.length}（${escapeHtml(scopeText)}）\n`
-					+ `📂 未写入本地 D1 黑名单(杀神库独立记账)\n`
-					+ `ℹ️ 如确认是广告号需跨群永久加黑,请在群内 <code>/spam ${escapeHtml(userIdStr)}</code>`;
-			const auditText = `🌐 <b>杀神全局库命中处置</b>\n` +
-				`🎬 触发:${escapeHtml(options.trigger || '新成员进群')}\n` +
-				`🎯 用户:${target}\n` +
-				`📋 全局库原因:${escapeHtml(String(data.reason || '未提供'))}\n` +
-				blacklistLine;
-			await notifyAllOwners(auditText, null);
-		}
-		return true;
-	} catch (error) {
-		// 查询失败(网络/解析)→ 绝不误伤,静默放行
-		console.error(`[杀神全局库] 查询失败 用户=${userIdStr}:`, error.message || error);
-		return false;
-	}
-}
 
-// 新成员进群(真人)批量查杀神全局库。bot 由 handleNewChatMemberBots 单独处理,这里跳过 bot。
-async function handleNewMemberGkyCheck(message, env, ctx) {
-	if (!GKY_ACTIVE_CHECK) return;
-	const chat = message.chat;
-	const newMembers = message.new_chat_members;
-	if (!Array.isArray(newMembers) || newMembers.length === 0) return;
-	if (!chat || !isConfiguredGroup(chat.id)) return;
-	for (const member of newMembers) {
-		if (!member || member.is_bot) continue; // bot 交给 handleNewChatMemberBots
-		await checkGkyGlobalBanAndPunish(member.id, chat, env, ctx, {
-			user: member,
-			messageId: message.message_id,
-			trigger: '新成员进群'
-		});
-	}
-}
+
 
 // 处理 chat_member 事件：管理员手动封/解封时同步 D1 黑名单
 // 加黑：从其它状态 → kicked
@@ -5614,6 +4682,17 @@ async function handleChatMemberUpdate(chatMember, env) {
 	const fromUser = chatMember.from;
 
 	if (!chat || !oldMember || !newMember || !fromUser) return;
+
+	// 管理员身份一变，立刻清掉本群的管理员列表缓存（广告检测豁免用的那一份）。
+	// 放在这里而不是更下面：下面还有 isConfiguredGroup、is_bot、操作人自查等多个
+	// 提前 return，任何一个都会让缓存留着陈旧数据。这一步无副作用、无 IO，
+	// 早做没有代价，晚做会漏。
+	// 撤职同样要清 —— 否则被撤的人还能靠陈旧缓存继续免检 5 分钟。
+	if (oldMember.status !== newMember.status
+		&& (oldMember.status === 'administrator' || newMember.status === 'administrator'
+			|| oldMember.status === 'creator' || newMember.status === 'creator')) {
+		invalidateAdAdminCache(chat.id);
+	}
 
 	// 必须是配置群组
 	if (!isConfiguredGroup(chat.id)) return;
@@ -5638,9 +4717,7 @@ async function handleChatMemberUpdate(chatMember, env) {
 		oldStatusEarly !== 'administrator' &&
 		oldStatusEarly !== 'creator';
 	if (enteredGroup) {
-		// 只有"本群在该记录的生效范围内"才拦截：被单群封禁的人仍可自由加入其它配置群，
-		// 这正是需求 2 的目的 —— 误杀不再连带阻断私密群。
-		const blacklistCheck = await checkBlacklist(targetIdStr, env, { chatId: chat.id });
+		const blacklistCheck = await checkBlacklist(targetIdStr, env);
 		if (blacklistCheck.isBlacklisted) {
 			const banResult = await banUserFromGroup(chat.id, targetIdStr);
 			console.log('[chat_member] 黑名单用户复入群，立即踢回:', JSON.stringify({
@@ -5653,6 +4730,22 @@ async function handleChatMemberUpdate(chatMember, env) {
 			await notifyOwnerBlacklistIntercept(targetUser, chat, '复入群拦截', blacklistCheck, banResult);
 			return; // 已处理，不再走后面"管理员操作同步"分支
 		}
+
+		// 【方案 C 的第一个修复】不在黑名单，就当场做广告筛查（查 bio / 用户名 / 昵称）。
+		// 这是本次补的核心缺口：自己点邀请链接进群、加入请求被批准、unban 后自加回，
+		// Telegram 走的是 chat_member update，【不保证】同时发 new_chat_members
+		// service message —— 那种情况下 detectAdOnJoin 一次都不会执行。
+		// 而再往下第一个 return 就是「操作人 === 被操作人」：自己进群时 from 就是 target，
+		// 直接 return，简介里写满广告也不看一眼。所以必须拦在那一行之前。
+		const joinVerdict = await screenAdJoinMember(env, targetUser, {
+			chatId: String(chat.id),
+			chatTitle: chat.title || '',
+			messageId: null,					// chat_member update 没有消息可删
+			skipBlacklistCheck: true,			// 上面刚查过，别再查一遍 D1
+			source: 'chat_member'
+		});
+		// 已封禁的人后面那套「管理员操作同步」没有意义：他已经不在群里了。
+		if (joinVerdict === 'banned') return;
 	}
 
 	// 跳过：操作人是被操作用户本人（用户自愿 leave 不算管理员动作）
@@ -5676,16 +4769,15 @@ async function handleChatMemberUpdate(chatMember, env) {
 
 	if (newStatus === 'kicked') {
 		// 群内手动封禁（真人点 Telegram 封禁按钮 / 任何作为管理员的机器人执行封禁）一律【不再】同步进 D1 黑名单。
-		// D1 黑名单的唯一来源 = 真人管理员的 /ban、/spam 指令（含 /ban 123、/spam 123、引用消息 /spam）。
+		// D1 全局黑名单的唯一来源 = 真人管理员的 /ban、/spam 指令（含 /ban 123、/spam 123、引用消息 /spam）。
 		// 这里仅发审计通知告知主人群里发生了手动封禁；notifyOwnerChatMemberAction 内部已自动过滤机器人操作，机器人封禁不会打扰主人。
 		console.log('[chat_member] 群内手动封禁，按规则不同步加黑:', JSON.stringify(logCommon));
-		await notifyOwnerChatMemberAction(chatMember, '封禁（未写入 D1 黑名单）', oldStatus, newStatus);
+		await notifyOwnerChatMemberAction(chatMember, '封禁（未加入全局黑名单）', oldStatus, newStatus);
 	} else if (oldStatus === 'kicked') {
 		// 群内原生手动解封：D1 黑名单是权威封禁，禁止普通管理员经此绕过或清除。
-		// 管理层必须通过 /unban TGID 先移除/收窄 D1 再解封；该命令路径不会进入这里的封回逻辑。
+		// 管理层必须通过 /unban TGID 先移除 D1 再解封；该命令路径不会进入这里的封回逻辑。
 		// 普通管理员直接使用 Telegram 原生解封时，D1 仍在，因此继续由独立保护链封回。
-		// 仅当记录在【本群】生效时才封回：范围外的记录对本群没有约束力。
-		const blacklistCheck = await checkBlacklist(targetIdStr, env, { chatId: chat.id });
+		const blacklistCheck = await checkBlacklist(targetIdStr, env);
 		if (blacklistCheck.isBlacklisted) {
 			// 仍在 D1 黑名单 → 撤销本次群内手动解封，立即封回，绝不删除黑名单记录
 			const banResult = await banUserFromGroup(chat.id, targetIdStr);
@@ -5761,22 +4853,15 @@ async function notifyOwnerChatMemberAction(chatMember, action, oldStatus, newSta
 // ===== 广告自动检测 =====
 
 // 从 D1 读自定义广告词库(分类对象),空/出错返回 null
-// 把 D1 自定义词库 merge 到运行期模块级变量(在 detectAd 之前调用)
-// fetch 入口每请求已把 AD_KEYWORDS_* 重置为基线(DEFAULT 空 / 环境变量),这里 push 叠加安全
+
+
+
 // 新保存统一使用 spam 分类；旧 D1 data.sa 只读合并，避免历史词库失效。
-function normalizeAdKeywordsForSave(data) {
-	const normalized = data && typeof data === 'object' && !Array.isArray(data) ? { ...data } : {};
-	const mergedSpam = [
-		...(Array.isArray(normalized.sa) ? normalized.sa : []),
-		...(Array.isArray(normalized.spam) ? normalized.spam : []),
-	];
-	normalized.spam = [...new Set(mergedSpam.map((w) => String(w).toLowerCase()).filter(Boolean))];
-	delete normalized.sa;
-	return normalized;
-}
 
 // 把词库对象写回 D1
+
 // 读取 D1 词库,空则返回标准空结构(7 个分类)
+
 // ===== 广告学习样本(第一主人 /spam 上报 → 指纹入库 → 精准查杀)=====
 
 // 归一化:把文本"洗"成标准指纹,抓"加空格/标点/全半角"变体
@@ -5788,196 +4873,25 @@ function normalizeAdKeywordsForSave(data) {
 // 【关键取舍】不能无条件删掉所有空白/标点 —— 那会把相邻词拼起来造成误杀
 //   (如"今日 入门" → "今日入门" 会凭空命中"日入")。因此只处理"逐字分隔"这一种
 //   明确的混淆签名:连续 ≥3 个单字符、每个后面都跟一个分隔符。正常语句不会长这样。
-const INVISIBLE_SCAN_CHARS = /[\p{Cf}\u180e\ufe00-\ufe0f]/gu;
 // 逐字分隔签名:至少 3 个"单字符 + 单个分隔符"连续出现
-const SPACED_OUT_RUN = /(?:[\p{L}\p{N}][\s\p{P}\p{S}])(?:[\p{L}\p{N}][\s\p{P}\p{S}]){1,}[\p{L}\p{N}]/gu;
 
-function stripInvisibleScanChars(text) {
-	// 零宽/格式控制字符正常文本绝不会出现，可无条件删除，零误杀风险。
-	try {
-		return String(text || '').replace(INVISIBLE_SCAN_CHARS, '');
-	} catch (_) {
-		return String(text || '').replace(/[\u200b-\u200f\u2060\ufeff]/g, '');
-	}
-}
 
-function collapseSpacedOutRuns(text) {
-	// 仅把"逐字分隔"的片段压回连续文本，其余空白与标点原样保留。
-	try {
-		return String(text || '').replace(SPACED_OUT_RUN, (run) => run.replace(/[\s\p{P}\p{S}]/gu, ''));
-	} catch (_) {
-		return String(text || '');
-	}
-}
 
 // 返回参与关键词匹配的文本变体(已去重)。原文永远在第一项，行为完全向后兼容。
-function buildAdScanVariants(text) {
-	const raw = String(text || '');
-	const variants = [raw];
-	const deobfuscated = collapseSpacedOutRuns(stripInvisibleScanChars(raw));
-	if (deobfuscated && deobfuscated !== raw) variants.push(deobfuscated);
-	return variants;
-}
 
-function adScanIncludes(variants, word) {
-	if (!word) return false;
-	for (const variant of variants) {
-		if (variant.includes(word)) return true;
-	}
-	return false;
-}
 
-function adScanMatches(variants, pattern) {
-	for (const variant of variants) {
-		pattern.lastIndex = 0;
-		if (pattern.test(variant)) return true;
-	}
-	return false;
-}
 
+// 相似广告签名：只保留稳定的正文骨架，屏蔽广告商最常替换的账号、链接、电话、金额、数字与排版。
 // 该签名只用于第一主人亲自确认过的学习样本；代理内容仍在进入这里之前整条绝对豁免。
-function normalizeForAdSimilarity(text) {
-	let value = String(text || '');
-	try { value = value.normalize('NFKC'); } catch (_) {}
-	value = value
-		.toLowerCase()
-		.replace(/(?:https?:\/\/|www\.)[^\s<>()]+/gi, ' ')
-		.replace(/(?:t\.me|telegram\.me)\/[a-z0-9_+\-/]+/gi, ' ')
-		.replace(/@[a-z][\w]{2,}/gi, ' ')
-		.replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, ' ')
-		.replace(/\+?\d[\d\s().-]{5,}\d/g, ' ')
-		.replace(/[¥￥$€£]\s*\d+(?:[.,]\d+)?/g, ' ')
-		.replace(/\d+(?:[.,]\d+)?\s*(?:元|块|rmb|usdt|usdc|u|k|w|万|千|百|日|天|月|年|小时|分钟)/gi, ' ')
-		.replace(/[\p{N}]+/gu, ' ');
-	try {
-		value = value.replace(/[^\p{L}]+/gu, '');
-	} catch (_) {
-		value = value.replace(/[^a-z\u3400-\u9fff]+/gi, '');
-	}
-	return value.slice(0, AD_SIMILARITY_MAX_CANONICAL_LENGTH);
-}
 
-function buildAdShingleSet(canonical) {
-	const value = String(canonical || '');
-	const result = new Set();
-	if (value.length < AD_SIMILARITY_SHINGLE_SIZE) return result;
-	for (let i = 0; i <= value.length - AD_SIMILARITY_SHINGLE_SIZE; i += 1) {
-		result.add(value.slice(i, i + AD_SIMILARITY_SHINGLE_SIZE));
-	}
-	return result;
-}
 
-function compareAdSimilaritySignatures(left, right) {
-	const leftSet = buildAdShingleSet(left?.canonical);
-	const rightSet = buildAdShingleSet(right?.canonical);
-	if (leftSet.size === 0 || rightSet.size === 0) return { shared: 0, dice: 0, containment: 0 };
-	let shared = 0;
-	const smaller = leftSet.size <= rightSet.size ? leftSet : rightSet;
-	const larger = smaller === leftSet ? rightSet : leftSet;
-	for (const item of smaller) if (larger.has(item)) shared += 1;
-	return {
-		shared,
-		dice: (2 * shared) / (leftSet.size + rightSet.size),
-		containment: shared / Math.min(leftSet.size, rightSet.size),
-	};
-}
 
-function hasExplicitNormalAdContext(text) {
-	let scan = String(text || '').trim().toLowerCase();
-	if (!scan) return false;
-	try { scan = scan.normalize('NFKC'); } catch (_) {}
-	return [
-		/(?:这|那|这个|那个).{0,14}(?:是|算|属于).{0,4}(?:广告|推广|引流|诈骗|骗子).{0,6}(?:吗|么|？|\?)/i,
-		/(?:是不是|是否|算不算|像不像).{0,10}(?:广告|推广|引流|诈骗|骗子)/i,
-		/(?:举报|曝光|通报|提醒|警惕|小心|谨防|管理员.{0,6}(?:处理|看看|删除|封禁)).{0,24}(?:广告|推广|引流|诈骗|骗子|骚扰)/i,
-		/(?:广告|推广|引流|诈骗|骗子).{0,14}(?:别信|勿信|不要信|别加|别点|别扫码|别联系|删掉|封掉|处理一下)/i,
-		/(?:别|不要|请勿|勿)(?:再)?(?:发|转发|传播).{0,6}(?:广告|推广|引流|诈骗内容)/i,
-		/(?:有人|别人|对方|陌生人|广告号|骗子).{0,24}(?:发|私信|私聊|推销|骚扰).{0,12}(?:我|广告|推广|诈骗)/i,
-		/(?:我|本人).{0,10}(?:收到|遇到|看到|发现|被).{0,24}(?:广告|推广|私信|私聊|骚扰|诈骗)/i,
-	].some((pattern) => pattern.test(scan));
-}
 
-function hasAdSimilarityIntent(text) {
-	const scan = String(text || '').toLowerCase();
-	if (!scan.trim() || hasExplicitNormalAdContext(scan)) return false;
-	const highRiskHits = scoreHighRiskAdWords(scan);
-	const intent = analyzeQuotedHighRiskIntent(scan, highRiskHits);
-	if (intent.isPromotional) return true;
-	const mention = analyzeMentionFlood(scan);
-	if (mention.maxRepeat >= 3 || mention.distinct >= 4) return true;
-	return /(?:点击下方|扫码|进群|频道入口|资源入口|完整版|免费(?:看|观看|领取)|联系(?:我|客服|商家)|添加(?:我|客服)|私信(?:我|客服)|承接|出售|售卖|供应|招募|招聘|诚招|合作|代理加盟|日入|月入|佣金|返利)/i.test(scan);
-}
 
-function inferAdSampleScopes(source) {
-	const value = String(source || '').toLowerCase();
-	if (value.includes('identity-only') || value.includes('profile')) return ['profile'];
-	if (value.includes('quoted-ad') || value.includes('quote')) return ['quote'];
-	return ['body'];
-}
 
-// 从广告文本提取特征词组(加入词库 general 分类,抓变体)
-// 从 D1 读样本(返回 { fingerprints: [], count, updatedAt })
-// 写样本回 D1
-// 把样本指纹 merge 到运行期变量(handleMessage 入口调用)
-// 学习一条广告样本:只写整句指纹入库(不再自动污染词库)
-// 根因修复:旧版会把自动提取的词写进 general(+2 分),导致正常消息分数虚高被误杀。
-//   现在只写指纹;提取的候选词仅作为"建议"返回,由主人自行决定是否 /addword,绝不自动入库。
-// 返回 { ok, fingerprint, fpAdded, suggestedKeywords, sampleCount }
-async function recordAdRelayObservation(env, details = {}) {
-	if (!env.DB) return { ok: false, occurrences: 0, duplicate: false, error: '未绑定 D1 存储空间' };
-	const actorId = String(details.actorId || '').trim();
-	if (!/^\d+$/.test(actorId)) return { ok: false, occurrences: 0, duplicate: false, error: '观察对象 TGID 无效' };
 
-	const chatId = String(details.chatId || '');
-	const messageId = String(details.messageId || '');
-	const now = new Date().toISOString();
-	try {
-		if (!(await ensureAdRelayTables(env))) {
-			return { ok: false, occurrences: 0, duplicate: false, error: 'D1 引用观察表初始化失败' };
-		}
-		const existing = await env.DB.prepare(
-			'SELECT actor_id, occurrences, first_seen_at, last_chat_id, last_message_id FROM ad_relay_observations WHERE actor_id = ? LIMIT 1'
-		).bind(actorId).first();
-		const duplicate = Boolean(
-			existing
-			&& String(existing.last_chat_id || '') === chatId
-			&& String(existing.last_message_id || '') === messageId
-		);
-		const occurrences = existing
-			? Math.max(1, Number(existing.occurrences) || 1) + (duplicate ? 0 : 1)
-			: 1;
-		const values = [
-			occurrences,
-			now,
-			chatId,
-			messageId,
-			String(details.originalAuthorId || ''),
-			String(details.quoteFingerprint || ''),
-			String(details.quotePreview || '').slice(0, 300),
-			String(details.wrapperPreview || '').slice(0, 160),
-			String(details.evidence || '').slice(0, 500),
-		];
-		if (existing) {
-			await env.DB.prepare(
-				'UPDATE ad_relay_observations SET occurrences = ?, last_seen_at = ?, last_chat_id = ?, last_message_id = ?, last_original_author_id = ?, last_quote_fingerprint = ?, quote_preview = ?, wrapper_preview = ?, evidence = ? WHERE actor_id = ?'
-			).bind(...values, actorId).run();
-		} else {
-			await env.DB.prepare(
-				'INSERT INTO ad_relay_observations (actor_id, occurrences, first_seen_at, last_seen_at, last_chat_id, last_message_id, last_original_author_id, last_quote_fingerprint, quote_preview, wrapper_preview, evidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-			).bind(actorId, occurrences, now, ...values.slice(1)).run();
-		}
-		return {
-			ok: true,
-			occurrences,
-			duplicate,
-			firstSeenAt: String(existing?.first_seen_at || now),
-			lastSeenAt: now,
-		};
-	} catch (error) {
-		console.error('[广告引用观察] 写 D1 失败:', error);
-		return { ok: false, occurrences: 0, duplicate: false, error: error.message || String(error) };
-	}
-}
+
+
 // ===== /ad 举报投票 D1 状态 =====
 function d1MutationChanges(result) {
 	const changes = Number(result?.meta?.changes ?? result?.changes ?? 0);
@@ -6148,733 +5062,9 @@ async function setAdVoteAllowlist(env, userId, enabled, byUser) {
 	}
 }
 
-// ===== 额外管理员（/ban /spam 权限）=====
-// 第一主人通过 /add_mod 添加的非管理员用户，可使用 /ban 和 /spam。
-// 不需要是 Telegram 群管理员，只需是本项目认可的额外管理员。
-
-async function isModerationAdmin(env, userId) {
-	if (!env.DB) return false;
-	const id = String(userId || '').trim();
-	if (!id) return false;
-	try {
-		await ensureD1Table(env);
-		const row = await env.DB.prepare('SELECT user_id FROM moderation_admins WHERE user_id = ?').bind(id).first();
-		return Boolean(row?.user_id);
-	} catch (error) {
-		console.error('[mod_admin] 查询失败:', error.message);
-		return false;
-	}
-}
-
-// 刷新额外管理员缓存
-async function refreshModerationAdminCache(env) {
-	if (!env?.DB) {
-		isModerationAdminCache = null;
-		return;
-	}
-	try {
-		await ensureD1Table(env);
-		const { results } = await env.DB.prepare('SELECT user_id FROM moderation_admins').all();
-		isModerationAdminCache = new Set((results || []).map((r) => String(r.user_id)));
-		console.log(`[mod_admin] 缓存已刷新: ${isModerationAdminCache.size} 个管理员`);
-	} catch (error) {
-		console.error('[mod_admin] 缓存刷新失败:', error.message);
-		isModerationAdminCache = null;
-	}
-}
-
-async function addModerationAdmin(env, userId, byUser, note = '') {
-	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
-	const id = String(userId || '').trim();
-	if (!/^\d+$/.test(id)) return { ok: false, error: 'TGID 必须是纯数字' };
-	try {
-		await ensureD1Table(env);
-		const now = new Date().toISOString();
-		await env.DB.prepare('INSERT OR REPLACE INTO moderation_admins (user_id, added_by, added_at, note) VALUES (?, ?, ?, ?)')
-			.bind(id, String(byUser || ''), now, String(note || ''))
-			.run();
-		return { ok: true };
-	} catch (error) {
-		console.error('[mod_admin] 添加失败:', error.message);
-		return { ok: false, error: error.message || String(error) };
-	}
-}
-
-async function removeModerationAdmin(env, userId) {
-	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
-	const id = String(userId || '').trim();
-	if (!id) return { ok: false, error: 'TGID 不能为空' };
-	try {
-		await ensureD1Table(env);
-		const result = await env.DB.prepare('DELETE FROM moderation_admins WHERE user_id = ?').bind(id).run();
-		const changed = d1MutationChanges(result);
-		if (!changed) return { ok: false, error: '该用户不在额外管理员列表中' };
-		return { ok: true };
-	} catch (error) {
-		console.error('[mod_admin] 移除失败:', error.message);
-		return { ok: false, error: error.message || String(error) };
-	}
-}
-
-async function listModerationAdmins(env) {
-	if (!env.DB) return [];
-	try {
-		await ensureD1Table(env);
-		const { results } = await env.DB.prepare('SELECT user_id, added_by, added_at, note FROM moderation_admins ORDER BY added_at ASC').all();
-		return results || [];
-	} catch (error) {
-		console.error('[mod_admin] 列表失败:', error.message);
-		return [];
-	}
-}
-
-// ===== 频道转发警告系统 =====
-// 用户转发频道帖子时，先给予警告，满3次后自动封禁。
-// 警告记录存储在 warning_records 表中。
-
-const WARNING_LIMIT = 3; // 警告次数上限，达到后自动封禁
-
-// 获取用户当前警告次数
-async function getWarningCount(env, userId) {
-	if (!env.DB) return 0;
-	const id = String(userId || '').trim();
-	if (!id) return 0;
-	try {
-		await ensureD1Table(env);
-		const row = await env.DB.prepare('SELECT count FROM warning_records WHERE user_id = ?').bind(id).first();
-		return row?.count || 0;
-	} catch (error) {
-		console.error('[warning] 查询失败:', error.message);
-		return 0;
-	}
-}
-
-// 增加警告次数，返回新的次数
-async function incrementWarning(env, userId) {
-	if (!env.DB) return 0;
-	const id = String(userId || '').trim();
-	if (!id) return 0;
-	try {
-		await ensureD1Table(env);
-		const now = new Date().toISOString();
-		const existing = await env.DB.prepare('SELECT count, history FROM warning_records WHERE user_id = ?').bind(id).first();
-		const count = (existing?.count || 0) + 1;
-		const history = existing?.history ? JSON.parse(existing.history) : [];
-		history.push({ at: now, count });
-		await env.DB.prepare(
-			`INSERT OR REPLACE INTO warning_records (user_id, count, last_warned_at, history)
-			 VALUES (?, ?, ?, ?)`
-		).bind(id, count, now, JSON.stringify(history)).run();
-		return count;
-	} catch (error) {
-		console.error('[warning] 增加失败:', error.message);
-		return 0;
-	}
-}
-
-// 清除警告次数（用户被封禁后调用）
-async function clearWarnings(env, userId) {
-	if (!env.DB) return;
-	const id = String(userId || '').trim();
-	if (!id) return;
-	try {
-		await ensureD1Table(env);
-		await env.DB.prepare('DELETE FROM warning_records WHERE user_id = ?').bind(id).run();
-	} catch (error) {
-		console.error('[warning] 清除失败:', error.message);
-	}
-}
-
-// ===== 广告检测 V2 =====
-// 观察窗口 + 指纹库 + 人工确认机制
-
-const AD_V2_OBSERVATION_HOURS = 24;
-const AD_V2_BAN_SCORE = 7;      // 达到此分数直接封禁
-const AD_V2_OBSERVE_SCORE = 4;  // 达到此分数进入观察窗口
-const AD_V2_FINGERPRINT_BAN_WEIGHT = 0.8;  // 指纹权重达到此值直接封禁
-
-// ===== AI 语义层 =====
-const AD_EMBEDDING_MODEL = '@cf/baai/bge-m3';  // Workers AI 嵌入模型
-const AD_SAMPLE_TARGET_COUNT = 30;   // 目标样本向量数
-const AD_SAMPLE_LAZY_BATCH = 8;      // 每次懒加载补齐的样本数
-const AD_AI_SIMILARITY_THRESHOLD = 0.78;  // 相似度阈值，超过则判定为广告
-const AD_AI_SOFT_BONUS_FLOOR = 0.65;      // 软加分下限
-const AD_AI_SOFT_BONUS_SCORE = 2;         // 软加分分数
-
-// AI 语义层样本种子（真实广告文本）
-const AD_SAMPLE_SEED_TEXTS = [
-	'💚高价收网赚号💚 长期收购网 du 商宝账号，老账号优先加价',
-	'2💚高价收网赚号💚 专业收购网 du 账号',
-	'😊青山落日😊 最新项目一天稳宝8-20U，进群联系',
-	'小额洗急 两分钟一单赚几百 私聊我',
-	'7💚高价收网赚号💚 收各种赚钱包盒项目',
-	'真宝玩家注册即送88-388USDT无需实名 大额无忧',
-	'约炮极品辣妞组 真实头像 进入社区查看 黑丝反差女主妇',
-	'最新赚钱风口项目 春节前带家人来找我 薪6000+',
-	'长期收购各类账号 价格表私聊 秒结不拖欠',
-	'招代理日结佣金 无需经验 加微详聊',
-];
-
-// AI 样本向量缓存
-let _adSampleEmbeddingCache = null;
-let _adSampleEmbeddingCacheAt = 0;
-const AD_SAMPLE_EMBEDDING_CACHE_TTL = 60000;
-
-// 获取指纹库（带缓存）
-let _adFingerprintCache = null;
-let _adFingerprintCacheAt = 0;
-const AD_FINGERPRINT_CACHE_TTL = 60000;
-
-async function getAdFingerprints(env) {
-	if (!env.DB) return [];
-	const now = Date.now();
-	if (_adFingerprintCache && (now - _adFingerprintCacheAt) < AD_FINGERPRINT_CACHE_TTL) {
-		return _adFingerprintCache;
-	}
-	try {
-		await ensureD1Table(env);
-		const { results } = await env.DB.prepare('SELECT value, type, weight, source FROM ad_fingerprints').all();
-		_adFingerprintCache = results || [];
-		_adFingerprintCacheAt = now;
-		return _adFingerprintCache;
-	} catch (error) {
-		console.error('[ad_v2] 读取指纹库失败:', error.message);
-		return [];
-	}
-}
-
-function invalidateAdFingerprintCache() {
-	_adFingerprintCache = null;
-	_adFingerprintCacheAt = 0;
-}
-
-// 添加指纹
-async function addAdFingerprint(env, value, type = 'keyword', weight = 0.6, source = 'auto') {
-	if (!env.DB) return { ok: false, error: '未绑定 D1' };
-	try {
-		await ensureD1Table(env);
-		const now = new Date().toISOString();
-		await env.DB.prepare(
-			`INSERT INTO ad_fingerprints (value, type, weight, source, hit_count, created_at)
-			 VALUES (?, ?, ?, ?, 0, ?)
-			 ON CONFLICT(value) DO UPDATE SET weight = MAX(weight, excluded.weight), source = CASE WHEN source = 'manual' THEN 'manual' ELSE excluded.source END`
-		).bind(String(value).toLowerCase(), type, weight, source, now).run();
-		invalidateAdFingerprintCache();
-		return { ok: true };
-	} catch (error) {
-		console.error('[ad_v2] 添加指纹失败:', error.message);
-		return { ok: false, error: error.message };
-	}
-}
-
-// 删除指纹
-async function removeAdFingerprint(env, value) {
-	if (!env.DB) return { ok: false, error: '未绑定 D1' };
-	try {
-		await ensureD1Table(env);
-		const result = await env.DB.prepare('DELETE FROM ad_fingerprints WHERE value = ?').bind(String(value).toLowerCase()).run();
-		invalidateAdFingerprintCache();
-		return { ok: true, changed: (result?.meta?.changes || result?.changes || 0) > 0 };
-	} catch (error) {
-		console.error('[ad_v2] 删除指纹失败:', error.message);
-		return { ok: false, error: error.message };
-	}
-}
-
-// 指纹匹配：返回匹配的指纹列表
-async function matchAdFingerprints(env, text) {
-	if (!text) return [];
-	const fingerprints = await getAdFingerprints(env);
-	const lower = String(text).toLowerCase();
-	const matches = [];
-	for (const fp of fingerprints) {
-		if (fp.value && lower.includes(fp.value.toLowerCase())) {
-			matches.push(fp);
-		}
-	}
-	return matches;
-}
-
-// 更新观察窗口
-async function updateObservationWindow(env, userId, chatId, scoreDelta, hits) {
-	if (!env.DB) return null;
-	const id = String(userId || '').trim();
-	if (!id) return null;
-	try {
-		await ensureD1Table(env);
-		const now = new Date().toISOString();
-		const existing = await env.DB.prepare('SELECT * FROM ad_observation_window WHERE user_id = ?').bind(id).first();
-		if (existing) {
-			const newScore = (existing.score || 0) + scoreDelta;
-			const historyHits = existing.hits ? JSON.parse(existing.hits) : [];
-			if (hits) historyHits.push(...hits);
-			await env.DB.prepare(
-				'UPDATE ad_observation_window SET score = ?, hits = ?, last_seen = ?, status = ? WHERE user_id = ?'
-			).bind(newScore, JSON.stringify(historyHits), now, newScore >= AD_V2_BAN_SCORE ? 'banned' : 'observing', id).run();
-			return { score: newScore, status: newScore >= AD_V2_BAN_SCORE ? 'banned' : 'observing' };
-		}
-		await env.DB.prepare(
-			`INSERT INTO ad_observation_window (user_id, chat_id, score, hits, first_seen, last_seen, status)
-			 VALUES (?, ?, ?, ?, ?, ?, 'observing')`
-		).bind(id, String(chatId), scoreDelta, JSON.stringify(hits || []), now, now).run();
-		return { score: scoreDelta, status: 'observing' };
-	} catch (error) {
-		console.error('[ad_v2] 更新观察窗口失败:', error.message);
-		return null;
-	}
-}
-
-// 获取观察窗口中的用户
-async function getObservationWindow(env, limit = 10) {
-	if (!env.DB) return [];
-	try {
-		await ensureD1Table(env);
-		const since = new Date(Date.now() - AD_V2_OBSERVATION_HOURS * 3600 * 1000).toISOString();
-		const { results } = await env.DB.prepare(
-			'SELECT * FROM ad_observation_window WHERE status = "observing" AND last_seen > ? ORDER BY score DESC LIMIT ?'
-		).bind(since, limit).all();
-		return results || [];
-	} catch (error) {
-		console.error('[ad_v2] 读取观察窗口失败:', error.message);
-		return [];
-	}
-}
-
-// 创建待确认快照
-async function createPendingSnapshot(env, userId, chatId, messageId, score, hits, preview) {
-	if (!env.DB) return null;
-	try {
-		await ensureD1Table(env);
-		const token = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-		const now = new Date().toISOString();
-		await env.DB.prepare(
-			`INSERT INTO ad_pending_snapshots (token, user_id, chat_id, message_id, score, hits, preview, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-		).bind(token, String(userId), String(chatId), messageId, score, JSON.stringify(hits || []), preview || '', now).run();
-		return token;
-	} catch (error) {
-		console.error('[ad_v2] 创建快照失败:', error.message);
-		return null;
-	}
-}
-
-// 获取待确认快照
-async function getPendingSnapshots(env, limit = 20) {
-	if (!env.DB) return [];
-	try {
-		await ensureD1Table(env);
-		const since = new Date(Date.now() - 3600000).toISOString();
-		const { results } = await env.DB.prepare(
-			'SELECT * FROM ad_pending_snapshots WHERE status = "pending" AND created_at > ? ORDER BY created_at DESC LIMIT ?'
-		).bind(since, limit).all();
-		return results || [];
-	} catch (error) {
-		console.error('[ad_v2] 读取快照失败:', error.message);
-		return [];
-	}
-}
-
-// 获取单个快照
-async function getPendingSnapshot(env, token) {
-	if (!env.DB) return null;
-	try {
-		await ensureD1Table(env);
-		return await env.DB.prepare('SELECT * FROM ad_pending_snapshots WHERE token = ? AND status = "pending"').bind(token).first();
-	} catch (error) {
-		console.error('[ad_v2] 读取快照失败:', error.message);
-		return null;
-	}
-}
-
-// 更新快照状态
-async function updatePendingSnapshot(env, token, status) {
-	if (!env.DB) return false;
-	try {
-		await ensureD1Table(env);
-		await env.DB.prepare('UPDATE ad_pending_snapshots SET status = ? WHERE token = ?').bind(status, token).run();
-		return true;
-	} catch (error) {
-		console.error('[ad_v2] 更新快照失败:', error.message);
-		return false;
-	}
-}
-
-// ===== 状态菜单 =====
-async function sendStatusMenu(message, env, ctx) {
-	const chatId = message.chat.id;
-	const lines = ['🤖 <b>机器人状态</b>', ''];
-
-	// 基本状态
-	lines.push('✅ <b>运行状态:</b> 正常运行');
-	// 使用 UTC+8 时间
-	const now = new Date(Date.now() + 8 * 3600 * 1000);
-	lines.push(`🕐 <b>时间:</b> ${now.toISOString().slice(0, 19).replace('T', ' ')} UTC+8`);
-
-	// AI 绑定状态
-	const aiStatus = env.AI ? '✅ 已绑定' : '❌ 未绑定';
-	lines.push(`🧠 <b>Workers AI:</b> ${aiStatus}`);
-
-	// 广告检测状态（显示当前用户的测试模式状态）
-	let adStatus = AD_FILTER_ENABLED ? '✅ 已开启' : '❌ 已关闭';
-	try {
-		if (env.DB && message?.from?.id) {
-			await ensureAdTestModeTable(env);
-			const testMode = await getAdTestMode(env, message.from.id);
-			adStatus = testMode ? '✅ 测试中' : '❌ 已关闭';
-		}
-	} catch (error) { /* ignore */ }
-	lines.push(`🔍 <b>广告检测:</b> ${adStatus}`);
-
-	// 自动清理状态
-	let autoCleanStatus = '❌ 已关闭';
-	try {
-		if (env.DB) {
-			await ensureAutoCleanTable(env);
-			const row = await env.DB.prepare('SELECT value FROM auto_clean_settings WHERE key = ?').bind('enabled').first();
-			autoCleanStatus = row && row.value ? '✅ 已开启' : '❌ 已关闭';
-		}
-	} catch (error) { /* ignore */ }
-	lines.push(`🧹 <b>自动清理:</b> ${autoCleanStatus}`);
-
-	// 内联按钮（显示当前状态）
-	const autoCleanBtnText = autoCleanStatus.includes('已开启') ? '🧹 自动清理 ✅' : '🧹 自动清理 ❌';
-	const adBtnText = adStatus.includes('已开启') ? '🔍 广告检测 ✅' : '🔍 广告检测 ❌';
-
-	lines.push('');
-	lines.push('<b>📊 数据统计</b>');
-
-	// 指纹库数量
-	let fpCount = 0;
-	let obsCount = 0;
-	let pendingCount = 0;
-	let warnCount = 0;
-	let modAdminCount = 0;
-	try {
-		if (env.DB) {
-			await ensureD1Table(env);
-			const fpRow = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_fingerprints').first();
-			fpCount = fpRow?.cnt || 0;
-			const obsRow = await env.DB.prepare("SELECT COUNT(*) as cnt FROM ad_observation_window WHERE status = 'observing'").first();
-			obsCount = obsRow?.cnt || 0;
-			const pendingRow = await env.DB.prepare("SELECT COUNT(*) as cnt FROM ad_pending_snapshots WHERE status = 'pending'").first();
-			pendingCount = pendingRow?.cnt || 0;
-			const warnRow = await env.DB.prepare('SELECT COUNT(*) as cnt FROM warning_records').first();
-			warnCount = warnRow?.cnt || 0;
-			const modRow = await env.DB.prepare('SELECT COUNT(*) as cnt FROM moderation_admins').first();
-			modAdminCount = modRow?.cnt || 0;
-		}
-	} catch (error) { /* ignore */ }
-
-	lines.push(`  • 指纹库: ${fpCount} 条`);
-	lines.push(`  • 观察窗口: ${obsCount} 人`);
-	lines.push(`  • 待确认快照: ${pendingCount} 条`);
-	lines.push(`  • 警告记录: ${warnCount} 人`);
-	lines.push(`  • 额外管理员: ${modAdminCount} 人`);
-
-	// 黑名单数量
-	let blacklistCount = 0;
-	try {
-		if (env.DB) {
-			const blRow = await env.DB.prepare('SELECT COUNT(*) as cnt FROM blacklist').first();
-			blacklistCount = blRow?.cnt || 0;
-		}
-	} catch (error) { /* ignore */ }
-	lines.push(`  • 黑名单: ${blacklistCount} 人`);
-
-	// 内联按钮（显示当前状态）
-	const replyMarkup = {
-		inline_keyboard: [
-			[
-				{ text: '🔄 刷新', callback_data: 'status:refresh' },
-				{ text: adBtnText, callback_data: 'status:ad_toggle' },
-			],
-			[
-				{ text: autoCleanBtnText, callback_data: 'status:clean_toggle' },
-				{ text: '📋 待确认', callback_data: 'status:pending' },
-			],
-			[
-				{ text: '👁️ 观察窗口', callback_data: 'status:observation' },
-				{ text: '📚 指纹库', callback_data: 'status:words' },
-			],
-			[
-				{ text: '🛡️ 管理员', callback_data: 'status:mods' },
-			],
-		],
-	};
-
-	// 发送或编辑消息
-	try {
-		await sendTelegramMessage(chatId, lines.join('\n'), replyMarkup);
-	} catch (error) {
-		console.error('[status] 发送失败:', error);
-	}
-}
-
-// 域名白名单检查
-async function isDomainWhitelisted(env, text) {
-	if (!env.DB || !text) return false;
-	try {
-		await ensureD1Table(env);
-		const { results } = await env.DB.prepare('SELECT domain FROM ad_domain_whitelist').all();
-		const domains = (results || []).map((r) => r.domain.toLowerCase());
-		const urlPattern = /(?:https?:\/\/)?([^\s/]+\.[^\s/]+)/g;
-		let match;
-		while ((match = urlPattern.exec(text)) !== null) {
-			const domain = match[1].toLowerCase();
-			for (const wd of domains) {
-				if (domain === wd || domain.endsWith('.' + wd)) {
-					return true;
-				}
-			}
-		}
-		return false;
-	} catch (error) {
-		return false;
-	}
-}
-
-// ===== AI 语义层 =====
-
-// 余弦相似度计算
-function cosineSimilarity(a, b) {
-	if (!Array.isArray(a) || !Array.isArray(b)) return 0;
-	const length = Math.min(a.length, b.length);
-	if (!length) return 0;
-	let dot = 0;
-	let normA = 0;
-	let normB = 0;
-	for (let i = 0; i < length; i++) {
-		const x = Number(a[i]) || 0;
-		const y = Number(b[i]) || 0;
-		dot += x * y;
-		normA += x * x;
-		normB += y * y;
-	}
-	if (normA <= 0 || normB <= 0) return 0;
-	const value = dot / (Math.sqrt(normA) * Math.sqrt(normB));
-	return Number.isFinite(value) ? value : 0;
-}
-
-// 生成文本嵌入向量
-async function embedAdText(env, text) {
-	const source = String(text ?? '').trim().slice(0, 512);
-	if (!source) return null;
-	if (!(env?.AI && typeof env.AI.run === 'function')) return null;
-	try {
-		const response = await env.AI.run(AD_EMBEDDING_MODEL, { text: [source] });
-		const vector = response?.data?.[0];
-		if (!Array.isArray(vector) || !vector.length) return null;
-		return vector.map((v) => Number(v) || 0);
-	} catch (error) {
-		console.error('[AI] 生成文本向量失败'
-			+ ' model=' + AD_EMBEDDING_MODEL
-			+ ' name=' + (error?.name || '未知')
-			+ ' message=' + (error?.message || '（空）')
-			+ ' textLen=' + source.length);
-		return null;
-	}
-}
-
-// 懒加载补齐样本向量
-async function topUpAdSampleEmbeddings(env) {
-	if (!(env?.AI && typeof env.AI.run === 'function')) return 0;
-	try {
-		const readyRow = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL').first();
-		if ((Number(readyRow?.c) || 0) >= AD_SAMPLE_TARGET_COUNT) return 0;
-		const { results } = await env.DB.prepare(
-			'SELECT id, text FROM ad_sample_embeddings WHERE embedding IS NULL ORDER BY id ASC LIMIT ?'
-		).bind(AD_SAMPLE_LAZY_BATCH).all();
-		if (!results?.length) return 0;
-
-		let filled = 0;
-		for (const row of results) {
-			const vector = await embedAdText(env, row.text);
-			if (!vector) continue;
-			await env.DB.prepare('UPDATE ad_sample_embeddings SET embedding = ? WHERE id = ?')
-				.bind(JSON.stringify(vector), row.id).run();
-			filled += 1;
-		}
-		if (filled) {
-			_adSampleEmbeddingCache = null;
-			_adSampleEmbeddingCacheAt = 0;
-		}
-		return filled;
-	} catch (error) {
-		console.error('[AI] 补齐样本向量失败:', error);
-		return 0;
-	}
-}
-
-// 读取样本向量（带缓存）
-async function loadAdSampleEmbeddings(env) {
-	if (!env?.DB) return [];
-	const now = Date.now();
-	if (_adSampleEmbeddingCache && (now - _adSampleEmbeddingCacheAt) < AD_SAMPLE_EMBEDDING_CACHE_TTL) {
-		return _adSampleEmbeddingCache;
-	}
-	try {
-		const { results } = await env.DB.prepare(
-			'SELECT text, embedding FROM ad_sample_embeddings WHERE embedding IS NOT NULL ORDER BY id ASC LIMIT ?'
-		).bind(AD_SAMPLE_TARGET_COUNT * 2).all();
-		const rows = [];
-		for (const row of results || []) {
-			try {
-				const vector = JSON.parse(String(row.embedding));
-				if (Array.isArray(vector) && vector.length) rows.push({ text: String(row.text || ''), vector });
-			} catch { /* 脏样本跳过 */ }
-		}
-		_adSampleEmbeddingCache = rows;
-		_adSampleEmbeddingCacheAt = now;
-		return rows;
-	} catch (error) {
-		console.error('[AI] 读取样本向量失败:', error);
-		return [];
-	}
-}
-
-// 检查 AI 语义相似度
-async function checkAdAiSimilarity(env, text) {
-	const source = String(text ?? '').trim();
-	if (source.length < 4) return { available: true, similarity: 0, sample: null };
-
-	await topUpAdSampleEmbeddings(env);
-	const samples = await loadAdSampleEmbeddings(env);
-	if (!samples.length) return { available: true, similarity: 0, sample: null };
-
-	const vector = await embedAdText(env, source);
-	if (!vector) return { available: true, similarity: 0, sample: null };
-
-	let best = 0;
-	let bestSample = null;
-	for (const sample of samples) {
-		if (sample.vector.length !== vector.length) continue;
-		const similarity = cosineSimilarity(vector, sample.vector);
-		if (similarity > best) { best = similarity; bestSample = sample.text; }
-	}
-	return { available: true, similarity: best, sample: bestSample };
-}
-// /recent 把当时的疑似广告列表(已按上下文过滤+排序)冻结写入 D1;
-// /learnlast 只从这份快照读,所以期间实时缓存被新消息挤动也不影响主人看到的序号。
-
-// 写入快照:items 是已排序好的数组(序号 1 = items[0]),scope/at 仅作展示与排错
-async function saveLearnSnapshot(env, items, meta = {}) {
-	if (!env.DB) return { ok: false, error: '未绑定 D1 存储空间' };
-	try {
-		await ensureD1Table(env);
-		const data = JSON.stringify({
-			items: items || [],
-			scope: meta.scope || '',
-			byChatId: meta.byChatId || '',
-			at: new Date().toISOString(),
-		});
-		await env.DB.prepare('INSERT OR REPLACE INTO learn_snapshot (id, data, updated_at) VALUES (1, ?, ?)')
-			.bind(data, new Date().toISOString())
-			.run();
-		return { ok: true };
-	} catch (error) {
-		console.error('[学习快照] 写 D1 失败:', error);
-		return { ok: false, error: error.message };
-	}
-}
-
-// 读取快照,返回 { items: [], scope, byChatId, at } 或 null
-async function loadLearnSnapshot(env) {
-	if (!env.DB) return null;
-	try {
-		await ensureD1Table(env);
-		const row = await env.DB.prepare('SELECT data FROM learn_snapshot WHERE id = 1').first();
-		if (row && row.data) {
-			const parsed = JSON.parse(row.data);
-			if (parsed && Array.isArray(parsed.items)) return parsed;
-		}
-	} catch (error) {
-		console.error('[学习快照] 读 D1 失败:', error);
-	}
-	return null;
-}
-
-// ===== 最近消息缓存(供 /learnlast 学习被删的广告)=====
-
-// 预筛:是否"疑似广告"消息(只缓存这些,省 D1 写入)
-function looksLikeAdCandidate(message) {
-	// 服务消息（置顶/入群/改群名等）不是用户发言，不进 /recent 学习候选。
-	if (isTelegramServiceMessage(message)) return false;
-	// 代理相关内容按用户口径整条绝对豁免，不进入 /recent 疑似广告缓存。
-	if (isProxyRelatedMessage(message)) return false;
-	// 名片(分享联系人)直接算疑似广告候选 —— 名片广告无 text,但内容藏在 contact 里
-	if (message.contact) return true;
-	const text = (message.text || message.caption || '').trim();
-	if (!text) return false;
-	const urls = collectUrls(message);
-	if (urls.length > 0) return true;                 // 含链接
-	if (/@[a-zA-Z][\w]{3,}/.test(text)) return true;  // @用户名提及(引流)
-	if (/\d{5,}/.test(text)) return true;             // 长数字串(电话/金额)
-	return false;
-}
-
-// 读最近消息缓存
-async function loadRecentMessages(env) {
-	if (!env.DB) return [];
-	try {
-		await ensureD1Table(env);
-		const safeLimit = Math.max(1, Math.min(Number(MSG_CACHE_SIZE) || DEFAULT_MSG_CACHE_SIZE, 500));
-		const { results } = await env.DB.prepare('SELECT mid, chat_id, chat_title, text, from_id, from_name, created_at FROM recent_messages ORDER BY id DESC LIMIT ?')
-			.bind(safeLimit)
-			.all();
-		return [...(results || [])].reverse().map(r => ({
-			mid: r.mid,
-			chatId: r.chat_id,
-			chatTitle: r.chat_title || '',
-			text: r.text || '',
-			fromId: r.from_id || '',
-			fromName: r.from_name || '',
-			at: r.created_at || '',
-		}));
-	} catch (error) {
-		console.error('[消息缓存] 读 D1 失败:', error);
-	}
-	return [];
-}
-
-// 按上下文过滤缓存:群内发 → 只看当前群;私聊发 → 全部群
-// 返回"最新在前"的数组(序号 1 = 最新)
-function filterMessagesByContext(items, message) {
-	const isInGroup = message.chat.type !== 'private';
-	let list = items;
-	if (isInGroup) {
-		const cid = String(message.chat.id);
-		list = items.filter((it) => String(it.chatId) === cid);
-	}
-	return [...list].reverse(); // 最新在前
-}
-
-// 缓存一条消息(环形,保留最近 MSG_CACHE_SIZE 条)
-async function cacheRecentMessage(env, message) {
-	if (!env.DB) return;
-	try {
-		await ensureD1Table(env);
-		const cacheText = (message.text || message.caption || getContactText(message) || '').slice(0, 500);
-		const insertResult = await env.DB.prepare('INSERT INTO recent_messages (mid, chat_id, chat_title, text, from_id, from_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-			.bind(
-				message.message_id,
-				String(message.chat.id),
-				message.chat.title || '',
-				cacheText,
-				String(message.from?.id || ''),
-				[message.from?.first_name, message.from?.last_name].filter(Boolean).join(' ') || message.from?.username || '',
-				new Date().toISOString()
-			)
-			.run();
-		if (shouldPruneD1Cache(insertResult)) {
-			await pruneAutoincrementCacheTable(env, 'recent_messages', MSG_CACHE_SIZE);
-		}
-	} catch (error) {
-		console.error('[消息缓存] 写 D1 失败:', error);
-	}
-}
 
 // 当前群清扫缓存：保存普通用户近期消息 ID，供 /spam 引用回复时清扫该用户当前群近期消息。
-// 与 recent_messages 分开，避免 /recent 学习列表被普通聊天污染。
+// 只记消息 ID 与发送者，不存正文 —— 这是自动广告治理移除后唯一保留的消息缓存。
 // Telegram 服务消息（置顶/入群/退群/改群名等）不是用户发言，绝不能进清扫缓存。
 // 根因案例：管理员置顶任意消息时，Telegram 推送一条 pinned_message 服务消息，
 // 它的 from 是置顶者、message_id 是服务消息自身。旧逻辑只排除 bot 与斜杠命令，
@@ -6996,173 +5186,20 @@ async function cleanupAdVoteSourceChatMessages(env, chatId, userId) {
 	return result;
 }
 
-// ===== 广告 Bot 触发者检测 =====
-// 当检测到广告来自 bot 时，查找是谁 @了这个 bot 触发了广告
-// 返回触发者用户 ID 数组
-async function findBotTriggerers(env, chatId, botUsername, botUserId, limit = 50) {
-	const triggerers = new Set();
-	if (!env?.DB || !chatId || (!botUsername && !botUserId)) return [];
-	try {
-		await ensureD1Table(env);
-		// 查找 moderation_messages 中 @了 bot 的消息
-		const { results } = await env.DB.prepare(
-			'SELECT from_id, mid FROM moderation_messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?'
-		).bind(String(chatId), limit).all();
-		for (const row of results || []) {
-			if (!row.from_id || String(row.from_id) === String(botUserId)) continue;
-			// 检查消息内容是否包含 @bot用户名
-			// 由于 moderation_messages 不存储文本，我们通过 recent_messages 查找
-			try {
-				const { results: msgResults } = await env.DB.prepare(
-					'SELECT text FROM recent_messages WHERE chat_id = ? AND from_id = ? AND mid = ? LIMIT 1'
-				).bind(String(chatId), String(row.from_id), row.mid).first();
-				if (msgResults && msgResults.text) {
-					const text = msgResults.text.toLowerCase();
-					const username = (botUsername || '').toLowerCase().replace('@', '');
-					if (username && (text.includes(`@${username}`) || text.includes(`@${username.toLowerCase()}`))) {
-						triggerers.add(String(row.from_id));
-					}
-				}
-			} catch (error) { /* ignore */ }
-		}
-	} catch (error) {
-		console.error('[bot_trigger] 查找失败:', error.message);
-	}
-	return [...triggerers];
-}
-
-// ===== 增强版消息清扫 =====
-// 删除用户的所有消息，包括：
-// 1. moderation_messages 缓存的消息
-// 2. recent_messages 中包含 @bot 的消息
-async function cleanupUserAllMessages(env, chatId, userId, targetBotUsername = null) {
-	const messageIds = new Set();
-	const addMessageId = (mid) => {
-		const n = Number(mid);
-		if (Number.isInteger(n) && n > 0) messageIds.add(n);
-	};
-
-	if (env.DB) {
-		try {
-			await ensureD1Table(env);
-			// 1. 从 moderation_messages 获取
-			const { results: modResults } = await env.DB.prepare(
-				'SELECT mid FROM moderation_messages WHERE chat_id = ? AND from_id = ? ORDER BY id DESC LIMIT 200'
-			).bind(String(chatId), String(userId)).all();
-			for (const row of modResults || []) addMessageId(row.mid);
-			await env.DB.prepare('DELETE FROM moderation_messages WHERE chat_id = ? AND from_id = ?')
-				.bind(String(chatId), String(userId)).run();
-
-			// 2. 如果指定了 bot 用户名，查找包含 @bot 的消息
-			if (targetBotUsername) {
-				const username = targetBotUsername.toLowerCase().replace('@', '');
-				const { results: recentResults } = await env.DB.prepare(
-					'SELECT mid FROM recent_messages WHERE chat_id = ? AND from_id = ? ORDER BY id DESC LIMIT 200'
-				).bind(String(chatId), String(userId)).all();
-				for (const row of recentResults || []) {
-					try {
-						const { results: textResult } = await env.DB.prepare(
-							'SELECT text FROM recent_messages WHERE mid = ? LIMIT 1'
-						).bind(row.mid).first();
-						if (textResult && textResult.text) {
-							const text = textResult.text.toLowerCase();
-							if (text.includes(`@${username}`)) {
-								addMessageId(row.mid);
-							}
-						}
-					} catch (error) { /* ignore */ }
-				}
-			}
-		} catch (error) {
-			console.error('[cleanup] 读取 D1 缓存失败:', error);
-		}
-	}
-
-	let ok = 0;
-	let failed = 0;
-	const errors = [];
-	for (const mid of messageIds) {
-		const result = deleteMessage(chatId, mid);
-		if (result.ok) {
-			ok += 1;
-		} else {
-			failed += 1;
-			errors.push({ messageId: mid, error: result.error || '未知错误' });
-		}
-	}
-	return { total: messageIds.size, ok, failed, errors };
-}
-
 function renderCurrentChatCleanupResult(cleanup) {
 	if (!cleanup || cleanup.total === 0) return '🧹 当前群近期消息清扫:未找到缓存消息';
 	const suffix = cleanup.failed ? `，失败 ${cleanup.failed}` : '';
 	return `🧹 当前群近期消息清扫:成功 ${cleanup.ok}/${cleanup.total}${suffix}`;
 }
 // 收集消息里所有 URL(entities + caption_entities 里的 url / text_link)
-function collectUrls(message) {
-	const urls = [];
-	const ents = [...(message.entities || []), ...(message.caption_entities || [])];
-	const base = message.text || message.caption || '';
-	for (const e of ents) {
-		if (e.type === 'text_link' && e.url) {
-			urls.push(e.url);
-		} else if (e.type === 'url' && typeof e.offset === 'number') {
-			urls.push(base.substring(e.offset, e.offset + e.length));
-		}
-	}
-	// 兜底:正则从原文再抓一遍裸 URL(有些纯文本链接 Telegram 不一定给 entity)
-	const reUrl = /https?:\/\/[^\s<>"')]+/gi;
-	for (const m of base.matchAll(reUrl)) {
-		if (!urls.includes(m[0])) urls.push(m[0]);
-	}
-	for (const row of message?.reply_markup?.inline_keyboard || []) {
-		for (const button of row || []) {
-			for (const value of [button?.url, button?.login_url?.url, button?.web_app?.url]) {
-				if (value && !urls.includes(String(value))) urls.push(String(value));
-			}
-		}
-	}
-	return urls;
-}
 
 // 从一批 URL 中提取主机名(小写,去 www. 前缀)。解析失败的 URL 跳过。
-function extractHostnames(urls) {
-	const hosts = [];
-	for (const u of urls) {
-		let host = '';
-		try {
-			host = new URL(u).hostname.toLowerCase();
-		} catch (_) {
-			// URL() 解析失败(如缺协议),用正则兜底抓 host
-			const m = String(u).match(/^(?:https?:\/\/)?([^/\s:?#]+)/i);
-			host = m ? m[1].toLowerCase() : '';
-		}
-		if (host.startsWith('www.')) host = host.slice(4);
-		if (host) hosts.push(host);
-	}
-	return hosts;
-}
 
 // 主机名是否命中某个白名单域名(等于 或 是其子域名)。
 // 例:host=gist.github.com,wl=github.com → true(子域名);host=evilgithub.com → false(防伪造)
-function hostMatchesDomain(host, domain) {
-	if (!host || !domain) return false;
-	return host === domain || host.endsWith('.' + domain);
-}
 
 // 这批 URL 是否【全部】命中正常域名白名单(只要有一个不在白名单,就不算"纯白名单链接")
-function allUrlsWhitelisted(urls) {
-	if (urls.length === 0) return false;
-	const hosts = extractHostnames(urls);
-	if (hosts.length === 0) return false;
-	return hosts.every((h) => URL_WHITELIST.some((d) => hostMatchesDomain(h, d)));
-}
 
-// 这批 URL 是否含可疑短链域名
-function hasSuspiciousUrl(urls) {
-	const hosts = extractHostnames(urls);
-	return hosts.some((h) => SUSPICIOUS_URL_DOMAINS.some((d) => hostMatchesDomain(h, d)));
-}
 
 // 提取联系人名片(contact)里的全部可读文本,供广告检测。
 // 名片广告把内容藏在名片显示名/电话/vcard 里(如名字"假钞交流群"+电话"+1 870..."),
@@ -7172,6 +5209,33 @@ function getContactText(message) {
 	if (!c) return '';
 	const parts = [c.first_name, c.last_name, c.phone_number, c.vcard].filter(Boolean);
 	return parts.join(' ');
+}
+
+// 名片显示名【是否像人名】—— 反向白名单，只减误封、不抓广告。
+// 2026-09-09 从旧代码（e80658e 移除前的 :6632）原样移植，是那套实现里唯一与词表无关的部件。
+//
+// 为什么这一档值得单独存在：正常人分享的名片，显示名就是人名或称谓
+//（张三 / 王医生 / 妈妈 / 快递小哥 / John Smith）。广告名片必须把广告写进显示名，
+// 否则没人知道它卖什么 —— 这是广告【无法规避】的结构约束。
+// 命中即整条跳过名片通道，不进任何判据，所以它对漏检零影响，只压误封。
+//
+// 移植时刻意【不带】旧代码的 countContactPromoSignals 与 PROFILE_OFFERING_PATTERN：
+// 那两个才是旧代码的误封源头（`交流群` 三个字会杀掉「Python技术交流群管理」，
+// 而本项目就部署在技术群）。判据仍走 judgeAdStructure 的两类同现。
+function looksLikePersonName(name) {
+	const value = String(name || '').trim();
+	if (!value) return false;
+	const chars = Array.from(value);
+	if (chars.length > 12) return false;                            // 人名不会超过 12 字
+	if (/\d/.test(value)) return false;                            // 人名不含数字
+	try {
+		if (/\p{Extended_Pictographic}/u.test(value)) return false;  // 人名不带 emoji
+	} catch (_) {
+		if (/[\u{1F300}-\u{1FAFF}☀-➿]/u.test(value)) return false;
+	}
+	if (/[一-龥]/.test(value)) return chars.length <= 5;            // 中日韩姓名/称谓 ≤5 字
+	// 西文人名：1~3 个词，每词首字母大写
+	return /^[A-Z][a-z'’-]+(?:\s[A-Z][a-z'’-]+){0,2}$/.test(value);
 }
 function getInlineButtonPayloadText(message) {
 	const parts = [];
@@ -7199,1433 +5263,61 @@ function getAdDetectionBodyText(message) {
 	].filter(Boolean).join(' ').trim();
 }
 
-// 判断名片电话号是否为"外国号"(非中国大陆 +86)。
-// 中文群里正常人极少分享外国号名片,广告号几乎清一色 +63/+7/+972/+1 等。
-// 只有能明确识别出国际区号且【不是 +86】时才返回 true;号码缺失/无法判断 → false(保守,不误判)。
-function isForeignPhoneNumber(phone) {
-	const raw = String(phone || '').trim();
-	if (!raw) return false;
-	// 归一:去空格/横线/括号,保留开头 + 号
-	const digits = raw.replace(/[\s\-()]/g, '');
-	// 必须是国际格式(以 + 或 00 开头)才能判断"是不是外国号";纯本地号无区号 → 不判断
-	let intl = '';
-	if (digits.startsWith('+')) intl = digits.slice(1);
-	else if (digits.startsWith('00')) intl = digits.slice(2);
-	else return false;
-	if (!/^\d{6,15}$/.test(intl)) return false;
-	// +86 开头 = 中国大陆,放行
-	if (intl.startsWith('86')) return false;
-	return true;
+// 提取【引用体】正文 —— 也就是这条消息「引用/回复的那条别人的消息」里的文字。
+//
+// 2026-09-08 新增。起因是主人发来的实例（昵称 Maybell Tillman，正文只有一个字母 `c`，
+// 引用块里是「操逼赚钱，招探花9000一单，提供设备」，来源频道 bxbd）——
+// 这正是线上漏放 50+ 个号的共同形态：正文只有 v / z / n / x / c 一个字母，
+// 广告词全在引用体里，而 getAdDetectionBodyText 只读 text/caption，一个词都取不到。
+// 检测层看到的只有那个字母，所以那批号一路走到底都是 0 分。
+//
+// 【三个字段全读，不做取舍】。Telegram 把「引用别人消息」这件事分散在三处，
+// 而客户端渲染出来长得一模一样（左侧竖线 + 来源名 + 内容），从截图分不出是哪个：
+//   quote          —— 2023 新增的「引用片段」，用户手选一段文字引用，只有被选中的片段
+//   external_reply —— 引用【其它聊天】里的消息（跨群 / 引用频道帖子），本体在这里
+//   reply_to_message —— 同群内回复，包括「频道关联讨论组里回复频道自动转发的帖子」
+// 与其开 AD_DEBUG_DUMP_UPDATE 取样确认是哪个（那会把群内消息全文打进 Worker 日志，
+// 是实打实的隐私泄露面），不如三个都读 —— 成本一样，还少一轮线上取样。
+//
+// external_reply 内部还可能再套一层 quote（引用其它聊天里的某个片段），故一并展开。
+function getAdQuotedText(message) {
+	const ext = message?.external_reply || null;
+	const reply = message?.reply_to_message || null;
+	return [
+		message?.quote?.text,
+		ext?.text,
+		ext?.caption,
+		ext?.quote?.text,
+		reply?.text,
+		reply?.caption,
+	].filter(Boolean).join('\n').trim();
 }
 
-// 名片显示名是否呈"推广模式"(而非正常人名)。用于外国号名片的第二重条件,压误杀。
-// 命中任一:含"数字+单位(单/元/块/部/一单)"、专卖/代购、无风险、看我介绍/主页、加好友/加微信、
-//   搞钱/找我、内幕/预测、招募/收购、+联系方式引导词。正常人名(张三/John/小明)不会命中。
-function looksLikePromoName(name) {
-	const t = String(name || '');
-	if (!t.trim()) return false;
-	const patterns = [
-		/\d+\s*(单|元|块|部|一单|美金|u\b)/i,
-		/(专卖|代购|专营|旗舰)/,
-		/(无风险|风险自负)/,
-		/(看我(介绍|主页)|个人?主页|看主页|看简介)/,
-		/(加(好友|微信|群|我|一下)|私聊|滴滴我|dd我)/,
-		/(搞钱|找我|带你|带飞|上岸)/,
-		/(内幕|预测|回血|上分|下注)/,
-		/(招募|收(视频|料|号)|出(u|货|料))/i,
-	];
-	return patterns.some((re) => re.test(t));
-}
+
 
 // 统计文本里"引流@提及/频道"的分布。广告常用重复 @同一账号 或堆叠多个 @账号 引流。
 // 返回 { distinct: 去重后@数量, maxRepeat: 同一@最多重复次数 }。
-function analyzeMentionFlood(text) {
-	const t = String(text || '');
-	const counts = new Map();
-	for (const m of t.matchAll(/@[a-zA-Z][\w]{3,}/g)) {
-		const key = m[0].toLowerCase();
-		counts.set(key, (counts.get(key) || 0) + 1);
-	}
-	let maxRepeat = 0;
-	for (const v of counts.values()) if (v > maxRepeat) maxRepeat = v;
-	return { distinct: counts.size, maxRepeat };
-}
 
-const QUOTE_TEXT_KEYS = new Set(['text', 'caption', 'title', 'description', 'url']);
-const QUOTE_TEXT_SKIP_KEYS = new Set([
-	'from', 'sender_chat', 'chat', 'via_bot',
-	'forward_from', 'forward_from_chat', 'forward_origin', 'origin',
-	'entities', 'caption_entities'
-]);
 
-function collectQuoteTextParts(value, parts, depth = 0, key = '') {
-	if (!value || depth > 6) return;
-	if (typeof value === 'string') {
-		if (QUOTE_TEXT_KEYS.has(key)) parts.push(value);
-		return;
-	}
-	if (typeof value !== 'object') return;
-	if (QUOTE_TEXT_SKIP_KEYS.has(key)) return;
-	if (Array.isArray(value)) {
-		for (const item of value) collectQuoteTextParts(item, parts, depth + 1, key);
-		return;
-	}
-	for (const [childKey, childValue] of Object.entries(value)) {
-		collectQuoteTextParts(childValue, parts, depth + 1, childKey);
-	}
-}
 
-function getQuoteText(message) {
-	const parts = [];
-	collectQuoteTextParts(message.quote, parts, 0, 'quote');
-	collectQuoteTextParts(message.reply_to_message, parts, 0, 'reply_to_message');
-	collectQuoteTextParts(message.external_reply, parts, 0, 'external_reply');
-	return [...new Set(parts.map((s) => String(s).trim()).filter(Boolean))].join(' ');
-}
 
-function normalizeTelegramUserCandidate(user, source) {
-	const id = String(user?.id || '').trim();
-	if (!/^\d+$/.test(id) || id === ANON_ADMIN_BOT_ID) return null;
-	return { id, user: { ...user, id: Number(id) }, source };
-}
 
-function collectOriginalAuthors(message, mode = 'quote') {
-	const found = new Map();
-	const add = (user, source) => {
-		const candidate = normalizeTelegramUserCandidate(user, source);
-		if (candidate && !found.has(candidate.id)) found.set(candidate.id, candidate);
-	};
-	const addOrigin = (origin, source) => {
-		add(origin?.sender_user, source);
-		add(origin?.user, source);
-	};
 
-	if (mode === 'forward') {
-		addOrigin(message?.forward_origin, '转发原作者');
-		add(message?.forward_from, '转发原作者');
-		// 频道转发的原作者在 forward_from_chat 里（频道身份）
-		if (message?.forward_from_chat?.id) {
-			const fc = message.forward_from_chat;
-			add({
-				id: String(fc.id),
-				first_name: fc.title || fc.username || String(fc.id),
-				last_name: '',
-				username: fc.username || null,
-			}, '转发原频道');
-		}
-		return [...found.values()];
-	}
 
-	for (const [container, label] of [
-		[message?.reply_to_message, '引用消息'],
-		[message?.external_reply, '外部引用'],
-		[message?.quote, '引用片段'],
-	]) {
-		if (!container || typeof container !== 'object') continue;
-		addOrigin(container.forward_origin, `${label}转发原作者`);
-		addOrigin(container.origin, `${label}原作者`);
-		add(container.forward_from, `${label}转发原作者`);
-		add(container.from, `${label}作者`);
-	}
-	return [...found.values()];
-}
 
-function isForwardedMessage(message) {
-	return Boolean(
-		message?.forward_origin
-		|| message?.forward_from
-		|| message?.forward_from_chat
-		|| message?.forward_sender_name
-	);
-}
 
-function setAdIdentityProfileCache(key, value, ttlMs) {
-	if (AD_IDENTITY_PROFILE_CACHE.size >= AD_IDENTITY_CACHE_MAX && !AD_IDENTITY_PROFILE_CACHE.has(key)) {
-		const oldest = AD_IDENTITY_PROFILE_CACHE.keys().next().value;
-		if (oldest !== undefined) AD_IDENTITY_PROFILE_CACHE.delete(oldest);
-	}
-	AD_IDENTITY_PROFILE_CACHE.set(key, { value, expiresAt: Date.now() + ttlMs });
-}
 
-async function fetchAdIdentityProfile(chatId, options = {}) {
-	const id = String(chatId || '').trim();
-	if (!id) return null;
-	const key = `${BOT_TOKEN}:${id}`;
-	const cached = AD_IDENTITY_PROFILE_CACHE.get(key);
-	if (!options.forceFresh && cached && cached.expiresAt > Date.now()) return cached.value;
-	try {
-		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ chat_id: id }),
-		});
-		const result = await response.json();
-		const profile = response.ok && result?.ok && result.result ? result.result : null;
-		setAdIdentityProfileCache(
-			key,
-			profile,
-			profile ? AD_IDENTITY_CACHE_TTL_MS : AD_IDENTITY_FAILURE_CACHE_TTL_MS
-		);
-		return profile;
-	} catch (error) {
-		console.error('[广告资料检测] getChat 失败:', error);
-		setAdIdentityProfileCache(key, null, AD_IDENTITY_FAILURE_CACHE_TTL_MS);
-		return null;
-	}
-}
 
-async function resolveAdIdentityProfile(message, options = {}) {
-	const specs = [];
-	if (message?.from?.id && String(message.from.id) !== ANON_ADMIN_BOT_ID) {
-		specs.push({
-			key: `user:${message.from.id}`,
-			id: String(message.from.id),
-			kind: 'user',
-			inlineParts: [
-				message.from.first_name,
-				message.from.last_name,
-				message.from.username,
-				message.from.bio,
-			],
-		});
-	}
-	if (message?.sender_chat?.id) {
-		specs.push({
-			key: `sender_chat:${message.sender_chat.id}`,
-			id: String(message.sender_chat.id),
-			kind: 'sender_chat',
-			inlineParts: [
-				message.sender_chat.title,
-				message.sender_chat.username,
-				message.sender_chat.description,
-			],
-		});
-	}
-
-	const subjects = await Promise.all(specs.map(async (spec) => {
-		const profile = await fetchAdIdentityProfile(spec.id, options);
-		const parts = [
-			...spec.inlineParts,
-			profile?.first_name,
-			profile?.last_name,
-			profile?.username,
-			profile?.title,
-			profile?.bio,
-			profile?.description,
-		];
-		return {
-			key: spec.key,
-			id: spec.id,
-			kind: spec.kind,
-			fetchSucceeded: Boolean(profile),
-			text: [...new Set(parts.map((part) => String(part || '').trim()).filter(Boolean))].join(' '),
-		};
-	}));
-	return {
-		subjects,
-		text: subjects.map((subject) => subject.text).filter(Boolean).join(' '),
-		forceFresh: options.forceFresh === true,
-	};
-}
-
-async function resolveAdIdentityText(message, options = {}) {
-	return (await resolveAdIdentityProfile(message, options)).text;
-}
-
-// ===== 代理相关内容绝对豁免 =====
-// 只扫描消息内容，不扫描发送者姓名/用户名或群名，避免“名字叫 Clash 的用户”获得永久豁免。
-// 命中后仅跳过自动广告检测与 /recent 疑似广告缓存；D1 黑名单拦截和手动 /ban /spam 不受影响。
-const PROXY_SCAN_TEXT_KEYS = new Set(['text', 'caption', 'title', 'description', 'file_name', 'url', 'vcard']);
-const PROXY_SCAN_SKIP_KEYS = new Set([
-	'from', 'sender_chat', 'chat', 'via_bot',
-	'forward_from', 'forward_from_chat', 'forward_origin', 'origin',
-	'new_chat_member', 'new_chat_members', 'left_chat_member'
-]);
-
-function collectProxyScanParts(value, parts, depth = 0, key = '') {
-	if (value === null || value === undefined || depth > 8) return;
-	if (typeof value === 'string') {
-		if (PROXY_SCAN_TEXT_KEYS.has(key)) parts.push(value);
-		return;
-	}
-	if (typeof value !== 'object' || PROXY_SCAN_SKIP_KEYS.has(key)) return;
-	if (Array.isArray(value)) {
-		for (const item of value) collectProxyScanParts(item, parts, depth + 1, key);
-		return;
-	}
-	// 分享名片属于消息内容；只在 contact 节点读取，绝不读取 message.from 身份字段。
-	if (key === 'contact') {
-		for (const field of ['first_name', 'last_name', 'phone_number', 'vcard']) {
-			if (value[field]) parts.push(String(value[field]));
-		}
-	}
-	for (const [childKey, childValue] of Object.entries(value)) {
-		collectProxyScanParts(childValue, parts, depth + 1, childKey);
-	}
-}
-
-const PROXY_CONTENT_PATTERNS = [
-	// 中文代理语境：代理池、节点、机场、订阅/订阅转换、反代等均整条豁免。
-	/(?:代理|节点|机场|订阅|反代|反向代理)/i,
-	// 常见代理协议及简称。HTTP(S) 仅匹配代理语境或明确的“HTTP(S)”写法，不把普通网页 URL 当代理。
-	/\b(?:socks(?:4|5)?|s[45]|ss|ssr|shadowsocks|vmess|vless|trojan|hysteria2?|hy2|tuic|wireguard|naiveproxy|anytls)\b/i,
-	/(?:socks(?:4|5)?|ssr?|vmess|vless|trojan|hysteria2?|hy2|tuic|wg):\/\/\S+/i,
-	/\bhttp\(s\)(?!\w)/i,
-	/\bhttps?\s*(?:proxy\b|代理)/i,
-	// 常见代理客户端/内核/路由插件。
-	/\b(?:clash(?:\s*(?:meta|verge))?|mihomo|openclash|v2ray(?:n(?:g)?)?|nekoray|nekobox|sing[- _]?box|shadowrocket|surge|loon|quantumult\s*x|hiddify|stash|passwall|homeproxy)\b/i,
-	// 订阅转换与代理配置关键词。
-	/\b(?:subconverter|sub[- _]?store|subscription(?:s|\s+(?:converter|generator))?|proxy|proxies)\b/i,
-	/\b(?:cf[- _]?)?proxy[- _]?ip\b/i,
-	/\breverse\s+proxy\b/i,
-	/\b(?:proxy-groups?|proxy-providers?|mixed-port|redir-port|tproxy-port|external-controller|allow-lan|rule-providers?)\s*:/i,
-	/\/api\/v\d+\/client\/subscribe(?:[/?#]|$)/i,
-	// TURN/STUN/WebRTC 中继。
-	/\b(?:turn|stun)\b/i,
-	/\bwebrtc(?:\s+(?:relay|turn|stun|中继))?\b/i,
-];
-
-function hasProxyEndpointSyntax(text) {
-	const authBeforeHost = /(?:^|[\s,;|])[^\s:@/]+:[^\s@/]+@(?:\[[0-9a-f:]+\]|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}):\d{2,5}(?=$|[\s,;|/#])/i;
-	const authAfterHost = /(?:^|[\s,;|])(?:\[[0-9a-f:]+\]|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}):\d{2,5}:[^\s:]+:[^\s:]+(?=$|[\s,;|/#])/i;
-	if (authBeforeHost.test(text) || authAfterHost.test(text)) return true;
-
-	// 单个常见代理端口，或同一条消息里出现多个 host:port，按代理端点列表处理。
-	const endpointRe = /(?:^|[\s,;|])(?:\[[0-9a-f:]+\]|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}):(\d{2,5})(?=$|[\s,;|/#])/gi;
-	const ports = [...text.matchAll(endpointRe)].map((m) => Number(m[1]));
-	if (ports.length >= 2) return true;
-	const commonProxyPorts = new Set([1080, 1081, 2080, 3128, 7890, 7891, 8080, 8118, 8888, 10808, 10809]);
-	return ports.some((port) => commonProxyPorts.has(port));
-}
-
-function isProxyRelatedMessage(message) {
-	if (!message || typeof message !== 'object') return false;
-	const parts = [];
-	collectProxyScanParts(message, parts, 0, 'message');
-	if (parts.length === 0) return false;
-	let scanText = [...new Set(parts.map((part) => String(part).trim()).filter(Boolean))].join('\n');
-	try {
-		scanText = scanText.normalize('NFKC');
-	} catch (_) {}
-	if (!scanText) return false;
-	return PROXY_CONTENT_PATTERNS.some((pattern) => pattern.test(scanText)) || hasProxyEndpointSyntax(scanText);
-}
-
-function hasQuoteLikeStructure(message) {
-	return Boolean(message?.quote || message?.reply_to_message || message?.external_reply);
-}
-
-function summarizeQuoteStructure(value) {
-	if (!value || typeof value !== 'object') return null;
-	const textFields = [];
-	const scan = (node, prefix = '', depth = 0, key = '') => {
-		if (!node || typeof node !== 'object' || depth > 3 || QUOTE_TEXT_SKIP_KEYS.has(key)) return;
-		for (const [childKey, childValue] of Object.entries(node)) {
-			const path = prefix ? `${prefix}.${childKey}` : childKey;
-			if (typeof childValue === 'string' && QUOTE_TEXT_KEYS.has(childKey)) {
-				textFields.push(path);
-			} else if (childValue && typeof childValue === 'object') {
-				scan(childValue, path, depth + 1, childKey);
-			}
-		}
-	};
-	scan(value);
-	return {
-		keys: Object.keys(value).slice(0, 16),
-		text_fields: [...new Set(textFields)].slice(0, 16)
-	};
-}
-
-function summarizeQuoteStructures(message) {
-	return {
-		quote: summarizeQuoteStructure(message?.quote),
-		reply_to_message: summarizeQuoteStructure(message?.reply_to_message),
-		external_reply: summarizeQuoteStructure(message?.external_reply)
-	};
-}
-
-function isShortQuoteWrapperText(text) {
-	const raw = String(text || '')
-		.replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, '')
-		.trim();
-	if (!raw) return true;
-	const normalized = normalizeForFingerprint(raw);
-	if (!normalized) return true;
-	// 只把 t/k/1/ok 这类无意义 ASCII 包装当作"引用广告包装"。
-	// 正常中文短回复(如"那还挺好的""好的谢谢")不能触发引用广告封禁。
-	if (!/^[a-z0-9]+$/i.test(normalized)) return false;
-	return normalized.length <= 8 && /^[a-z0-9\W_]{1,16}$/i.test(raw);
-}
-
-function isHighConfidenceQuotedAdEvidence(quoteAd) {
-	if (!quoteAd) return false;
-	if (quoteAd.originalAuthorBanSafe === true) return true;
-	if (quoteAd.sampleTrusted === true) return true;
-	return [
-		'引用内容高危词',
-		'引用@引流泛滥',
-		'引用内容@bot+诱导词',
-	].includes(String(quoteAd.strong || ''));
-}
-
-function getQuotedRelayWrapper(message) {
-	if (typeof message?.text === 'string') return message.text;
-	if (typeof message?.caption === 'string') return message.caption;
-	return '';
-}
-
-function isHarmlessAccidentalQuoteReply(message) {
-	if (message?.sticker) return true;
-	const raw = getQuotedRelayWrapper(message)
-		.replace(/[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, '')
-		.trim();
-	if (!raw) return true;
-	return /^(?:好的?|谢谢|谢了|收到|嗯+|哦+|啊+|哈+|啥|什么|这是什么|怎么了|[?？])$/i.test(raw);
-}
-
-function hasVerifiableInChatReplyAuthor(message, quoteAuthors) {
-	const replyAuthorId = String(message?.reply_to_message?.from?.id || '');
-	if (!/^\d+$/.test(replyAuthorId)) return false;
-	return (quoteAuthors || []).some((candidate) => String(candidate?.id || '') === replyAuthorId);
-}
-
-function classifyQuotedAdRelay(message, quoteAd, quoteAuthors = []) {
-	if (!isHighConfidenceQuotedAdEvidence(quoteAd)) {
-		return { shouldBan: false, mode: 'weak_evidence', reason: '引用证据未达到高置信阈值' };
-	}
-	const wrapper = getQuotedRelayWrapper(message);
-	if (hasExplicitNormalAdContext(wrapper)) {
-		return { shouldBan: false, mode: 'normal_context', reason: '明确举报/询问/警告语境保护' };
-	}
-	if (
-		hasVerifiableInChatReplyAuthor(message, quoteAuthors)
-		&& isHarmlessAccidentalQuoteReply(message)
-		&& !message?.external_reply
-		&& !isForwardedMessage(message)
-	) {
-		return { shouldBan: false, mode: 'accidental_observation', reason: '可验证群内原消息的误触型短回复/贴纸' };
-	}
-	return { shouldBan: true, mode: 'high_confidence_relay', reason: '高置信广告传播，首次直接全局封禁' };
-}
-
-function logQuoteAdDiagnostic(message, quoteText, detail = {}) {
-	try {
-		console.log('[引用广告诊断]', JSON.stringify({
-			chat_id: message?.chat?.id,
-			message_id: message?.message_id,
-			user_id: message?.from?.id,
-			wrapper: truncateTelegramText(message?.text || message?.caption || '', 30),
-			quote: truncateTelegramText(quoteText || '', 120),
-			...detail
-		}));
-	} catch (error) {
-		console.error('[引用广告诊断] 输出失败:', error);
-	}
-}
-
-function scoreHighRiskAdWords(text) {
-	const hits = [];
-	// 同时比对原文与去混淆文本，防止"约·炮""六 合 彩"这类插隔符绕过高危词直杀。
-	const variants = buildAdScanVariants(text);
-	// 金融词(如 usdt/usdc/承兑)在正常讨论里很常见，不能单词直杀引用回复者。
-	// 普通自定义词也可能是宽泛词，只走 scoreAdWords 的多词/达阈值规则。
-	for (const w of AD_KEYWORDS_PORN) if (w && adScanIncludes(variants, w)) hits.push(`色情:${w}`);
-	for (const w of AD_KEYWORDS_FRAUD) if (w && adScanIncludes(variants, w)) hits.push(`诈骗:${w}`);
-	return hits;
-}
-
-function analyzeQuotedHighRiskIntent(text, highRiskHits = []) {
-	let scan = String(text || '').toLowerCase();
-	try {
-		scan = scan.normalize('NFKC');
-	} catch (_) {}
-
-	const passiveOrWarningPatterns = [
-		['他人向本人私信/推销', /(?:有人|别人|对方|陌生人|广告号|骗子|[一二两三四五六七八九十\d]+个?人).{0,20}(?:给|向)?我.{0,10}(?:私信|私聊|发消息|发广告|推销|推荐)/i],
-		['他人主动私信本人', /(?:有人|别人|对方|陌生人|广告号|骗子|[一二两三四五六七八九十\d]+个?人).{0,12}(?:私信|私聊|发消息|推销|推荐).{0,6}(?:我|本人)/i],
-		['本人收到骚扰/广告', /(?:我|本人).{0,8}(?:收到|收到了|遇到|碰到|被).{0,24}(?:私信|私聊|消息|广告|推销|骚扰|骗子|诈骗)/i],
-		['被诈骗经历', /我.{0,30}(?:被骗|受骗|上当|被坑|被骚扰)/i],
-		['收到或发现广告', /(?:收到|遇到|碰到|看见|看到|发现).{0,24}(?:广告|推销|骚扰|骗子|诈骗)/i],
-		['举报/曝光/警告', /(?:举报|曝光|通报|提醒|警惕|小心|谨防).{0,24}(?:骗子|诈骗|广告|引流|推广|别信|勿信|不要信|上当|受骗)/i],
-		['明确指出是广告/诈骗', /(?:这是|这个是|那是|那个是|属于).{0,10}(?:骗子|诈骗|广告|引流|推广)/i],
-		['明确劝阻', /(?:骗子|诈骗|广告|引流|推广).{0,12}(?:别信|勿信|不要信|小心|警惕|别联系|别加|别点|别扫码)/i],
-		['明确禁止互动', /(?:别|不要|请勿|勿)(?:相信|信|联系(?:他|她|他们|对方)|加(?:他|她|他们|对方)|点击|扫码|转账|付款|上当|理会|回复)/i],
-	];
-	const contextHits = passiveOrWarningPatterns
-		.filter(([, pattern]) => pattern.test(scan))
-		.map(([label]) => label);
-
-	const contactPattern = /(?:联系|私信|私聊|加|添加|找)(?:我|本人|客服|商家|店主|老板|代理|频道|群|微信|微|v|vx|tg|telegram)/i;
-	const accountPattern = /(?:https?:\/\/|t\.me\/|telegram\.me\/|@[a-z][\w]{3,})/i;
-	const questionPattern = /(?:怎么|如何|为什么|是否|是不是|哪里|哪儿|多少(?:钱)?|什么(?:材料|手续|流程|条件|意思)|哪些(?:材料|手续)|需要(?:什么|哪些)|要准备什么|合法吗|真的假的|靠谱吗)/i;
-	if (questionPattern.test(scan) && !contactPattern.test(scan) && !accountPattern.test(scan)) {
-		contextHits.push('咨询/提问语境');
-	}
-
-	const intentPatterns = [
-		['主动联系方式', contactPattern],
-		['账号或链接入口', accountPattern],
-		['主动提供/招揽', /(?:专业|长期|大量|稳定|低价|特价|优惠|一手|靠谱|诚信|快速|秒出|包过|保真|无风险|可办|能办|代办|承接|供应|提供|出售|售卖|接单|招募|招聘|诚招|招代理|合作代理|全套服务|上门服务)/i],
-		['价格/交易/收益', /(?:价格|售价|报价|费用|一单|每单|佣金|返利|日入|月入|赚钱|下单|购买|包邮|设备免费|[¥￥$]\s*\d|\d+(?:\.\d+)?\s*(?:元|块|rmb|u|usdt|k|w|万))/i],
-		['广告载体/营销动作', /(?:📢|📣|🔞|💰|💵|💸|点击下方|扫码|二维码|进群|频道入口|资源入口|广告位|影院大全|完整版|在线(?:看|观看)|免费(?:看|观看|领取))/i],
-	];
-	const intentHits = intentPatterns
-		.filter(([, pattern]) => pattern.test(scan))
-		.map(([label]) => label);
-
-	for (const hit of highRiskHits) {
-		const separator = String(hit).indexOf(':');
-		const word = separator >= 0 ? String(hit).slice(separator + 1) : '';
-		if (!word) continue;
-		let offset = scan.indexOf(word);
-		while (offset >= 0) {
-			const around = scan.slice(Math.max(0, offset - 12), Math.min(scan.length, offset + word.length + 12));
-			if (/(?:招|收|出|卖|接|代办|办理|可办|能办|提供|承接|出售|售卖|供应)/i.test(around)) {
-				intentHits.push(`高危词附近交易动词:${word}`);
-				break;
-			}
-			offset = scan.indexOf(word, offset + word.length);
-		}
-	}
-
-	return {
-		isPromotional: contextHits.length === 0 && intentHits.length > 0,
-		contextHits: [...new Set(contextHits)],
-		intentHits: [...new Set(intentHits)],
-	};
-}
-
-// 检测"发言人身份"(名字/用户名/简介)里的广告特征。
-// 【重要】只匹配明确的广告词(色情/卖号/卡网/赌博话术),不碰链接/@提及/域名 ——
-//   因为正常用户简介里放双向机器人 @xxxBot、github 链接、个人频道 t.me/xxx、主页域名
-//   都极其普遍,把"含链接"当广告会大面积误杀正常人(技术讨论/隐私设置)。
-//   所以身份检测唯一依据 = IDENTITY_SPAM_WORDS 广告词命中。
-// 返回命中的特征数组(空数组=没命中)。
-function detectIdentitySpam(identityText) {
-	const t = String(identityText || '');
-	if (!t.trim()) return [];
-	const hits = [];
-	// 同时比对原文与去混淆文本，防止身份词被插空格/标点/零宽字符绕过。
-	const variants = buildAdScanVariants(t.toLowerCase());
-	// 仅匹配明确广告词(卡网/卖号/色情/赌博等)。链接、@提及、域名一律不算广告。
-	for (const w of IDENTITY_SPAM_WORDS) {
-		if (w && adScanIncludes(variants, w)) hits.push(`身份广告词:${w}`);
-	}
-	return hits;
-}
-
-function collectProfilePatternHits(variants, pattern, label) {
-	const hits = [];
-	for (const text of Array.isArray(variants) ? variants : [variants]) {
-		for (const match of String(text || '').matchAll(pattern)) {
-			const value = String(match[0] || '').trim();
-			if (value) hits.push(`${label}:${value.slice(0, 30)}`);
-		}
-	}
-	return [...new Set(hits)];
-}
-
-// ===== 商业三要素槽位（资料卡判定的核心）=====
-// 实测结论：广告号与正常用户在"关键词"层面无法区分（三张真实截图里广告与正常用户
-// 都含 @xxxbot，该维度区分力为零）。真正有区分力的是【商业结构】：
-//   槽位1 提供物  —— 在卖什么（服务/商品/资源/渠道/项目）
-//   槽位2 价格交易 —— 标价、收益承诺、积分、风险话术
-//   槽位3 触达入口 —— 可成交的落地点（非 bot @账号 / 外链 / 电话 / 微信）
-// 判定：命中 ≥2 槽 = 广告；仅命中触达入口 = 正常用户常态（他们只有联系方式）。
-// 广告的本质是卖东西，不卖东西就不是广告 —— 这个约束广告号无法规避。
-const PROFILE_OFFERING_PATTERN = /(?:项目|地推|投放|招人|招募|兼职|代办|代发|出售|售卖|供应|承接|接单|货源|一手|专卖|专营|代购|社工库|查人|开户|六合彩|时时彩|内幕|精准计划|红单|推荐群|交流群|资源群|分享群|全套服务|上门服务|开票|发票|料子|水房|跑分|承兑|刷单|刷流水|加盟)/gi;
-const PROFILE_PRICING_PATTERN = /(?:日入|月入|日过|周入|年入|一天赚|一单|每单|佣金|返利|返点|分成|稳赚|躺赚|收益|高薪|日结|月结|结算|报价|价格|费用|充值|注册就送|免费领|积分|上万|过千|\d+\s*[uU]\s*=|\d+\s*(?:元|块|万|千|w\b|rmb|usdt)|[¥￥$]\s*\d|一个\s*\d+|\d+\s*风险|无风险|零风险|保真|包过)/gi;
-
-// 判定名片/资料卡显示名是否"像人名"。正常人通讯录里的名片显示名就是人名或称谓
-// （张三 / 王医生 / 妈妈 / 快递小哥 / John Smith），广告名片必须把广告写进显示名
-// 才能让人知道它卖什么 —— 这是广告无法规避的结构约束。
-// 实测：本判据 + 商业要素双条件对 6 个广告名片 / 10 个正常名片做到漏 0 误 0。
-function looksLikePersonName(name) {
-	const value = String(name || '').trim();
-	if (!value) return false;
-	const chars = Array.from(value);
-	if (chars.length > 12) return false;                 // 人名不会超过 12 字
-	if (/\d/.test(value)) return false;                  // 人名不含数字
-	try {
-		if (/[\p{Extended_Pictographic}]/u.test(value)) return false;  // 人名不带 emoji
-	} catch (_) {
-		if (/[\u{1F300}-\u{1FAFF}☀-➿]/u.test(value)) return false;
-	}
-	if (/[一-龥]/.test(value)) return chars.length <= 5;  // 中日韩姓名/称谓 ≤5 字
-	// 西文人名：1~3 个词，每词首字母大写
-	return /^[A-Z][a-z'’-]+(?:\s[A-Z][a-z'’-]+){0,2}$/.test(value);
-}
-
-// 名片显示名的商业要素槽数（提供物 / 价格交易 / 招揽动作）
-function countContactPromoSignals(displayName) {
-	const value = String(displayName || '');
-	if (!value.trim()) return 0;
-	PROFILE_OFFERING_PATTERN.lastIndex = 0;
-	PROFILE_PRICING_PATTERN.lastIndex = 0;
-	const hasOffering = PROFILE_OFFERING_PATTERN.test(value);
-	PROFILE_PRICING_PATTERN.lastIndex = 0;
-	const hasPricing = PROFILE_PRICING_PATTERN.test(value);
-	const hasSolicit = looksLikePromoName(value);
-	return [hasOffering, hasPricing, hasSolicit].filter(Boolean).length;
-}
-
-// 裸 @bot 串：正文除了多个 @xxxbot 之外别无一字。
-// 这是"协议号在群里发 bot 用户名触发广告引用"的结构签名 —— 实测这类消息去掉全部
-// @bot 提及与标点后残留 0 字，而正常用户 @ 双向机器人时一定带话（"@xxbot 帮我问下"）。
-// 不依赖任何关键词，改词/改语言/换 bot 名都躲不掉。
-function detectNakedBotMentionSpam(text) {
-	const value = String(text || '').trim();
-	if (!value) return null;
-	const botMentions = [...value.matchAll(/@[a-z][\w]{2,}bot\b/gi)].map((m) => m[0]);
-	if (botMentions.length < 2) return null;
-	let residue = value.replace(/@[a-z][\w]{2,}/gi, '');
-	try {
-		residue = residue.replace(/[\s\p{P}\p{S}]/gu, '');
-	} catch (_) {
-		residue = residue.replace(/[\s.,!?;:'"()\[\]{}<>\/\\|`~@#$%^&*+=_-]/g, '');
-	}
-	if (residue.length > 0) return null;
-	return {
-		botCount: botMentions.length,
-		distinct: [...new Set(botMentions.map((m) => m.toLowerCase()))].length,
-		preview: botMentions.slice(0, 4).join(' '),
-	};
-}
-
-function detectProfileAdEvidence(identityText) {
-	let scan = String(identityText || '').trim();
-	if (!scan) return { isAd: false, hits: [], strong: null, localIntent: false };
-	try { scan = scan.normalize('NFKC'); } catch (_) {}
-	scan = scan.toLowerCase();
-	// 反混淆扫描文本:原文 + 去零宽字符/压逐字分隔片段。所有词库与意图正则都按两份文本比对，
-	// 任一命中即算，堵住"广 告 位 招 租""联·系·我"这类插隔符绕过。
-	// 豁免类判断同样使用两份文本:豁免本就可用明文触发，反混淆不新增绕过能力，
-	// 但能保护"反 广 告 志 愿 者"这类用逐字强调的正常用户不被反混淆后的词库反咬。
-	const scanVariants = buildAdScanVariants(scan);
-
-	// 资料卡也遵守代理内容绝对豁免；技术协议、客户端和订阅信息不能成为广告证据。
-	// 例外(仅资料卡):PROXY_CONTENT_PATTERNS 含裸词"代理/订阅/节点"，是技术与广告的歧义词
-	// ——技术语境指网络代理，广告语境指"招代理/代理加盟"。广告号只要写"代理"就能拿到
-	// 永久免疫(实测"专业推广引流 招代理加盟 佣金日结"被整条豁免)。因此下列两种情形不再豁免；
-	// 纯技术代理讨论不含这些结构，仍完全豁免。
-	const adServiceSolicitation = adScanMatches(scanVariants, /(?:广告|推广|引流|招商)/i)
-		&& adScanMatches(scanVariants, /(?:招|承接|出售|售卖|代发|投放|加盟|佣金|返利|日入|月入|日结|结算|接单)/i);
-	// 情形二:"代理"以【商业代理招募】句式出现(招代理/诚招代理/代理加盟/代理分成…)。
-	// 这类文本可能完全不含"广告/推广"字样(如"运营团队 诚招代理加盟 日入过千")，
-	// 上面那条判不出来，但它显然不是网络代理讨论。技术语境说的是"用代理/搭代理/代理节点"，
-	// 不会说"招代理""代理加盟""代理佣金"。
-	const agentRecruitment = adScanMatches(scanVariants, /(?:招|收|诚招|招募|寻|找)\s*(?:各级|一级|二级|总)?代理/i)
-		|| adScanMatches(scanVariants, /代理\s*(?:加盟|入驻|分成|佣金|返点|返利|日结|月结|合作(?:伙伴)?)/i)
-		|| adScanMatches(scanVariants, /(?:一手|全国|长期)\s*代理(?:商)?/i);
-	if (!adServiceSolicitation && !agentRecruitment && isProxyRelatedMessage({ text: scan })) {
-		return { isAd: false, hits: ['资料卡代理内容绝对豁免'], strong: null, localIntent: false };
-	}
-	// 反广告/反诈工具与声明的语义方向与广告相反，必须在评分前整条豁免。
-	// 典型误杀:"Cloudflare验证+广告屏蔽测试客服机器人"——它是【屏蔽广告】的工具，
-	// 却因同时含"广告"字样与"客服"结构被判成【发广告】。此处显式识别反向语境。
-	const antiAdContext = adScanMatches(scanVariants, /(?:屏蔽|拦截|过滤|检测|识别|清理|删除|举报|反|防|禁)\s*(?:广告|推广|引流|垃圾消息|垃圾信息|spam)/i)
-		|| adScanMatches(scanVariants, /(?:广告|推广|引流|垃圾消息|垃圾信息|spam)\s*(?:屏蔽|拦截|过滤|检测|识别|清理|删除|举报|防护|机器人|bot)/i)
-		|| adScanMatches(scanVariants, /(?:反广告|反诈|反骗|防诈|防骗|谨防诈骗|举报广告|曝光骗子|验证机器人|验证bot)/i);
-	// 主动声明"拒绝私聊/广告骚扰"是正常用户的自我保护，不是招揽。
-	// 覆盖"拉黑/屏蔽/免打扰"等原词表缺失的表达（本次误杀卡写的是"私聊直接拉黑"）。
-	const refusalContext = adScanMatches(scanVariants, /(?:拒绝|谢绝|禁止|请勿|勿|别|不要|不接|退订)(?:任何)?(?:广告|推广|引流|推销|私信|私聊|加好友|合作|接单|骚扰)/i)
-		|| adScanMatches(scanVariants, /(?:私聊|私信|广告|推销|推广|陌生人|骚扰)(?:的人)?.{0,10}(?:直接)?(?:拉黑|屏蔽|举报|删除|不回|免打扰|勿扰)/i)
-		|| adScanMatches(scanVariants, /(?:拉黑|屏蔽|免打扰|勿扰|不回)(?:所有|任何)?(?:私聊|私信|广告|推销|推广|骚扰)/i);
-	// 身份/职业陈述不是招揽。资料卡写"客服""运营""博主""自由职业"是在介绍自己是谁，
-	// 而不是在推销什么 —— 但这些词恰好落在 marketingHits/businessHits 的词表里
-	// （"客服""接单""合作"），单靠词表无法区分。此处显式豁免"纯身份陈述"：
-	// 只有当这些词以【职业身份句式】出现、且资料卡内没有任何交易招揽信号时才豁免；
-	// 一旦同时出现收益/价格/招募/落地点，说明不是自我介绍而是揽客，不豁免。
-	const occupationStatement = adScanMatches(
-		scanVariants,
-		/(?:^|[\s|、,，/·\-—(（【[])(?:在职|前|资深|公司|企业|专职|全职|兼任)?(?:客服|运营|销售|市场|公关|编辑|记者|博主|up主|自由职业|设计师|程序员|开发者|工程师|运维|站长|作者|译者|摄影师|讲师|老师|学生|研究员|分析师)(?:$|[\s|、,，/·\-—)）】\]])/i,
-	);
-	const solicitationSignal = adScanMatches(
-		scanVariants,
-		/(?:日入|月入|佣金|返利|稳赚|躺赚|一单|每单|日结|结算|报价|价格|费用|优惠|招募|招聘|诚招|招代理|代理加盟|加盟|代发|投放|承接|出售|售卖|供应|包过|保真|无风险|上门服务|全套服务)/i,
-	);
-	const occupationOnlyContext = occupationStatement && !solicitationSignal;
-	const normalContext = scanVariants.some((variant) => hasExplicitNormalAdContext(variant))
-		|| antiAdContext
-		|| refusalContext
-		|| occupationOnlyContext;
-	if (normalContext) {
-		const label = antiAdContext
-			? '资料卡反广告/反诈语境保护'
-			: (occupationOnlyContext ? '资料卡职业身份陈述保护' : '资料卡正常/否定语境保护');
-		return { isAd: false, hits: [label], strong: null, localIntent: false };
-	}
-
-	const identityHits = detectIdentitySpam(scan);
-	const rawHighRiskHits = scoreHighRiskAdWords(scan);
-	const highRiskHits = rawHighRiskHits.map((hit) => `资料卡${hit}`);
-	const financeHits = AD_KEYWORDS_FINANCE.filter((word) => word && adScanIncludes(scanVariants, word));
-	const revenueHits = collectProfilePatternHits(
-		scanVariants,
-		/(?:日入|月入|佣金|返利|稳赚|躺赚|收益|一单|每单|高薪|兼职|赚钱|出u|接u|承兑|跑分|刷流水)/gi,
-		'资料卡收益/交易'
-	);
-	const businessHits = collectProfilePatternHits(
-		scanVariants,
-		/(?:出售|售卖|供应|承接|接单|代办|招募|招聘|诚招|招代理|代理加盟|合作代理|全套服务|内幕|精准计划|红单推荐)/gi,
-		'资料卡业务招揽'
-	);
-	const marketingHits = collectProfilePatternHits(
-		scanVariants,
-		/(?:分享群|交流群|资源群|公群|频道|客服|联系(?:我|客服)|私信(?:我|客服)|加(?:我|客服)|找(?:我|客服)|咨询(?:我|客服)|点击下方|扫码|进群|入口|免费(?:看|观看|领取)|完整版|内幕|精准)/gi,
-		'资料卡营销结构'
-	);
-	const mentions = [...scan.matchAll(/@[a-z][\w]{2,}/gi)].map((match) => match[0].toLowerCase());
-	const nonBotMentions = [...new Set(mentions.filter((mention) => !mention.endsWith('bot')))];
-	const botMentions = [...new Set(mentions.filter((mention) => mention.endsWith('bot')))];
-	const telegramTargets = [...scan.matchAll(/(?:t\.me|telegram\.me)\/([a-z0-9_+\-/]+)/gi)]
-		.map((match) => String(match[1] || '').replace(/^\+/, '').split('/')[0].toLowerCase())
-		.filter(Boolean);
-	const nonBotTelegramTargets = [...new Set(telegramTargets.filter((target) => !target.endsWith('bot')))];
-	const urls = collectUrls({ text: scan });
-	const nonWhitelistedUrls = urls.filter((url) => !allUrlsWhitelisted([url]));
-	const phoneOrSocialHandle = adScanMatches(scanVariants, /(?:微信|微|vx|v信|qq)\s*[:：]?\s*[a-z0-9_-]{4,}|\+?\d[\d\s().-]{7,}\d/i);
-	const destinationHits = [
-		...nonBotMentions.map((value) => `资料卡联系账号:${value}`),
-		...nonBotTelegramTargets.map((value) => `资料卡Telegram入口:${value}`),
-		...nonWhitelistedUrls.slice(0, 3).map((value) => `资料卡外链:${String(value).slice(0, 50)}`),
-		...(phoneOrSocialHandle ? ['资料卡电话/社交账号'] : []),
-	];
-	const directSolicitation = adScanMatches(scanVariants, /(?:联系|私信|私聊|加|添加|找|咨询)(?:我|本人|客服|商家|店主|老板|代理)/i);
-	const intent = analyzeQuotedHighRiskIntent(scan, [
-		...rawHighRiskHits,
-		...identityHits,
-	]);
-	const explicitRisk = highRiskHits.length > 0 || identityHits.length > 0;
-	const pairedHighRisk = highRiskHits.length >= 2;
-	const financePromotion = financeHits.length >= 2
-		&& /(?:爆u|出u|接u|承兑.{0,12}usdt|usdt.{0,12}承兑)/i.test(scan)
-		&& /(?:项目|代理|合作|招募|联系|私信|加|日入)/i.test(scan);
-	// 只保留【广告服务本身】的标签词。原先含"频道主|资源主"——那是身份描述不是招揽，
-	// 正常频道主在简介里放自己频道链接会被判成广告(实测误杀)，故移除。
-	// 真正的频道主广告一定伴随 招商/合作/日入 等词，由其余分支覆盖。
-	const explicitAdLabel = adScanMatches(scanVariants, /(?:广告|推广|引流|招商)/i);
-	// 收紧:仅"含广告字样 + 营销词"不足以定罪——描述自身功能(如"广告屏蔽测试客服机器人")
-	// 会同时命中两者却零引流意图。真广告必然给出可达的落地点(非 bot 账号/外链/电话)
-	// 或明确招揽动作，故此处与 structuredBusiness 对齐要求，纯 bot 提及不算落地点。
-	const explicitAdStructure = explicitAdLabel
-		&& (destinationHits.length > 0 || directSolicitation);
-	const riskWithPromotion = explicitRisk
-		&& (pairedHighRisk || intent.isPromotional || marketingHits.length > 0 || destinationHits.length > 0);
-	const structuredBusiness = (revenueHits.length > 0 || businessHits.length > 0)
-		&& (destinationHits.length > 0 || directSolicitation)
-		|| financePromotion;
-	const identityComposite = identityHits.length > 0
-		&& destinationHits.length > 0
-		&& marketingHits.length > 0;
-
-	// ===== 商业三要素槽位判定（本次重构核心）=====
-	// 旧判定链（riskWithPromotion / structuredBusiness / explicitAdStructure）依赖
-	// 各词表两两组合，实测既漏杀真广告（"加群看项目 一天赚8千"、"地推充电宝投放项目
-	// 一个400，最新项目0风险" 都被放行），又误杀正常用户（"广告屏蔽测试客服机器人"）。
-	// 换成结构判定：卖什么 + 多少钱 + 去哪找，命中 ≥2 槽即广告。
-	// 正常用户资料卡只有"去哪找"（联系方式），永远够不到 2 槽。
-	PROFILE_OFFERING_PATTERN.lastIndex = 0;
-	const offeringHits = collectProfilePatternHits(scanVariants, PROFILE_OFFERING_PATTERN, '资料卡提供物');
-	PROFILE_PRICING_PATTERN.lastIndex = 0;
-	const pricingHits = collectProfilePatternHits(scanVariants, PROFILE_PRICING_PATTERN, '资料卡价格/收益');
-	// 多账号目录：资料卡里列 ≥3 个【非 bot】@账号 = 那是一份目录/菜单，本身就是"提供物"。
-	// 实测案例：`中国 @quanqiu0001 越南 @Manilawai 日本 @Manilawai1 菲妹 @MKHF01`
-	// —— 按国别分类的招嫖账号目录，三要素词表一个都不命中（国名不是"提供物"词）。
-	// 正常用户简介里最多放自己的双向 bot 和自己的频道（1~2 个，且多为 bot 结尾）；
-	// 列一串别人的账号只有一种解释。纯结构判断，改词/换国家/换语言都躲不掉。
-	const accountDirectory = nonBotMentions.length >= 3;
-	// 槽位归类必须互斥：同一个词不能同时填两个槽，否则单词即达 2 槽（实测 "今日入门" 被
-	// 反混淆压成 "今日入门" 后命中 "日入"，同时落进 revenueHits 与 pricingHits 两个集合，
-	// 一个词凑出 2 槽被误杀）。收益/佣金类词语义上属于【价格交易】，不属于【提供物】。
-	const slotOffering = offeringHits.length > 0 || businessHits.length > 0 || accountDirectory;
-	const slotPricing = pricingHits.length > 0 || revenueHits.length > 0;
-	const slotDestination = destinationHits.length > 0 || directSolicitation;
-	const slotCount = [slotOffering, slotPricing, slotDestination].filter(Boolean).length;
-	const commercialStructure = slotCount >= 2;
-
-	const localIntent = riskWithPromotion
-		|| structuredBusiness
-		|| identityComposite
-		|| explicitAdStructure
-		|| commercialStructure;
-
-	const fingerprint = normalizeForFingerprint(scan);
-	const exactSample = fingerprint.length >= SAMPLE_FP_EXACT_MIN
-		? getAdSampleMatch(fingerprint, 'profile')
-		: null;
-	const similarSample = findSimilarTrustedAdSample(scan, 'profile');
-	const sampleHits = [];
-	if (exactSample?.trusted && localIntent) sampleHits.push('资料卡可信学习样本精确匹配');
-	if (similarSample && localIntent) {
-		sampleHits.push(
-			'资料卡可信学习样本相似匹配:Dice='
-			+ similarSample.dice.toFixed(3)
-			+ '/包含='
-			+ similarSample.containment.toFixed(3)
-		);
-	}
-
-	if (sampleHits.length > 0) {
-		return {
-			isAd: true,
-			score: 99,
-			hits: sampleHits,
-			strong: exactSample?.trusted ? '资料卡广告(精确样本)' : '资料卡广告(相似样本)',
-			localIntent,
-			sampleTrusted: true,
-			sampleSimilarityTrusted: Boolean(similarSample),
-		};
-	}
-	if (!localIntent) {
-		const neutralBotHits = botMentions.length > 0
-			? [`资料卡普通Bot提及(不作为广告证据):${botMentions.join(',')}`]
-			: [];
-		return {
-			isAd: false,
-			score: 0,
-			hits: neutralBotHits,
-			strong: null,
-			localIntent: false,
-		};
-	}
-	return {
-		isAd: true,
-		score: 99,
-		hits: [...new Set([
-			...identityHits,
-			...highRiskHits,
-			...offeringHits,
-			...pricingHits,
-			...revenueHits,
-			...businessHits,
-			...marketingHits,
-			...destinationHits,
-			...(accountDirectory ? [`资料卡多账号目录:${nonBotMentions.length} 个非 bot 账号`] : []),
-		])],
-		strong: explicitRisk
-			? '资料卡高危业务+推广结构'
-			: (commercialStructure && !structuredBusiness && !explicitAdStructure
-				? `资料卡商业结构${slotCount}/3槽`
-				: '资料卡交易招揽+联系方式'),
-		localIntent: true,
-		slotCount,
-		commercialStructure,
-	};
-}
-
-// 广告检测(多维度评分 + 强特征直杀)
-// 返回 { isAd, score, hits: string[], strong: string|null }
-function detectQuotedAdEvidence(message, quoteText) {
-	if (!quoteText) return null;
-	let quoteForScan = String(quoteText).toLowerCase();
-	for (const w of AD_WHITELIST) {
-		if (w) quoteForScan = quoteForScan.split(w).join('');
-	}
-	const quotePreview = String(quoteText).slice(0, 100);
-	const makeResult = (strong, hits, score = 99, extra = {}) => ({
-		score,
-		hits,
-		strong,
-		source: '引用内容',
-		quotePreview,
-		originalAuthorBanSafe: false,
-		...extra,
-	});
-
-	const mention = analyzeMentionFlood(quoteText);
-	if (mention.maxRepeat >= 3 || mention.distinct >= 4) {
-		const hits = [`引用@引流泛滥:不同${mention.distinct}个/最多重复${mention.maxRepeat}次`];
-		logQuoteAdDiagnostic(message, quoteText, { decision: 'quote_ad_mention_flood', score: 99, hits });
-		return makeResult('引用@引流泛滥', hits, 99, { originalAuthorBanSafe: true });
-	}
-
-	const quoteNorm = normalizeForFingerprint(quoteText);
-	const sampleMatch = quoteNorm.length >= SAMPLE_FP_EXACT_MIN ? getAdSampleMatch(quoteNorm, 'quote') : null;
-	const quoteUrlsAllWhite = allUrlsWhitelisted(collectUrls({ text: quoteText }));
-	if (sampleMatch?.trusted && !quoteUrlsAllWhite) {
-		const hits = ['引用内容可信学习样本精确匹配'];
-		logQuoteAdDiagnostic(message, quoteText, { decision: 'quote_ad_trusted_sample', score: 99, hits });
-		return makeResult('引用内容广告', hits, 99, { sampleTrusted: true, originalAuthorBanSafe: true });
-	}
-	const similarityMatch = !quoteUrlsAllWhite ? findSimilarTrustedAdSample(quoteText, 'quote') : null;
-	if (similarityMatch) {
-		const hits = ['引用内容可信学习样本相似匹配:Dice=' + similarityMatch.dice.toFixed(3) + '/包含=' + similarityMatch.containment.toFixed(3)];
-		logQuoteAdDiagnostic(message, quoteText, { decision: 'quote_ad_similar_sample', score: 99, hits });
-		return makeResult('引用内容相似学习样本', hits, 99, {
-			sampleTrusted: true,
-			sampleSimilarityTrusted: true,
-			originalAuthorBanSafe: true,
-		});
-	}
-
-	const highRiskHits = scoreHighRiskAdWords(quoteForScan);
-	if (highRiskHits.length > 0) {
-		const intent = analyzeQuotedHighRiskIntent(quoteForScan, highRiskHits);
-		if (!intent.isPromotional) {
-			logQuoteAdDiagnostic(message, quoteText, {
-				decision: intent.contextHits.length > 0 ? 'quote_high_risk_normal_context' : 'quote_high_risk_without_ad_intent',
-				score: 0,
-				hits: highRiskHits,
-				contextHits: intent.contextHits,
-				intentHits: intent.intentHits,
-			});
-			return null;
-		}
-		const hits = [
-			...highRiskHits.map((hit) => `引用内容高危:${hit}`),
-			...intent.intentHits.map((hit) => `引用内容广告意图:${hit}`),
-		];
-		logQuoteAdDiagnostic(message, quoteText, {
-			decision: 'quote_ad_high_risk_with_intent',
-			score: 99,
-			hits,
-			intentHits: intent.intentHits,
-		});
-		return makeResult('引用内容高危词', hits, 99, {
-			legacySampleCorroborated: sampleMatch?.legacy === true,
-			originalAuthorBanSafe: true,
-		});
-	}
-
-	const mentionsBot = /@[a-z][\w]{2,}bot\b/i.test(quoteForScan);
-	const hasLure = /(点击下方|完整版|免费(看|观看|领)|加我(看|领)|资源(群|站)|看完整|扫码|进群看)/.test(quoteForScan);
-	if (mentionsBot && hasLure) {
-		const hits = ['引用内容@bot+诱导词'];
-		logQuoteAdDiagnostic(message, quoteText, { decision: 'quote_ad_bot_lure', score: 99, hits });
-		return makeResult('引用内容@bot+诱导词', hits, 99, {
-			legacySampleCorroborated: sampleMatch?.legacy === true,
-			originalAuthorBanSafe: true,
-		});
-	}
-
-	if (!AD_STRICT_MODE) {
-		const scored = scoreAdWords(quoteForScan);
-		if (scored.score >= AD_SCORE_THRESHOLD || scored.hits.length >= 2) {
-			const hits = scored.hits.map((hit) => `引用内容${hit}`);
-			logQuoteAdDiagnostic(message, quoteText, { decision: 'quote_ad_score', score: Math.max(scored.score, AD_SCORE_THRESHOLD), hits });
-			return makeResult('引用内容命中广告词', hits, Math.max(scored.score, AD_SCORE_THRESHOLD), {
-				legacySampleCorroborated: sampleMatch?.legacy === true,
-			});
-		}
-	}
-
-	logQuoteAdDiagnostic(message, quoteText, {
-		decision: sampleMatch?.legacy ? 'legacy_sample_without_corroboration' : 'quote_no_match',
-		score: 0,
-		hits: [],
-	});
-	return null;
-}
-
-async function detectAdLegacy(message, env) {
-	if (!AD_FILTER_ENABLED) return { isAd: false, score: 0, hits: [], strong: null };
-	// 代理相关内容整条绝对豁免：不进入词库、学习样本、引用 @、短文本包装等任何自动广告规则。
-	if (isProxyRelatedMessage(message)) return { isAd: false, score: 0, hits: [], strong: null };
-
-	const quoteText = getQuoteText(message);
-	// 正文检测只接收消息自身载体，不再混入姓名、用户名、bio 或 sender_chat 资料。
-	// 名片和内联按钮仍属于消息正文载体，继续保留原有检测行为。
-	const bodyText = getAdDetectionBodyText(message).toLowerCase();
-	const fullText = bodyText;
-	const hits = [];
-
-	// 白名单:把白名单词从计分文本里挖掉(命中也不计分)
-	let scoringText = fullText;
-	for (const w of AD_WHITELIST) {
-		if (w) scoringText = scoringText.split(w).join('');
-	}
-
-	const urls = collectUrls(message);
-	// 链接分级:纯白名单链接(github/google等)放行;含可疑短链单独加分
-	const urlsAllWhite = allUrlsWhitelisted(urls);
-	const urlsSuspicious = hasSuspiciousUrl(urls);
-
-	// 强特征 0.5:广告名片直杀 —— 判据从"电话国别"换成"显示名结构"。
-	//   旧规则要求【非 +86 外国号】+ 推广名，实测这个前置条件是错的:
-	//     广告名片里外国号占比 1/6 (17%)，正常名片里 2/10 (20%) —— 电话国别几乎零区分力，
-	//     而它作为硬前置直接导致 6 个广告名片漏杀 5 个(如 `+86 185 xxxx` 的地推招人名片)。
-	//   新判据(实测 6 广告 / 10 正常 → 漏 0 误 0):
-	//     ① 显示名【不像人名】—— 正常人通讯录里的名片名就是人名或称谓(张三/王医生/妈妈/
-	//        快递小哥/John Smith)，≤5 字中文或首字母大写西文，无数字无 emoji;
-	//     ② 显示名含【商业要素】≥1 —— 提供物/价格交易/招揽动作。
-	//   广告名片必须把广告写进显示名，否则没人知道它卖什么 —— 这是它无法规避的结构约束。
-	if (message.contact) {
-		const contactPhone = message.contact.phone_number || '';
-		const contactDisplayName = [message.contact.first_name, message.contact.last_name].filter(Boolean).join(' ');
-		const promoSignals = countContactPromoSignals(contactDisplayName);
-		if (!looksLikePersonName(contactDisplayName) && promoSignals >= 1) {
-			return {
-				isAd: true,
-				score: 99,
-				hits: [`广告名片:${contactDisplayName.slice(0, 30)}${contactPhone ? ' / ' + contactPhone : ''}（商业要素 ${promoSignals} 项，显示名非人名）`],
-				strong: '广告名片(显示名非人名+商业要素)'
-			};
-		}
-	}
-
-	// 强特征 1:学习样本指纹精确匹配(/spam /learn /learnlast 上报过的广告)
-	//   归一化后完全相等才命中,不做子串包含(避免误杀正常长消息)
-	const normMsg = normalizeForFingerprint(bodyText);
-	if (!urlsAllWhite && normMsg.length >= SAMPLE_FP_EXACT_MIN && AD_SAMPLE_FINGERPRINTS.length > 0) {
-		for (const fp of AD_SAMPLE_FINGERPRINTS) {
-			if (!fp || fp.length < SAMPLE_FP_EXACT_MIN) continue;
-			if (normMsg === fp) {
-				if (!getAdSampleMatch(fp)?.trusted) continue;
-				return { isAd: true, score: 99, hits: ['学习样本精确匹配'], strong: '学习样本(精确)' };
-			}
-		}
-	}
-	const similarSample = !urlsAllWhite ? findSimilarTrustedAdSample(bodyText) : null;
-	if (similarSample) {
-		return {
-			isAd: true,
-			score: 99,
-			hits: ['学习样本相似匹配:Dice=' + similarSample.dice.toFixed(3) + '/包含=' + similarSample.containment.toFixed(3)],
-			strong: '学习样本(相似)',
-		};
-	}
-
-	// 强特征 1.4:裸 @bot 串直杀 —— "协议号在群里发 bot 用户名触发广告引用"的结构签名。
-	//   实测两个真实案例:
-	//     `@gtqz646xbot @gtqdqlpibot @gtqg0c3kbot`
-	//     `@eeshabxjkjhx55_bot @ddshjdhjxhx55_bot @ffhsxjhshx55_bot`
-	//   去掉全部 @提及与标点后残留 0 字 —— 正文除了 bot 用户名别无一物。
-	//   这些号的资料卡完全干净(印度语祈祷句 / 空简介)，词库与资料卡通路都抓不到，
-	//   但它们是广告投放链条的触发端(bot 收到 @ 后回帖广告)。
-	//   正常用户 @ 双向机器人时一定带话("@xxbot 帮我问下")，且 ≥2 个的条件再压一层，
-	//   所以误杀面极低。纯结构判断，改词/换语言/换 bot 名都躲不掉。
-	const nakedBotSpam = detectNakedBotMentionSpam(message.text || message.caption || '');
-	if (nakedBotSpam) {
-		return {
-			isAd: true,
-			score: 99,
-			hits: [`裸@bot串:${nakedBotSpam.botCount} 个(不同 ${nakedBotSpam.distinct} 个)、正文无其它内容 → ${nakedBotSpam.preview}`],
-			strong: '裸@bot串(协议号触发广告)',
-		};
-	}
-
-	// 强特征 1.5:引用框@引流泛滥(专治"短正文 + 引用框堆叠@账号"的引流广告)。
-	//   命中双条件:① 当前发送者正文很短(归一化 ≤ 8 字,任何语言,包括"笛裙带走六百"这类无意义中文包装);
-	//   ② 被引用内容里 @账号 泛滥:同一 @重复 ≥ 3 次,或不同 @账号 ≥ 4 个。
-	//   正常人引用某条消息回复时,正文是正常句子(不会 ≤8 字无意义)且不会堆一堆@,所以误杀率极低。
-	//   杀当前"二次广播广告"的发送者,不处理被引用的原消息作者。
-	if (quoteText) {
-		const senderBodyNorm = normalizeForFingerprint(message.text || message.caption || '');
-		const mention = analyzeMentionFlood(quoteText);
-		if (senderBodyNorm.length <= 8 && (mention.maxRepeat >= 3 || mention.distinct >= 4)) {
-			logQuoteAdDiagnostic(message, quoteText, {
-				decision: 'kill_mention_flood',
-				score: 99,
-				hits: [`引用@引流泛滥:不同${mention.distinct}/最多重复${mention.maxRepeat}`]
-			});
-			return {
-				isAd: true,
-				score: 99,
-				hits: [`引用@引流泛滥:不同${mention.distinct}个/最多重复${mention.maxRepeat}次`],
-				strong: '引用@引流泛滥',
-				source: '引用内容',
-				quotePreview: quoteText.slice(0, 100)
-			};
-		}
-	}
-
-	// 强特征 1.6:引用频道内容检测（专治"转发频道帖子"和"分享频道链接"类广告）。
-	//   两种子判据：
-	//     甲:手动转发频道帖子 —— forward_from_chat 存在（频道身份转发，非 is_automatic_forward）、
-	//        且 forward_origin 类型为 channel。频道是广告投放的主阵地，真人手动转频道帖到群里
-	//        绝大多数是引流广告（正常用户不会手动转频道帖到群里）。
-	//        【改为警告制】不再直接封禁，而是先警告，满3次后再封禁。
-	//     乙:正文含频道链接 —— 文本里出现 t.me/xxx 或 @xxx 格式的频道链接，且同时出现诱导词
-	//        （进群/频道/关注/订阅/领取/免费/福利）→ 典型的"分享频道引流广告"。
-	//   误杀防线：
-	//     - 自动转发帖（is_automatic_forward）由 isChannelAutoForward 早退排除，不进入此判据；
-	//     - 纯频道链接无诱导词不加分（避免误伤正常分享）；
-	//     - 严格模式下只kill手动转频道帖（甲），不kill含链接+诱导词（乙）。
-	const forwardFromChat = message?.forward_from_chat;
-	const isManualChannelForward = Boolean(forwardFromChat && message?.forward_origin?.type === 'channel' && !message?.is_automatic_forward);
-	if (isManualChannelForward) {
-		const channelTitle = forwardFromChat.title || forwardFromChat.username || String(forwardFromChat.id);
-		return {
-			isAd: true,
-			score: 99,
-			hits: [`手动转发频道帖:频道 ${channelTitle}${forwardFromChat.username ? ' @' + forwardFromChat.username : ''}`],
-			strong: '手动转发频道帖(频道引流广告)',
-			source: '频道转发',
-			// 标记为频道转发，由 handleAutomaticAdDecision 处理警告逻辑
-			channelForwardWarning: true,
-		};
-	}
-	if (!AD_STRICT_MODE && !urlsAllWhite) {
-		// 检测正文中的频道链接（t.me/xxx 或 @xxx）+ 诱导词
-		const hasChannelLink = /(?:t\.me\/[a-zA-Z0-9_]+|@[a-zA-Z0-9_]{4,})\b/i.test(fullText);
-		const hasChannelLure = /(进群|加群|频道|关注|订阅|领取|免费|福利|资源|入群|扫码进|点击加入|看更多|完整版在)/i.test(fullText);
-		if (hasChannelLink && hasChannelLure) {
-			return {
-				isAd: true,
-				score: 99,
-				hits: [`频道链接+诱导词:正文含频道链接且出现引流诱导词`],
-				strong: '频道链接引流广告',
-				source: '正文',
-			};
-		}
-	}
-
-	// 强特征 2:短正文包装引用广告。广告号会把正文写成 t/s/l/1,把广告放在引用框里规避正文检测。
-	// 命中后删除当前这条"短正文+引用广告"消息,封当前发送者,不处理被引用消息发送者。
-	const shortQuoteWrapper = isShortQuoteWrapperText(message.text || message.caption || '');
-	if (quoteText && shortQuoteWrapper) {
-		let quoteForScan = quoteText.toLowerCase();
-		for (const w of AD_WHITELIST) {
-			if (w) quoteForScan = quoteForScan.split(w).join('');
-		}
-		const quoteNorm = normalizeForFingerprint(quoteText);
-		if (quoteNorm.length >= SAMPLE_FP_EXACT_MIN && AD_SAMPLE_FINGERPRINTS.length > 0) {
-			for (const fp of AD_SAMPLE_FINGERPRINTS) {
-				if (!fp || fp.length < SAMPLE_FP_EXACT_MIN) continue;
-				if (quoteNorm === fp) {
-					if (!getAdSampleMatch(fp, 'quote')?.trusted) continue;
-					logQuoteAdDiagnostic(message, quoteText, {
-						decision: 'kill_sample_exact',
-						score: 99,
-						hits: ['引用内容学习样本精确匹配']
-					});
-					return {
-						isAd: true,
-						score: 99,
-						hits: ['引用内容学习样本精确匹配'],
-						strong: '引用内容广告',
-						source: '引用内容',
-						quotePreview: quoteText.slice(0, 100)
-					};
-				}
-			}
-		}
-		const quotedHighRiskHits = scoreHighRiskAdWords(quoteForScan);
-		if (quotedHighRiskHits.length > 0) {
-			const hits = quotedHighRiskHits.map((h) => `引用内容高危:${h}`);
-			logQuoteAdDiagnostic(message, quoteText, {
-				decision: 'kill_high_risk_word',
-				score: 99,
-				hits
-			});
-			return {
-				isAd: true,
-				score: 99,
-				hits,
-				strong: '引用内容高危词',
-				source: '引用内容',
-				quotePreview: quoteText.slice(0, 100)
-			};
-		}
-		// 严格模式下跳过引用内容加权评分(同正文路径逻辑一致,只留上方强特征直杀)
-		if (!AD_STRICT_MODE) {
-			const quotedWordScore = scoreAdWords(quoteForScan);
-			if (quotedWordScore.score >= AD_SCORE_THRESHOLD || quotedWordScore.hits.length >= 2) {
-				const hits = quotedWordScore.hits.map((h) => `引用内容${h}`);
-				logQuoteAdDiagnostic(message, quoteText, {
-					decision: 'kill_score_or_multi_word',
-					score: Math.max(quotedWordScore.score, AD_SCORE_THRESHOLD),
-					hits
-				});
-				return {
-					isAd: true,
-					score: Math.max(quotedWordScore.score, AD_SCORE_THRESHOLD),
-					hits,
-					strong: '引用内容命中广告词',
-					source: '引用内容',
-					quotePreview: quoteText.slice(0, 100)
-				};
-			}
-			logQuoteAdDiagnostic(message, quoteText, {
-				decision: 'no_match',
-				score: quotedWordScore.score,
-				hits: quotedWordScore.hits,
-				highRiskHits: quotedHighRiskHits
-			});
-		} else {
-			logQuoteAdDiagnostic(message, quoteText, { decision: 'no_match', score: 0, hits: [], highRiskHits: [] });
-		}
-	} else if (shortQuoteWrapper && hasQuoteLikeStructure(message)) {
-		logQuoteAdDiagnostic(message, quoteText, {
-			decision: 'quote_structure_no_text',
-			structures: summarizeQuoteStructures(message)
-		});
-	}
-
-	// 强特征 4:名片显示名命中词库 → 直接判广告秒杀(实现"名字带广告就杀")
-	//   原理:正常用户的名片显示名(张三/小明/John)几乎不可能含"假钞/承兑/约炮"这类词,
-	//   所以名片名字一旦命中任意分类词,直接判定,不必凑分。误杀面极低。
-	//   注意:只针对【名片显示名】,不针对普通聊天文本(那个仍走加权评分,避免正常聊天误杀)。
-	if (message.contact) {
-		const contactName = [message.contact.first_name, message.contact.last_name]
-			.filter(Boolean).join(' ').toLowerCase();
-		if (contactName) {
-			// 白名单词先挖掉,避免特定话题群误伤
-			let nameForScan = contactName;
-			for (const w of AD_WHITELIST) if (w) nameForScan = nameForScan.split(w).join('');
-			const allAdWords = [
-				...AD_KEYWORDS_FINANCE, ...AD_KEYWORDS_PORN, ...AD_KEYWORDS_SPAM,
-				...AD_KEYWORDS_FRAUD, ...AD_KEYWORDS,
-			];
-			for (const w of allAdWords) {
-				if (w && nameForScan.includes(w)) {
-					return { isAd: true, score: 99, hits: [`名片名字命中:${w}`], strong: '名片名字含广告词' };
-				}
-			}
-		}
-	}
-
-	// @bot 引流 + 诱导词组合(专治"图片+@xxx_bot+点击下方免费看完整版"这类色情图文广告)。
-	//   单独 @bot 不加分(正常人会 @双向机器人),但 @bot 同时出现"点击下方/完整版/免费看/加我看/资源"
-	//   这类诱导词时命中。双条件精度高,严格模式下作为强特征直杀;普通模式 +2 分。
-	const mentionsBot = /@[a-z][\w]{2,}bot\b/i.test(fullText);
-	const hasLure = /(点击下方|完整版|免费(看|观看|领)|加我(看|领)|资源(群|站)|看完整|扫码|进群看)/.test(fullText);
-
-	// ===== A 严格模式:关闭正文加权评分,只保留高精度强特征 =====
-	//   正文关键词加权累加是"误杀正常人"的主因(聊 usdt/搬砖/套利 的正常用户被弱信号叠加误判)。
-	//   严格模式下上面所有正文强特征仍生效(样本指纹/名片词/外国号名片/引用@泛滥),
-	//   此处只保留同为双条件、高精度的 @bot+诱导词直杀,其余加权评分一律不计 → 误杀趋近于零。
-	if (AD_STRICT_MODE) {
-		if (mentionsBot && hasLure) {
-			return { isAd: true, score: 99, hits: ['@bot+诱导词(严格模式直杀)'], strong: '@bot+诱导词' };
-		}
-		return { isAd: false, score: 0, hits: [], strong: null };
-	}
-
-	// ===== 普通模式:加权评分 =====
-	const wordScore = scoreAdWords(scoringText);
-	let score = wordScore.score;
-	hits.push(...wordScore.hits);
-
-	// 可疑短链(bit.ly 等)单独加分:常被广告用来藏落地页
-	if (urlsSuspicious) { score += 2; hits.push('可疑短链'); }
-
-	// 名片(分享联系人)+1 分:名片是常见引流载体,但正常用户也会分享,只 +1 需配合词库,
-	//   避免误杀正常分享。带敏感词的名片(如"假钞交流群")靠词库+名片分叠加达阈值被杀。
-	if (message.contact) { score += 1; hits.push('联系人名片'); }
-
-	// 纯链接刷屏:有外链 + 文本很短。纯白名单链接(github等)不算,避免误杀正常分享。
-	if (!urlsAllWhite && urls.length > 0 && fullText.length < 20) { score += 1; hits.push('短文本+链接'); }
-
-	if (mentionsBot && hasLure) { score += 2; hits.push('@bot+诱导词'); }
-
-	// V2 指纹库匹配
-	if (env?.DB) {
-		const fpMatches = await matchAdFingerprints(env, fullText);
-		for (const fp of fpMatches) {
-			if (fp.weight >= AD_V2_FINGERPRINT_BAN_WEIGHT) {
-				// 高权重指纹直接命中
-				return { isAd: true, score: 99, hits: [`指纹:${fp.value}`], strong: '广告指纹库命中', source: '指纹库' };
-			}
-			// 低权重指纹加分
-			score += AD_FINGERPRINT_HIT_SCORE;
-			hits.push(`指纹:${fp.value}`);
-		}
-		// 检查域名白名单
-		if (await isDomainWhitelisted(env, fullText)) {
-			score = Math.max(0, score - 3);
-			hits.push('域名白名单豁免');
-		}
-	}
-
-	// AI 语义相似度检测（第三层）
-	if (env?.AI && typeof env.AI.run === 'function' && fullText.length >= 4) {
-		try {
-			const aiResult = await checkAdAiSimilarity(env, fullText);
-			if (aiResult.available && aiResult.similarity >= AD_AI_SIMILARITY_THRESHOLD) {
-				// 高相似度直接判定为广告
-				return {
-					isAd: true,
-					score: 99,
-					hits: [`AI语义相似:${aiResult.similarity.toFixed(2)}${aiResult.sample ? ' / 样本:' + aiResult.sample.slice(0, 30) : ''}`],
-					strong: 'AI语义相似',
-					source: 'AI语义',
-				};
-			}
-			// 软加分
-			if (aiResult.available && aiResult.similarity >= AD_AI_SOFT_BONUS_FLOOR) {
-				score += AD_AI_SOFT_BONUS_SCORE;
-				hits.push(`AI语义加分:${aiResult.similarity.toFixed(2)}`);
-			}
-		} catch (error) {
-			console.error('[AI] 语义检测失败:', error.message);
-		}
-	}
-
-	return { isAd: score >= AD_SCORE_THRESHOLD, score, hits, strong: null };
-}
-
-async function detectAd(message, env) {
-	if (!AD_FILTER_ENABLED) return { isAd: false, score: 0, hits: [], strong: null, quoteAd: null };
-	if (isProxyRelatedMessage(message)) return { isAd: false, score: 0, hits: [], strong: null, quoteAd: null };
-
-	const quoteText = getQuoteText(message);
-	const quoteAd = detectQuotedAdEvidence(message, quoteText);
-	const directMessage = {
-		...message,
-		quote: undefined,
-		reply_to_message: undefined,
-		external_reply: undefined,
-	};
-	const directResult = await detectAdLegacy(directMessage, env);
-	const cachedProfile = await resolveAdIdentityProfile(message);
-	let candidate = null;
-	for (const subject of cachedProfile.subjects) {
-		const evidence = detectProfileAdEvidence(subject.text);
-		if (evidence.isAd) {
-			candidate = { subject, evidence };
-			break;
-		}
-	}
-
-	let profileEvidence = null;
-	let profileReview = {
-		status: candidate ? 'candidate' : 'not_candidate',
-		candidateText: candidate?.subject?.text || '',
-		latestText: '',
-	};
-	if (candidate) {
-		const latestProfile = await resolveAdIdentityProfile(message, { forceFresh: true });
-		const latestSubject = latestProfile.subjects.find((subject) => subject.key === candidate.subject.key);
-		profileReview.latestText = latestSubject?.text || '';
-		if (!latestSubject?.fetchSucceeded) {
-			profileReview.status = 'fresh_lookup_failed';
-		} else {
-			const latestEvidence = detectProfileAdEvidence(latestSubject.text);
-			if (latestEvidence.isAd) {
-				profileReview.status = 'confirmed';
-				profileEvidence = {
-					...latestEvidence,
-					subjectKey: latestSubject.key,
-					subjectKind: latestSubject.kind,
-					text: latestSubject.text,
-				};
-			} else {
-				profileReview.status = 'cleared_by_fresh_profile';
-			}
-		}
-	}
-
-	let result = {
-		...directResult,
-		source: directResult.isAd ? (directResult.source || '正文') : directResult.source,
-	};
-	if (profileEvidence && !directResult.isAd) {
-		result = {
-			isAd: true,
-			score: profileEvidence.score,
-			hits: profileEvidence.hits,
-			strong: profileEvidence.strong,
-			source: '资料卡',
-		};
-	} else if (profileEvidence && directResult.isAd) {
-		result = {
-			...directResult,
-			score: Math.max(directResult.score || 0, profileEvidence.score || 0),
-			hits: [...new Set([...(directResult.hits || []), ...(profileEvidence.hits || [])])],
-			source: '正文+资料卡',
-		};
-	}
-	return {
-		...result,
-		quoteAd,
-		quoteText,
-		identityEvidence: profileEvidence?.hits || candidate?.evidence?.hits || [],
-		identityText: profileEvidence?.text || cachedProfile.text,
-		profileEvidence,
-		profileReview,
-		bodyEvidence: directResult.isAd ? {
-			score: directResult.score,
-			hits: directResult.hits,
-			strong: directResult.strong,
-			text: getAdDetectionBodyText(directMessage),
-		} : null,
-	};
-}
-
-function getAdLearningBodyText(message) {
-	return getAdDetectionBodyText(message);
-}
-
-function hasIndependentAdBodyEvidence(message, bodyText) {
-	if (!bodyText || isProxyRelatedMessage({ ...message, quote: undefined, reply_to_message: undefined, external_reply: undefined })) return false;
-	const norm = normalizeForFingerprint(bodyText);
-	if (norm.length >= SAMPLE_FP_EXACT_MIN && getAdSampleMatch(norm, 'body')?.trusted) return true;
-	if (findSimilarTrustedAdSample(bodyText, 'body')) return true;
-	const scan = bodyText.toLowerCase();
-	const highRiskHits = scoreHighRiskAdWords(scan);
-	if (highRiskHits.length > 0 && analyzeQuotedHighRiskIntent(scan, highRiskHits).isPromotional) return true;
-	const mentionsBot = /@[a-z][\w]{2,}bot\b/i.test(scan);
-	const hasLure = /(点击下方|完整版|免费(看|观看|领)|加我(看|领)|资源(群|站)|看完整|扫码|进群看)/.test(scan);
-	if (mentionsBot && hasLure) return true;
-	const hasBodyAdStructure = /(?:@[a-z][\w]{2,}|https?:\/\/|t\.me\/|telegram\.me\/|联系|私信|私聊|加我|客服|电话|微信|vx)/i.test(scan)
-		&& /(?:承接|出售|售卖|供应|接单|招募|招聘|日入|月入|佣金|返利|赚钱|约炮|裸聊|资源|广告|推广|进群|频道|出u|接u|usdt|承兑)/i.test(scan);
-	if (hasAdSimilarityIntent(scan) && hasBodyAdStructure) return true;
-	if (!AD_STRICT_MODE) {
-		const scored = scoreAdWords(scan);
-		if (!hasExplicitNormalAdContext(scan) && (scored.score >= AD_SCORE_THRESHOLD || scored.hits.length >= 2)) return true;
-	}
-	return false;
-}
-
-// 广告拦截后通知主人
-async function notifyOwnerAdDetection(message, adResult, banResults) {
-	if (!OWNER_IDS.length) return;
-	const fromUser = message.from;
-	const operator = formatUserMention(fromUser) || `<code>${escapeHtml(String(fromUser?.id || '未知'))}</code>`;
-	const preview = escapeHtml((message.text || message.caption || (message.contact ? '[名片] ' + getContactText(message) : '') || '(无文本)').slice(0, 100));
-	const quotePreview = adResult.source === '引用内容' && adResult.quotePreview
-		? escapeHtml(adResult.quotePreview)
-		: '';
-	const reason = adResult.strong
-		? `强特征命中:${adResult.strong}`
-		: `评分 ${adResult.score}（${adResult.hits.slice(0, 6).join('、')}）`;
-	const source = adResult.source || '正文';
-	const profilePreview = adResult.profileEvidence?.text
-		? escapeHtml(adResult.profileEvidence.text.slice(0, 160))
-		: '';
-	const reviewLabels = {
-		confirmed: '缓存初筛命中，最新 Telegram 资料复核仍命中',
-		cleared_by_fresh_profile: '缓存初筛命中，但最新资料已无广告证据',
-		fresh_lookup_failed: '缓存初筛命中，但最新资料读取失败，资料卡未参与封禁',
-		not_candidate: '资料卡未达到候选门槛',
-	};
-
-	// 拉群名
-	let groupLabel = `<code>${escapeHtml(String(message.chat.id))}</code>`;
-	try {
-		const info = await getChatInfoFromId(message.chat.id);
-		if (info?.title) groupLabel = `<b>${escapeHtml(info.title)}</b> <code>${escapeHtml(String(message.chat.id))}</code>`;
-	} catch (_) {}
-
-	const lines = [
-		`🤖 <b>广告自动拦截</b>`,
-		`🎬 操作:自动删消息 + 加黑 + 全群踢`,
-		`👤 广告账号:${operator} <code>${escapeHtml(String(fromUser?.id || '未知'))}</code>`,
-		`📍 触发群:${groupLabel}`,
-		`🧭 命中来源:${escapeHtml(source)}`,
-		`🔍 判定依据:${escapeHtml(reason)}`,
-		`📝 内容预览(正文):${preview}`,
-		...(profilePreview ? [`👤 资料卡预览:${profilePreview}`] : []),
-		...(adResult.profileReview?.status && adResult.profileReview.status !== 'not_candidate'
-			? [`🔄 资料复核:${escapeHtml(reviewLabels[adResult.profileReview.status] || adResult.profileReview.status)}`]
-			: []),
-		...(quotePreview ? [`💬 引用内容:${quotePreview}`] : []),
-		'',
-		await renderBanResultsDetail(banResults),
-	];
-	await notifyAllOwners(lines.join('\n'), null);
-}
 function translateBlacklistReason(reason) {
+	// ad_auto / ad_learn 已无写入方，仅用于渲染 D1 里的历史封禁记录。
 	const map = {
 		manual_ban: '旧版 Telegram 原生封禁同步记录',
 		manual: '管理员 /ban 指令加黑',
 		sa: '管理员 /spam 引用回复加黑（历史记录）',
 		spam: '管理员 /spam 引用回复加黑',
-		ad_auto: '广告自动检测加黑',
+		ad_auto: '广告自动检测加黑（历史记录）',
 		ad_vote: '群内 /ad 举报投票加黑',
-		ad_learn: '上报学习加黑',
+		ad_learn: '上报学习加黑（历史记录）',
 	};
 	return map[reason] || reason || '未知';
 }
@@ -8654,6 +5346,7 @@ async function translateBlacklistOperator(byId) {
 	let roleTag = '👤 群管理员';
 	if (isPrimaryOwner(byId)) roleTag = '👑 主人';
 	else if (isSecondaryOwner(byId)) roleTag = '👤 副主人';
+	else if (SUPER_ADMINS.includes(byId)) roleTag = '🛡️ 超级管理员';
 
 	// 尝试查询操作人名字和类型
 	try {
@@ -8772,43 +5465,7 @@ async function notifyOwnerSelfUnban(fromUser, perGroupResults) {
 	await notifyAllOwners(lines.join('\n'), null);
 }
 
-// options.scopeGroups：加黑与封禁的生效群范围。自动检测一律只作用于【触发群】——
-// 误杀的正常用户仍能加入其它私密群，不会被一条自动判定连坐到全部群。
-async function enforceAutomaticAdTarget(candidate, env, options = {}) {
-	const id = String(candidate?.id || '').trim();
-	if (!/^\d+$/.test(id)) return { ...candidate, id, error: 'TGID 无效', banResults: [] };
-	const scopeGroups = normalizeBlacklistScope(options.scopeGroups ?? null);
-	try {
-		if (!options.skipAdminCheck && await checkIfUserIsAdmin(id)) {
-			return { ...candidate, id, skipped: '管理员豁免', banResults: [] };
-		}
-		const blacklistResult = await addToBlacklist(id, env, { reason: 'ad_auto', by: 'system', scopeGroups });
-		const banResults = await banUserFromGroups(id, resolveScopeTargetGroupIds(scopeGroups));
-		return { ...candidate, id, blacklistResult, banResults, scopeGroups };
-	} catch (error) {
-		console.error(`[广告联动处理] TGID=${id} 失败:`, error);
-		return { ...candidate, id, error: error.message || String(error), banResults: [] };
-	}
-}
 
-async function appendAutomaticAdTargetDetail(lines, label, result) {
-	const mention = formatUserMention(result?.user) || `<a href="tg://user?id=${escapeHtml(String(result?.id || ''))}">${escapeHtml(String(result?.id || '未知'))}</a>`;
-	lines.push(`${label}:${mention} <code>${escapeHtml(String(result?.id || '未知'))}</code>`);
-	if (result?.skipped) {
-		lines.push(`   ℹ️ ${escapeHtml(result.skipped)}`);
-		return;
-	}
-	if (result?.error) {
-		lines.push(`   ⚠️ 处理失败:${escapeHtml(result.error)}`);
-		return;
-	}
-	const addResult = result?.blacklistResult;
-	const scopeText = describeBlacklistScope(result?.scopeGroups ?? null);
-	if (addResult?.success) lines.push(`   ✅ 已写入 D1 黑名单（${escapeHtml(scopeText)}）`);
-	else if (addResult?.code === 'EXISTS') lines.push(`   ℹ️ 已在 D1 黑名单，本次继续执行封禁（${escapeHtml(scopeText)}）`);
-	else if (addResult) lines.push(`   ⚠️ D1 写入:${escapeHtml(addResult.message || '失败')}`);
-	lines.push(await renderBanResultsDetail(result?.banResults || [], null, { userId: result?.id, retryCommand: '/ban 或 /spam' }));
-}
 
 // ===== /ad 举报投票业务 =====
 function isAdCommand(text) {
@@ -8906,8 +5563,8 @@ function buildAdVoteMessageText(state) {
 	let status = '<i>进行中，1 小时后截止。</i>';
 	if (state.finalized && state.result === 'approved') {
 		status = state.enforcementComplete
-			? '💀 <b>举报通过，已加入 D1 黑名单（仅本群生效）、执行本群封禁，并请求撤回其本群全部历史发言。</b>'
-			: '💀 <b>举报通过，正在执行 D1 加黑、本群封禁与历史发言撤回。</b>';
+			? '💀 <b>举报通过，已加入 D1 全局黑名单、执行全部 GROUP_ID 群封禁，并请求撤回其各群全部历史发言。</b>'
+			: '💀 <b>举报通过，正在执行 D1 加黑、全群封禁与历史发言撤回。</b>';
 	} else if (state.finalized && state.result === 'rejected') {
 		status = '❎ <b>投票已被否决，目标未处理。</b>';
 	} else if (state.finalized && state.result === 'expired') {
@@ -9100,6 +5757,7 @@ async function resolveAdVoteTargetProtection(message, target) {
 	const targetId = String(target.targetUserId || '');
 	if (targetId === String(message?.from?.id || '')) return { protected: true, reason: '不能举报自己' };
 	if (isOwner(targetId)) return { protected: true, reason: '不能举报主人或副主人' };
+	if (isSuperAdmin(targetId)) return { protected: true, reason: '不能举报超级管理员' };
 	const botId = await getBotId();
 	if (botId && targetId === String(botId)) return { protected: true, reason: '不能举报当前机器人' };
 
@@ -9124,16 +5782,16 @@ async function resolveAdVoteTargetProtection(message, target) {
 	return { protected: false, memberStatus: member?.status || null, member };
 }
 
-// 重复举报预检：目标【已在本群被封禁/禁言】且【D1 黑名单已在本群生效】时，本次举报没有任何
+// 重复举报预检：目标【已在本群被封禁/禁言】且【已在 D1 全局黑名单】时，本次举报没有任何
 // 增量意义，直接跳过，避免群里刷出一张注定通过的投票卡片。
 // 必须两个条件同时成立才跳过 —— 只满足其一说明处置还不完整（例如已加黑但没踢掉、
-// 或群内踢了但 D1 在本群不生效），仍应走投票把处置补齐。
+// 或群内踢了但没进全局黑名单），仍应走投票把处置补齐。
 // memberStatus 复用 resolveAdVoteTargetProtection 已查到的结果，不额外调用 Telegram。
-async function isRedundantAdVoteTarget(env, targetUserId, memberStatus, chatId) {
+async function isRedundantAdVoteTarget(env, targetUserId, memberStatus) {
 	const status = String(memberStatus || '').toLowerCase();
 	const bannedOrMuted = status === 'kicked' || status === 'restricted';
 	if (!bannedOrMuted) return false;
-	const blacklistCheck = await checkBlacklist(targetUserId, env, { chatId });
+	const blacklistCheck = await checkBlacklist(targetUserId, env);
 	return blacklistCheck.isBlacklisted === true;
 }
 
@@ -9212,9 +5870,9 @@ async function handleAdCommand(message, env, ctx) {
 	if (protection.protected) {
 		return deleteAndReply('⚠️ ' + escapeHtml(protection.reason));
 	}
-	// 已被封禁/禁言且 D1 黑名单已在本群生效 → 本次举报无增量意义，直接跳过不刷投票卡片。
-	if (await isRedundantAdVoteTarget(env, target.targetUserId, protection.memberStatus, message.chat.id)) {
-		logIgnoredAdVoteCommand(message, '目标已被本群封禁/禁言且 D1 黑名单已在本群生效，无需重复举报');
+	// 已被封禁/禁言且已在全局黑名单 → 本次举报无增量意义，直接跳过不刷投票卡片。
+	if (await isRedundantAdVoteTarget(env, target.targetUserId, protection.memberStatus)) {
+		logIgnoredAdVoteCommand(message, '目标已被本群封禁/禁言且已在 D1 全局黑名单，无需重复举报');
 		await deleteAuthorizedGroupCommandMessage(message, '/ad');
 		return true;
 	}
@@ -9351,15 +6009,14 @@ async function notifyOwnerAdVoteApproved(state, blacklistResult, banResults, del
 		'📝 举报原因:' + escapeHtml(state.reason || '未填写'),
 		'',
 	];
-	if (blacklistResult?.success) lines.push('✅ 已写入 D1 黑名单（仅本群生效），原因:ad_vote');
-	else if (blacklistResult?.code === 'EXISTS') lines.push('ℹ️ 目标已在 D1 黑名单，本次仍继续执行本群封禁');
+	if (blacklistResult?.success) lines.push('✅ 已写入 D1 全局黑名单，原因:ad_vote');
+	else if (blacklistResult?.code === 'EXISTS') lines.push('ℹ️ 目标已在 D1 黑名单，本次仍继续执行全群封禁');
 	else lines.push('⚠️ D1 写入失败:' + escapeHtml(blacklistResult?.message || '未知错误'));
 	lines.push(await renderBanResultsDetail(banResults || [], null, {
 		userId: state.targetUserId,
 		retryCommand: '/ban 或 /spam',
 	}));
-	lines.push('🧹 历史发言:本群封禁请求启用 revoke_messages=true；封禁成功后由 Telegram 撤回该用户在本群的历史发言。');
-	lines.push('ℹ️ 本次仅封禁发起投票的群；确需跨群封禁请由管理员在群内使用 <code>/spam</code>。');
+	lines.push('🧹 历史发言:全部 GROUP_ID 封禁请求均启用 revoke_messages=true；封禁成功的群由 Telegram 撤回该用户全部历史发言。');
 	if (state.reportedMessageId) {
 		const outcome = classifyAdDeleteOutcome(deleteResult);
 		lines.push('🧹 被举报消息:' + escapeHtml(outcome.summary));
@@ -9377,23 +6034,23 @@ async function notifyOwnerAdVoteClosed(state) {
 		rejected: {
 			title: '广告举报投票已被否决',
 			result: '反对方胜出',
-			action: '目标未写入 D1、未执行本群封禁、未删除被举报消息。',
+			action: '目标未写入 D1、未执行全群封禁、未删除被举报消息。',
 		},
 		cancelled: {
 			title: '广告举报投票已取消',
 			result: '投票被有权限的用户取消',
-			action: '目标未写入 D1、未执行本群封禁、未删除被举报消息。',
+			action: '目标未写入 D1、未执行全群封禁、未删除被举报消息。',
 		},
 		expired: {
 			title: '广告举报投票已过期',
 			result: '超过 1 小时截止时间',
-			action: '目标未写入 D1、未执行本群封禁、未删除被举报消息。',
+			action: '目标未写入 D1、未执行全群封禁、未删除被举报消息。',
 		},
 	};
 	const meta = resultMeta[state.result] || {
 		title: '广告举报投票已结束',
 		result: String(state.result || '未知结果'),
-		action: '本次未执行 D1 写入或本群封禁。',
+		action: '本次未执行 D1 写入或全群封禁。',
 	};
 	const lines = [
 		'🗳️ <b>' + escapeHtml(meta.title) + '</b>',
@@ -9424,20 +6081,12 @@ async function notifyOwnerAdVoteClosed(state) {
 
 async function enforceApprovedAdVote(env, state) {
 	if (state.enforcementComplete) return;
-	// /ad 投票是【本群】管理员与成员对本群一条广告的判定，处置范围随之限定为发起投票的群，
-	// 不再跨群封禁；跨群封禁的唯一入口是真人 /spam。
-	const voteScopeGroups = [String(state.chatId)];
 	const blacklistResult = await addToBlacklist(state.targetUserId, env, {
 		reason: 'ad_vote',
 		by: state.creatorUserId,
 		note: ('群内 /ad 举报投票通过' + (state.reason ? '：' + state.reason : '')).slice(0, 500),
-		scopeGroups: voteScopeGroups,
 	});
-	const banResults = await banUserFromGroups(
-		state.targetUserId,
-		resolveScopeTargetGroupIds(voteScopeGroups),
-		{ probeMembership: true, revokeMessages: true }
-	);
+	const banResults = await banUserFromAllGroups(state.targetUserId, { probeMembership: true, revokeMessages: true });
 	const historyFallback = state.reportedMessageId
 		? null
 		: await cleanupAdVoteSourceChatMessages(env, state.chatId, state.targetUserId);
@@ -9474,170 +6123,188 @@ async function finalizeAdVote(env, state, result, decisionBy = null) {
 	return { ok: true, state: next };
 }
 
-async function handleAdCallbackQuery(callbackQuery, env, ctx) {
-	const data = String(callbackQuery?.data || '');
-	const voterId = String(callbackQuery?.from?.id || '');
-	const callbackChatId = String(callbackQuery?.message?.chat?.id || '');
-	const callbackMessageId = Number(callbackQuery?.message?.message_id) || 0;
+// ===== inline 按钮翻页基建 =====
+// 2026-09-09 主人要求：/words 与 /job 的「翻页：/words 2」文本提示全部改成按钮，
+// 且【编辑原消息】而不是发新消息（主人在两个选项里选的就是编辑原消息）。
+//
+// 为什么要自己写 base64：/words 的关键词是中文，而 Telegram 的 callback_data 上限
+// 【64 字节】且必须是 UTF-8 安全的短串。btoa 只吃 latin1，中文直接抛 InvalidCharacterError，
+// 所以必须先 TextEncoder 编成字节再逐字节 btoa。用 base64url 变体（-_ 且去掉 =）
+// 是因为 callback_data 会原样回传，+ / = 在某些客户端上会被再编码一次。
+function encodeAdCallbackToken(raw) {
+	const text = String(raw || '');
+	if (!text) return '';
+	const bytes = new TextEncoder().encode(text);
+	let binary = '';
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
 
-	// 状态菜单（内联按钮）
-	if (data.startsWith('status:')) {
-		const action = data.slice('status:'.length);
-		if (!isOwner(voterId)) {
-			await answerAdVoteCallback(callbackQuery?.id, '仅限主人操作', true);
-			return;
-		}
-		const cbChatId = String(callbackQuery?.message?.chat?.id || '');
-		if (action === 'refresh') {
-			await answerAdVoteCallback(callbackQuery?.id, '🔄 已刷新');
-			await sendStatusMenu({ chat: { id: cbChatId }, message: callbackQuery.message }, env, ctx);
-			return;
-		}
-		if (action === 'ad_toggle') {
-			// 切换广告检测测试模式
-			const currentMode = await getAdTestMode(env, voterId);
-			const newMode = !currentMode;
-			await setAdTestMode(env, voterId, newMode);
-			await answerAdVoteCallback(callbackQuery?.id, `已${newMode ? '开启' : '关闭'}广告检测测试模式`);
-			await sendStatusMenu({ chat: { id: cbChatId }, message: callbackQuery.message }, env, ctx);
-			return;
-		}
-		if (action === 'clean_toggle') {
-			try {
-				if (env.DB) {
-					await ensureAutoCleanTable(env);
-					const row = await env.DB.prepare('SELECT value FROM auto_clean_settings WHERE key = ?').bind('enabled').first();
-					const current = row?.value ? true : false;
-					await setAutoCleanEnabled(env, !current);
-					await answerAdVoteCallback(callbackQuery?.id, `已${!current ? '开启' : '关闭'}自动清理`);
-					await sendStatusMenu({ chat: { id: cbChatId }, message: callbackQuery.message }, env, ctx);
-				}
-			} catch (error) {
-				await answerAdVoteCallback(callbackQuery?.id, `操作失败: ${error.message}`, true);
-			}
-			return;
-		}
-		if (action === 'pending') {
-			const snapshots = await getPendingSnapshots(env, 10);
-			if (snapshots.length === 0) {
-				await answerAdVoteCallback(callbackQuery?.id, '没有待确认的快照');
-			} else {
-				let text = '📋 <b>待确认快照</b>\n\n';
-				snapshots.forEach((s, i) => {
-					text += `${i + 1}. 序号:<code>${s.token.slice(0, 12)}</code> 评分:${s.score}\n`;
-					text += `   用户:<code>${s.user_id}</code>\n\n`;
-				});
-				text += '确认:<code>/confirm 序号</code> 忽略:<code>/ignore 序号</code>';
-				await sendTelegramMessage(cbChatId, text);
-				await answerAdVoteCallback(callbackQuery?.id, '已发送待确认列表');
-			}
-			return;
-		}
-		if (action === 'words') {
-			try {
-				await ensureD1Table(env);
-				const { results } = await env.DB.prepare('SELECT value, type, weight, hit_count FROM ad_fingerprints ORDER BY hit_count DESC LIMIT 10').all();
-				let text = '📚 <b>广告指纹库 Top 10</b>\n\n';
-				if (results.length === 0) {
-					text += '（空）';
-				} else {
-					results.forEach((r, i) => {
-						text += `${i + 1}. <code>${escapeHtml(r.value)}</code> (权重${r.weight}, 命中${r.hit_count})\n`;
-					});
-				}
-				await sendTelegramMessage(cbChatId, text);
-				await answerAdVoteCallback(callbackQuery?.id, '已发送指纹库');
-			} catch (error) {
-				await answerAdVoteCallback(callbackQuery?.id, `查询失败: ${error.message}`, true);
-			}
-			return;
-		}
-		if (action === 'mods') {
-			const admins = await listModerationAdmins(env);
-			let text = '🛡️ <b>额外管理员列表</b>\n\n';
-			if (admins.length === 0) {
-				text += '（空）';
-			} else {
-				admins.forEach((a, i) => {
-					const note = a.note ? ` — ${escapeHtml(a.note)}` : '';
-					text += `${i + 1}. <code>${escapeHtml(a.user_id)}</code>${note}\n`;
-				});
-			}
-			await sendTelegramMessage(cbChatId, text);
-			await answerAdVoteCallback(callbackQuery?.id, '已发送管理员列表');
-			return;
-		}
-		if (action === 'observation') {
-			try {
-				const observations = await getObservationWindow(env, 20);
-				let text = '👁️ <b>观察窗口</b>\n\n';
-				if (observations.length === 0) {
-					text += '（空）没有用户在观察窗口中。';
-				} else {
-					observations.forEach((o, i) => {
-						const hits = o.hits ? JSON.parse(o.hits) : [];
-						text += `${i + 1}. 用户:<code>${escapeHtml(o.user_id)}</code> 评分:${o.score}\n`;
-						text += `   群:<code>${escapeHtml(o.chat_id)}</code>\n`;
-						if (hits.length > 0) {
-							text += `   原因:${hits.slice(0, 3).map((h) => escapeHtml(h)).join('、')}\n`;
-						}
-						text += '\n';
-					});
-				}
-				await sendTelegramMessage(cbChatId, text);
-				await answerAdVoteCallback(callbackQuery?.id, '已发送观察窗口');
-			} catch (error) {
-				await answerAdVoteCallback(callbackQuery?.id, `查询失败: ${error.message}`, true);
-			}
-			return;
-		}
+function decodeAdCallbackToken(token) {
+	const text = String(token || '');
+	if (!text) return '';
+	try {
+		const normalized = text.replace(/-/g, '+').replace(/_/g, '/');
+		const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+		const binary = atob(padded);
+		const bytes = new Uint8Array(binary.length);
+		for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+		return new TextDecoder().decode(bytes);
+	} catch (error) {
+		console.error('[翻页按钮] callback_data 解码失败:', error);
+		return '';
 	}
+}
 
-	// 自动销号清理开关（内联按钮）
-	if (data.startsWith('clean_switch:')) {
-		const action = data.slice('clean_switch:'.length);
-		const voterId = String(callbackQuery?.from?.id || '');
-		if (!isOwner(voterId)) {
-			await answerAdVoteCallback(callbackQuery?.id, '仅限第一主人操作', true);
-			return;
+// callback_data 是否还塞得下。超了就【不挂按钮、退回文本翻页提示】——
+// 宁可退化成老样子，也不能挂一个点下去报 BUTTON_DATA_INVALID 的死按钮。
+function adCallbackDataFits(data) {
+	return new TextEncoder().encode(String(data || '')).length <= 64;
+}
+
+// 翻页键盘。总页数 ≤ 1 时返回 null（一页没什么可翻的，按钮纯占地方）。
+// 中间那颗「第 X/Y 页」是纯展示，回调走 noop 分支只弹一个气泡，不重绘消息。
+function buildAdPaginationKeyboard(prefix, page, totalPages, payloadToken) {
+	if (!(totalPages > 1)) return null;
+	const cell = (label, targetPage) => {
+		const data = prefix + targetPage + ':' + (payloadToken || '');
+		return adCallbackDataFits(data) ? { text: label, callback_data: data } : null;
+	};
+	const row = [];
+	if (page > 1) row.push(cell('⬅️ 上一页', page - 1));
+	row.push({ text: '第 ' + page + '/' + totalPages + ' 页', callback_data: prefix + 'noop' });
+	if (page < totalPages) row.push(cell('下一页 ➡️', page + 1));
+	// 任何一颗按钮塞不下（关键词/任务 ID 太长）就整块放弃，避免半残键盘。
+	if (row.some((button) => !button)) return null;
+	return { inline_keyboard: [row] };
+}
+
+// 分页消息发送器。【只有单块消息才挂按钮】：
+// sendTelegramMessageChunks 把按钮挂在最后一块上，而回调编辑的也只有那一块 ——
+// 多块时编辑会把整页文本塞进最后一块，前面几块变成对不上的孤儿。
+// 所以多块一律降级回文本翻页提示（fallbackLine），行为与改造前完全一致。
+async function sendAdPagedMessage(chatId, text, keyboard, fallbackLine) {
+	const fits = splitTelegramHtmlBlocks(text).length <= 1;
+	if (keyboard && fits) return await sendTelegramMessage(chatId, text, keyboard);
+	const body = keyboard && fallbackLine ? text + '\n\n' + fallbackLine : text;
+	return await sendTelegramMessageChunks(chatId, body);
+}
+
+async function editAdPagedMessage(chatId, messageId, text, keyboard) {
+	if (!messageId) return { ok: false, error: 'message_id 缺失' };
+	try {
+		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/editMessageText', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				chat_id: chatId,
+				message_id: messageId,
+				text: sanitizeTelegramText(text),
+				parse_mode: 'HTML',
+				disable_web_page_preview: true,
+				reply_markup: keyboard || { inline_keyboard: [] }
+			})
+		});
+		const result = await response.json();
+		if (!response.ok || !result?.ok) {
+			const description = result?.description || ('HTTP ' + response.status);
+			// 「message is not modified」是重复点同一页的正常结果，不算故障，别刷错误日志。
+			if (!/not modified/i.test(description)) console.error('[翻页按钮] editMessageText 失败:', description);
+			return { ok: false, error: description };
 		}
-		const toggle = action === 'on';
-		await setAutoCleanEnabled(env, toggle);
-		const statusText = toggle ? '✅ 已开启' : '❌ 已关闭';
-		const statusEmoji = toggle ? '🟢' : '🔴';
-		await answerAdVoteCallback(callbackQuery?.id, `自动销号清理已${toggle ? '开启' : '关闭'}`, false);
-		// 编辑消息更新按钮状态
-		try {
-			const chatId = callbackQuery?.message?.chat?.id;
-			const messageId = callbackQuery?.message?.message_id;
-			if (chatId && messageId) {
-				await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						chat_id: chatId,
-						message_id: messageId,
-						text:
-							`🔧 <b>自动销号清理</b>\n\n` +
-							`状态: ${statusEmoji} ${statusText}\n\n` +
-							`每天凌晨 4 点自动检测黑名单中的销号用户并移除。\n` +
-							`当前状态: <b>${toggle ? '开启' : '关闭'}</b>`,
-						parse_mode: 'HTML',
-						reply_markup: {
-							inline_keyboard: [[
-								{ text: '✅ 开启', callback_data: 'clean_switch:on' },
-								{ text: '❌ 关闭', callback_data: 'clean_switch:off' },
-							]],
-						},
-					}),
-				});
-			}
-		} catch (error) {
-			console.error('[clean_switch] 编辑消息失败:', error);
-		}
+		return result;
+	} catch (error) {
+		console.error('[翻页按钮] editMessageText 异常:', error);
+		return { ok: false, error: error.message || String(error) };
+	}
+}
+
+// /words 翻页回调。data 形如 adwords:<页码>:<base64url 关键词>，或 adwords:noop。
+async function handleAdWordsPaginationCallback(callbackQuery, env) {
+	const data = String(callbackQuery?.data || '');
+	const clickerId = String(callbackQuery?.from?.id || '');
+	// 指纹库能直接决定自动封禁，权限口径必须与 /words 命令本身完全一致 —— 只给第一主人。
+	// 否则任何人只要拿到一条带按钮的转发消息就能翻看整个指纹库。
+	if (!isPrimaryOwner(clickerId)) {
+		await answerAdVoteCallback(callbackQuery?.id, '仅限第一主人操作', true);
 		return;
 	}
+	const body = data.slice(AD_WORDS_PAGINATION_PREFIX.length);
+	if (body === 'noop') {
+		await answerAdVoteCallback(callbackQuery?.id);
+		return;
+	}
+	const match = body.match(/^(\d+):(.*)$/);
+	if (!match) {
+		await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true);
+		return;
+	}
+	const page = Math.max(1, parseInt(match[1], 10) || 1);
+	const keyword = decodeAdCallbackToken(match[2]);
+	const chatId = String(callbackQuery?.message?.chat?.id || '');
+	const messageId = Number(callbackQuery?.message?.message_id) || 0;
+	if (!env.DB) {
+		await answerAdVoteCallback(callbackQuery?.id, '未绑定 D1 存储空间', true);
+		return;
+	}
+	const rendered = await renderAdWordsPage(env, { page, keyword });
+	if (!rendered.ok) {
+		await answerAdVoteCallback(callbackQuery?.id, rendered.notice || '读取指纹库失败', true);
+		return;
+	}
+	await editAdPagedMessage(chatId, messageId, rendered.text, rendered.keyboard);
+	await answerAdVoteCallback(callbackQuery?.id);
+}
 
+// /job 用户列表翻页回调。data 形如 adjob:<页码>:<base64url 任务 ID>。
+async function handleBulkJobPaginationCallback(callbackQuery, env) {
+	const data = String(callbackQuery?.data || '');
+	const clickerId = String(callbackQuery?.from?.id || '');
+	// 目标用户名单只在 isOwner 分支才会渲染，翻页口径跟着它，不放宽到全部高级管理员。
+	if (!isOwner(clickerId)) {
+		await answerAdVoteCallback(callbackQuery?.id, '仅限主人操作', true);
+		return;
+	}
+	const body = data.slice(AD_JOB_PAGINATION_PREFIX.length);
+	if (body === 'noop') {
+		await answerAdVoteCallback(callbackQuery?.id);
+		return;
+	}
+	const match = body.match(/^(\d+):(.*)$/);
+	if (!match) {
+		await answerAdVoteCallback(callbackQuery?.id, '按钮数据已失效', true);
+		return;
+	}
+	const requestedPage = Math.max(1, parseInt(match[1], 10) || 1);
+	const jobId = decodeAdCallbackToken(match[2]);
+	const chatId = String(callbackQuery?.message?.chat?.id || '');
+	const messageId = Number(callbackQuery?.message?.message_id) || 0;
+	if (!env.DB || !jobId) {
+		await answerAdVoteCallback(callbackQuery?.id, '任务不可读取', true);
+		return;
+	}
+	const job = await loadBulkJob(env, jobId);
+	if (!job) {
+		await answerAdVoteCallback(callbackQuery?.id, '任务已不存在', true);
+		return;
+	}
+	const rendered = await renderBulkJobOwnerView(env, job, requestedPage);
+	await editAdPagedMessage(chatId, messageId, rendered.text, rendered.keyboard);
+	await answerAdVoteCallback(callbackQuery?.id);
+}
+
+async function handleAdCallbackQuery(callbackQuery, env, ctx) {
+	const data = String(callbackQuery?.data || '');
+	// 三分支分流。必须排在 adv: 校验【之前】：投票分支开头那道 isConfiguredGroup
+	// 会把私聊来的回调全部挡掉，而 /words 本来就只在私聊里用。
+	if (data.startsWith(AD_WORDS_PAGINATION_PREFIX)) {
+		await handleAdWordsPaginationCallback(callbackQuery, env);
+		return;
+	}
+	if (data.startsWith(AD_JOB_PAGINATION_PREFIX)) {
+		await handleBulkJobPaginationCallback(callbackQuery, env);
+		return;
+	}
 	if (!data.startsWith(AD_VOTE_BUTTON_PREFIX)) return;
 	const match = data.slice(AD_VOTE_BUTTON_PREFIX.length).match(/^([ARC]):(.+)$/);
 	if (!match) {
@@ -9646,6 +6313,8 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 	}
 	const action = match[1];
 	const voteToken = match[2];
+	const callbackChatId = String(callbackQuery?.message?.chat?.id || '');
+	const callbackMessageId = Number(callbackQuery?.message?.message_id) || 0;
 	if (!isConfiguredGroup(callbackChatId)) {
 		await answerAdVoteCallback(callbackQuery?.id, '该投票不属于配置群', true);
 		return;
@@ -9675,6 +6344,7 @@ async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 		return;
 	}
 
+	const voterId = String(callbackQuery?.from?.id || '');
 	if (!/^\d+$/.test(voterId) || callbackQuery?.from?.is_bot) {
 		await answerAdVoteCallback(callbackQuery?.id, '机器人或无效账号不能投票', true);
 		return;
@@ -9777,264 +6447,8 @@ function classifyAdDeleteOutcome(result) {
 	};
 }
 
-async function notifyOwnerAdRelayObservation(message, adResult, context = {}) {
-	if (!OWNER_IDS.length) return;
-	const actorId = String(message?.from?.id || '未知');
-	const actor = formatUserMention(message?.from) || `<code>${escapeHtml(actorId)}</code>`;
-	const wrapper = message?.text || message?.caption || (message?.sticker ? '[贴纸]' : '(无文字)');
-	let groupLabel = `<code>${escapeHtml(String(message.chat.id))}</code>`;
-	try {
-		const info = await getChatInfoFromId(message.chat.id);
-		if (info?.title) groupLabel = `<b>${escapeHtml(info.title)}</b> <code>${escapeHtml(String(message.chat.id))}</code>`;
-	} catch (_) {}
 
-	const observation = context.observation || null;
-	const relayDecision = context.relayDecision || { mode: 'weak_evidence', reason: '未提供分类' };
-	const deleteOutcome = classifyAdDeleteOutcome(context.deleteResult);
-	let disposition = '弱证据引用：不封当前传播者';
-	if (context.currentResult) {
-		disposition = observation
-			? '误触型引用达到重复阈值，已升级为 D1 当前群黑名单并封禁本群'
-			: '高置信广告传播，第一次已加入 D1 当前群黑名单并封禁本群';
-	} else if (relayDecision.mode === 'normal_context') {
-		disposition = '明确举报/询问/警告语境保护：不封当前回复者，不累计观察';
-	} else if (relayDecision.mode === 'accidental_observation') {
-		disposition = '可验证误触型短回复/贴纸保护：本次不封，记录观察';
-	}
-	const title = context.currentResult
-		? (observation ? '🚫 <b>广告引用重复传播升级封禁</b>' : '🚫 <b>高置信引用广告首杀</b>')
-		: '🛡️ <b>广告引用保护判定</b>';
-	const lines = [
-		title,
-		`🧹 消息处理:${escapeHtml(deleteOutcome.summary)}`,
-		`🚫 当前传播者处置:${escapeHtml(disposition)}`,
-		`🧭 分类依据:${escapeHtml(relayDecision.reason || relayDecision.mode || '未知')}`,
-		`👤 当前回复者:${actor} <code>${escapeHtml(actorId)}</code>`,
-		`📍 触发群:${groupLabel}`,
-	];
-	if (deleteOutcome.detail) lines.push(`ℹ️ 删除详情:${escapeHtml(deleteOutcome.detail)}`);
-	if (observation) {
-		lines.push(`🧾 观察次数:${observation.ok ? observation.occurrences : '写入失败'}`);
-		if (!observation.ok) lines.push(`⚠️ D1 观察记录失败:${escapeHtml(observation.error || '未知错误')}`);
-		else if (observation.duplicate) lines.push('ℹ️ 同一 Telegram 消息重试，观察次数未重复累计');
-		else if (!context.currentResult) lines.push('✅ 第一次误触保护已留档；当前回复者本次未加入当前群黑名单');
-	}
-	lines.push(
-		`💬 外层内容:${escapeHtml(String(wrapper).slice(0, 100))}`,
-		`📢 引用广告:${escapeHtml(String(adResult?.quoteAd?.quotePreview || '').slice(0, 160))}`,
-		`🔍 判定依据:${escapeHtml([adResult?.quoteAd?.strong, ...(adResult?.quoteAd?.hits || [])].filter(Boolean).join(' / '))}`,
-	);
-	if (context.currentResult) {
-		lines.push('');
-		await appendAutomaticAdTargetDetail(
-			lines,
-			observation ? '🚫 当前传播者升级处理' : '🚫 当前传播者首次处理',
-			context.currentResult,
-		);
-	}
-	lines.push('');
-	const quotedAuthors = Array.isArray(context.quoteAuthors) ? context.quoteAuthors : [];
-	if ((context.originalResults || []).length === 0) {
-		if (quotedAuthors.length > 0 && context.originalAuthorBanSafe === false) {
-			lines.push('👤 原消息作者:已识别 Telegram TGID，但当前仅为弱评分证据，未自动联动封禁');
-		} else {
-			lines.push('👤 原广告作者:Telegram 未提供可验证 TGID，未按昵称猜测、未误封');
-		}
-	} else {
-		for (const result of context.originalResults) {
-			await appendAutomaticAdTargetDetail(lines, '🎯 原广告作者处理', result);
-		}
-	}
-	// 观察通知严格只发第一主人 OWNER_IDS[0]；群内、副主人、超管、普通管理员均不接收。
-	await notifyAllOwners(lines.join('\n'), null, false);
-}
 
-async function notifyOwnerOriginalAdTargets(message, adResult, originalResults) {
-	if (!OWNER_IDS.length || !Array.isArray(originalResults) || originalResults.length === 0) return;
-	const lines = [
-		'🔗 <b>广告原作者联动处理</b>',
-		`👤 当前传播者:${formatUserMention(message.from) || `<code>${escapeHtml(String(message.from?.id || '未知'))}</code>`}`,
-		`💬 广告载体:${escapeHtml(String(adResult?.quoteAd?.quotePreview || message.text || message.caption || '').slice(0, 160))}`,
-		'',
-	];
-	for (const result of originalResults) {
-		await appendAutomaticAdTargetDetail(lines, '🎯 可验证原作者', result);
-	}
-	await notifyAllOwners(lines.join('\n'), null, false);
-}
-
-async function handleAutomaticAdDecision(message, adResult, env) {
-	const directAd = adResult?.isAd === true;
-	const quoteAd = adResult?.quoteAd || null;
-	if (!directAd && !quoteAd) return false;
-
-	const currentId = String(message?.from?.id || '');
-	if (!/^\d+$/.test(currentId)) return false;
-	if (await checkIfUserIsAdmin(currentId)) return false;
-
-	// ===== 频道转发警告制：满3次后自动封禁 =====
-	if (adResult?.channelForwardWarning === true) {
-		const count = await incrementWarning(env, currentId);
-		const channelTitle = adResult.hits?.[0]?.replace('手动转发频道帖:', '') || '未知频道';
-		// 删除转发的频道帖
-		await deleteMessage(message.chat.id, message.message_id);
-		if (count >= WARNING_LIMIT) {
-			// 满3次，执行封禁
-			await clearWarnings(env, currentId);
-			const result = await addToBlacklist(currentId, env, { reason: 'ad_auto', by: 'system', note: `频道转发警告满${WARNING_LIMIT}次自动封禁: ${channelTitle}` });
-			const banResults = await banUserFromAllGroups(currentId, { probeMembership: true, _env: env });
-			const banDetail = await renderBanResultsDetail(banResults, null, { userId: currentId, retryCommand: '/ban' });
-			const lines = [
-				`⚠️ <b>频道转发警告已满 ${WARNING_LIMIT} 次，已自动封禁</b>`,
-				`👤 用户:<code>${currentId}</code>`,
-				`📢 转发频道:${escapeHtml(channelTitle)}`,
-				`📊 累计警告:${count} 次`,
-				'',
-				result.success ? '✅ 已写入 D1 全局黑名单' : `⚠️ D1 写入:${escapeHtml(result.message || '失败')}`,
-				banDetail,
-			];
-			await notifyAllOwners(lines.join('\n'), null);
-			return true;
-		}
-		// 未满3次，发送警告
-		const remaining = WARNING_LIMIT - count;
-		const warnText =
-			`⚠️ <b>警告 ${count}/${WARNING_LIMIT}</b>\n\n` +
-			`检测到您转发了频道帖子（${escapeHtml(channelTitle)}）。\n` +
-			`转发频道帖子属于广告行为，累计 ${WARNING_LIMIT} 次将被自动封禁。\n` +
-			`剩余次数：<b>${remaining}</b> 次`;
-		await sendTelegramMessage(message.chat.id, warnText);
-		// 通知主人
-		await notifyAllOwners(
-			`⚠️ <b>频道转发警告</b>\n` +
-			`👤 用户:<code>${currentId}</code>\n` +
-			`📢 转发频道:${escapeHtml(channelTitle)}\n` +
-			`📊 警告次数:${count}/${WARNING_LIMIT}\n` +
-			`📍 群:<code>${message.chat.id}</code>`,
-			null
-		);
-		return true;
-	}
-
-	const deleteResult = await deleteMessage(message.chat.id, message.message_id);
-	const quoteAuthors = quoteAd ? collectOriginalAuthors(message, 'quote') : [];
-	const originalAuthorBanSafe = quoteAd ? isHighConfidenceQuotedAdEvidence(quoteAd) : false;
-	const linkedQuoteAuthors = originalAuthorBanSafe ? quoteAuthors : [];
-	const forwardAuthors = directAd && isForwardedMessage(message)
-		? collectOriginalAuthors(message, 'forward')
-		: [];
-	const originalMap = new Map();
-	for (const candidate of [...linkedQuoteAuthors, ...forwardAuthors]) {
-		if (!originalMap.has(candidate.id)) originalMap.set(candidate.id, candidate);
-	}
-	const selfQuotedAd = quoteAd && originalAuthorBanSafe && originalMap.has(currentId);
-	originalMap.delete(currentId);
-	const forwardedQuotedAd = Boolean(quoteAd && isForwardedMessage(message));
-	const relayDecision = !quoteAd
-		? null
-		: (selfQuotedAd
-			? { shouldBan: true, mode: 'self_ad', reason: '当前用户传播自己的高置信广告' }
-			: (forwardedQuotedAd
-				? { shouldBan: true, mode: 'forwarded_relay', reason: '高置信广告转发，首次直接全局封禁' }
-				: classifyQuotedAdRelay(message, quoteAd, quoteAuthors)));
-	const immediateRelayBan = Boolean(
-		quoteAd
-		&& !directAd
-		&& relayDecision?.shouldBan
-		&& relayDecision.mode !== 'self_ad'
-	);
-
-	let observation = null;
-	let shouldBanCurrent = directAd || selfQuotedAd || forwardedQuotedAd || relayDecision?.shouldBan === true;
-	if (
-		quoteAd
-		&& !directAd
-		&& !selfQuotedAd
-		&& !forwardedQuotedAd
-		&& relayDecision?.mode === 'accidental_observation'
-	) {
-		observation = await recordAdRelayObservation(env, {
-			actorId: currentId,
-			chatId: message.chat.id,
-			messageId: message.message_id,
-			originalAuthorId: quoteAuthors[0]?.id || '',
-			quoteFingerprint: normalizeForFingerprint(adResult.quoteText || quoteAd.quotePreview || ''),
-			quotePreview: adResult.quoteText || quoteAd.quotePreview || '',
-			wrapperPreview: message.text || message.caption || (message.sticker ? '[贴纸]' : '(无文字)'),
-			evidence: [relayDecision.reason, quoteAd.strong, ...(quoteAd.hits || [])].filter(Boolean).join(' / '),
-		});
-		shouldBanCurrent = observation.ok && observation.occurrences >= AD_RELAY_REPEAT_THRESHOLD;
-	}
-
-	let currentResult = null;
-	if (shouldBanCurrent) {
-		let source = '高置信广告引用传播者';
-		if (directAd) source = '当前广告发送者';
-		else if (selfQuotedAd) source = '当前广告原作者';
-		else if (forwardedQuotedAd) source = '高置信广告转发者';
-		else if (observation) source = '重复误触型广告引用传播者';
-
-		// V2 观察窗口：直接广告检测（非引用/转发）走观察窗口机制
-		if (directAd && !quoteAd && env?.DB) {
-			const score = adResult.score || 0;
-			const hits = adResult.hits || [];
-			const obsResult = await updateObservationWindow(env, currentId, message.chat.id, score, hits);
-			if (obsResult && obsResult.score >= AD_V2_BAN_SCORE) {
-				// 观察窗口累计分数达标，执行封禁
-				currentResult = await enforceAutomaticAdTarget({
-					id: currentId,
-					user: message.from,
-					source: '广告检测V2观察窗口累计达标',
-				}, env, { skipAdminCheck: true, scopeGroups: [String(message.chat.id)] });
-			} else if (obsResult && obsResult.score >= AD_V2_OBSERVE_SCORE) {
-				// 进入观察窗口，创建待确认快照
-				const preview = (message.text || message.caption || '').slice(0, 100);
-				const token = await createPendingSnapshot(env, currentId, message.chat.id, message.message_id, obsResult.score, hits, preview);
-				// 通知主人
-				await notifyAllOwners(
-					`⚠️ <b>广告检测 V2 观察窗口</b>\n` +
-					`👤 用户:<code>${currentId}</code>\n` +
-					`📊 评分:${obsResult.score}/${AD_V2_BAN_SCORE}\n` +
-					`📍 群:<code>${message.chat.id}</code>\n` +
-					`🔍 命中:${hits.slice(0, 3).map((h) => escapeHtml(h)).join('、')}\n` +
-					(token ? `📋 快照:<code>${token.slice(0, 12)}</code>` : ''),
-					null
-				);
-			}
-		} else {
-			currentResult = await enforceAutomaticAdTarget({
-				id: currentId,
-				user: message.from,
-				source,
-			}, env, { skipAdminCheck: true, scopeGroups: [String(message.chat.id)] });
-		}
-	}
-
-	const originalResults = [];
-	for (const candidate of originalMap.values()) {
-		originalResults.push(await enforceAutomaticAdTarget(candidate, env, {
-			scopeGroups: [String(message.chat.id)]
-		}));
-	}
-
-	if (quoteAd && !directAd) {
-		await notifyOwnerAdRelayObservation(message, adResult, {
-			deleteResult,
-			observation,
-			immediateRelayBan,
-			relayDecision,
-			currentResult,
-			quoteAuthors,
-			originalAuthorBanSafe,
-			originalResults,
-		});
-	} else {
-		console.log(`[广告检测] 命中 用户=${currentId} 群=${message.chat.id} 分数=${adResult.score} 特征=${(adResult.hits || []).join('/')}`);
-		await notifyOwnerAdDetection(message, adResult, currentResult?.banResults || []);
-		await notifyOwnerOriginalAdTargets(message, adResult, originalResults);
-	}
-	return true;
-}
 
 // 频道帖自动转发到关联讨论群:Telegram 用 is_automatic_forward=true 标记这类消息,
 // 其 sender_chat 是来源频道、from 是 Telegram 服务账号(如 777000),内容是频道原文。
@@ -10049,18 +6463,17 @@ function isChannelAutoForward(message) {
 }
 
 async function handleMessage(message, env, ctx, requestUrl = '') {
-	// 刷新额外管理员缓存
-	await refreshModerationAdminCache(env);
-
-	// 频道关联群自动转发帖直接放行:不删、不缓存、不参与广告检测、不当命令。
+	// 频道关联群自动转发帖直接放行:不删、不缓存、不当命令。
 	// 放在最顶部,先于一切治理逻辑,保证任意频道内容(不只是像广告的)都不被误删误取消置顶。
 	if (isChannelAutoForward(message)) {
 		return;
 	}
 
-	// B 方案:新成员进群时主动查杀神全局封禁库(真人)。放在 bot 处理之前,
-	//   因为 handleNewChatMemberBots 遇到 new_chat_members 会 return true 提前结束。
-	await handleNewMemberGkyCheck(message, env, ctx);
+	// 广告检测 v2：入群资料筛查。
+	// 必须放在 handleNewChatMemberBots 之前——后者对配置群的任何进群消息最后一律 return true，
+	// 插在它之后会变成死代码。detectAdOnJoin 固定返回 false、不接返回值，
+	// 只做「拉资料 → 评分 → 封禁或写观察窗口」，绝不短路既有的 bot 静音与进群消息清理逻辑。
+	await detectAdOnJoin(message, env, ctx);
 
 	if (await handleNewChatMemberBots(message)) {
 		return;
@@ -10105,14 +6518,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 黑名单兜底：已黑用户在配置群里发言 → 删消息 + 立即踢出
 	// 必须先于消息缓存执行，避免已黑用户刷消息继续产生 D1 写入。
 	// 排除 bot 自身 / 私聊 / 群管理员（避免误伤误加黑的管理员）
-	// 只在"记录对本群生效"时拦截：被单群封禁的人在其它群发言不受影响。
 	// 命令命中后 return，不进入后续命令分发
 	if (
 		isConfiguredGroup(chatId) &&
 		message.from &&
 		!message.from.is_bot
 	) {
-		const blacklistCheck = await checkBlacklist(userId, env, { chatId });
+		const blacklistCheck = await checkBlacklist(userId, env);
 		if (blacklistCheck.isBlacklisted) {
 			// 双保险：管理员豁免，避免误加黑导致管理员被踢
 			const isAdmin = await checkIfUserIsAdmin(userId);
@@ -10126,424 +6538,67 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 	}
 
-	// /add_admin、/del_admin：第一主人管理额外管理员（可使用 /ban 和 /spam 的非管理员用户）。
-	if (text && /^\/(add_admin|del_admin|list_admin)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
-		const isInGroup = message.chat.type !== 'private';
-		if (!isOwner(userId)) {
-			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n额外管理员管理仅限主人。');
-			return;
-		}
-		if (!env.DB) {
-			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间。');
-			return;
-		}
-		const head = text.trim().match(/^\/(add_admin|del_admin|list_admin)(?:@[^\s]+)?/i)[1].toLowerCase();
-
-		// /list_admin：列出全部额外管理员
-		if (head === 'list_admin') {
-			const admins = await listModerationAdmins(env);
-			const lines = ['🛡️ <b>额外管理员列表</b>（可使用 /ban 和 /spam）', ''];
-			if (admins.length === 0) {
-				lines.push('（空）用 <code>/add_admin TGID</code> 添加。');
-			} else {
-				admins.forEach((a, i) => {
-					const note = a.note ? ` — ${escapeHtml(a.note)}` : '';
-					lines.push(`${i + 1}. <code>${escapeHtml(a.user_id)}</code>${note}`);
-				});
-			}
-			await sendTelegramMessage(chatId, lines.join('\n'));
-			return;
-		}
-
-		// /add_admin 和 /del_admin 需要 TGID 参数
-		const match = text.trim().match(/^\/(add_admin|del_admin)(?:@[^\s]+)?\s+(\d+)(?:\s+([\s\S]*))?$/i);
-		if (!match) {
-			await sendTelegramMessage(chatId, '❌ 用法：<code>/add_admin TGID [备注]</code> 或 <code>/del_admin TGID</code>');
-			return;
-		}
-		const targetId = match[2];
-		const note = match[3] ? match[3].trim() : '';
-		if (head === 'add_admin') {
-			const result = await addModerationAdmin(env, targetId, userId, note);
-			await sendTelegramMessage(chatId, result.ok
-				? `✅ 已将 <code>${escapeHtml(targetId)}</code> 添加为额外管理员${note ? '（' + escapeHtml(note) + '）' : ''}。\n可使用 /ban 和 /spam。`
-				: `❌ 添加失败：${escapeHtml(result.error || '未知错误')}`);
-		} else {
-			const result = await removeModerationAdmin(env, targetId);
-			await sendTelegramMessage(chatId, result.ok
-				? `✅ 已将 <code>${escapeHtml(targetId)}</code> 从额外管理员移除。`
-				: `❌ 移除失败：${escapeHtml(result.error || '未知错误')}`);
-		}
+	// 广告检测 v2 三个钩子。位置固定在黑名单兜底之后、所有命令分发之前：
+	//   1) 命令层：11 条主人私聊命令，命中即 return，避免落进后面的通用命令分发。
+	//   2) 回复学习：管理层回复某条消息说「广告」→ 立即判定 + 学习指纹。
+	//   3) 消息层：每条群消息都拉完整资料（昵称 + 用户名 + 简介）走三层判定。
+	//      早退只保留零成本的确定性排除：slash 命令、无正文且无转发、管理员。
+	//      不再按正文分做预筛 —— 那个省法漏放了资料分 10 分的明显广告号，详见 detectAdOnMessage。
+	// 三者都只在自己确实处理了这条消息时返回 true；否则一律返回 false 继续原流程。
+	if (await handleAdDetectionCommands(message, env, ctx)) {
 		return;
 	}
 
-	// ===== /status 机器人状态（内联按钮菜单）=====
-	if (text && /^\/status(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
-		const isInGroup = message.chat.type !== 'private';
-		if (!isOwner(userId)) {
-			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/status 仅限主人使用。');
-			return;
-		}
-		await sendStatusMenu(message, env, ctx);
+	if (await handleAdReplyLearning(message, env, ctx)) {
 		return;
 	}
 
-	// ===== 广告检测 V2 命令（仅第一主人私聊）=====
-	if (text && /^\/(pending|confirm|ignore|addword|delword|listwords|addsample|clearsamples|warmup|whitelist|adstats|rescreen)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
-		const isInGroup = message.chat.type !== 'private';
-		if (!isOwner(userId)) {
-			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告检测管理仅限主人。');
-			return;
-		}
-		if (isInGroup) {
-			await sendAuthorizedCommandResult(message, ctx, { flashText: 'ℹ️ 请私聊操作', detailText: '⚠️ 广告检测管理命令仅限私聊使用。' });
-			return;
-		}
-		if (!env.DB) {
-			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间。');
-			return;
-		}
-		const head = text.trim().match(/^\/(pending|confirm|ignore|addword|delword|listwords|addsample|clearsamples|warmup|whitelist|adstats|rescreen)(?:@[^\s]+)?/i)[1].toLowerCase();
-		const argMatch = text.trim().match(/^\/(?:pending|confirm|ignore|addword|delword|listwords|addsample|clearsamples|warmup|whitelist|adstats|rescreen)(?:@[^\s]+)?\s*([\s\S]*)/i);
-		const arg = argMatch ? argMatch[1].trim() : '';
-
-		// /pending [N] - 列出待确认快照
-		if (head === 'pending') {
-			const limit = Math.min(Math.max(parseInt(arg) || 10, 1), 50);
-			const snapshots = await getPendingSnapshots(env, limit);
-			const lines = ['📋 <b>待确认广告判定快照</b>', ''];
-			if (snapshots.length === 0) {
-				lines.push('（空）自动判定为广告时会推给你复核。');
-			} else {
-				snapshots.forEach((s, i) => {
-					const hits = s.hits ? JSON.parse(s.hits) : [];
-					lines.push(`${i + 1}. 序号:<code>${s.token.slice(0, 12)}</code> 评分:${s.score}`);
-					lines.push(`   用户:<code>${escapeHtml(s.user_id)}</code> 预览:${escapeHtml((s.preview || '').slice(0, 60))}`);
-					if (hits.length > 0) lines.push(`   命中:${hits.slice(0, 3).map((h) => escapeHtml(h)).join('、')}`);
-					lines.push('');
-				});
-				lines.push('确认:<code>/confirm 序号</code> 忽略:<code>/ignore 序号</code>');
-			}
-			await sendTelegramMessage(chatId, lines.join('\n'));
-			return;
-		}
-
-		// /confirm 序号 - 确认判定正确，学入指纹库
-		if (head === 'confirm') {
-			if (!arg) {
-				await sendTelegramMessage(chatId, '❌ 用法：<code>/confirm 序号</code>（见 /pending）');
-				return;
-			}
-			const snapshots = await getPendingSnapshots(env, 50);
-			const snap = snapshots[parseInt(arg) - 1] || snapshots.find((s) => s.token.startsWith(arg));
-			if (!snap) {
-				await sendTelegramMessage(chatId, '❌ 快照不存在或已过期。');
-				return;
-			}
-			// 学入指纹库
-			const hits = snap.hits ? JSON.parse(snap.hits) : [];
-			for (const hit of hits) {
-				if (hit.includes('指纹:')) {
-					const fpValue = hit.replace('指纹:', '');
-					await addAdFingerprint(env, fpValue, 'keyword', 0.7, 'manual');
-				}
-			}
-			// 执行封禁
-			await addToBlacklist(snap.user_id, env, { reason: 'ad_auto', by: userId, note: `广告检测V2确认: 评分${snap.score}` });
-			await banUserFromAllGroups(snap.user_id, { probeMembership: true, _env: env });
-			await updatePendingSnapshot(env, snap.token, 'confirmed');
-			await sendTelegramMessage(chatId, `✅ 已确认并封禁用户 <code>${escapeHtml(snap.user_id)}</code>，指纹已学入。`);
-			return;
-		}
-
-		// /ignore 序号 - 判定错误，解黑 + 标记误报
-		if (head === 'ignore') {
-			if (!arg) {
-				await sendTelegramMessage(chatId, '❌ 用法：<code>/ignore 序号</code>（见 /pending）');
-				return;
-			}
-			const snapshots = await getPendingSnapshots(env, 50);
-			const snap = snapshots[parseInt(arg) - 1] || snapshots.find((s) => s.token.startsWith(arg));
-			if (!snap) {
-				await sendTelegramMessage(chatId, '❌ 快照不存在或已过期。');
-				return;
-			}
-			// 解除黑名单
-			await removeFromBlacklist(snap.user_id, env);
-			await unbanUserFromAllGroups(snap.user_id, { _env: env });
-			await updatePendingSnapshot(env, snap.token, 'ignored');
-			await sendTelegramMessage(chatId, `✅ 已忽略并解封用户 <code>${escapeHtml(snap.user_id)}</code>。`);
-			return;
-		}
-
-		// /addword 值 - 手动添加指纹
-		if (head === 'addword') {
-			if (!arg) {
-				await sendTelegramMessage(chatId, '❌ 用法：<code>/addword 关键词</code>');
-				return;
-			}
-			const result = await addAdFingerprint(env, arg, 'keyword', 0.8, 'manual');
-			await sendTelegramMessage(chatId, result.ok
-				? `✅ 已添加指纹: <code>${escapeHtml(arg)}</code>`
-				: `❌ 添加失败：${escapeHtml(result.error || '未知错误')}`);
-			return;
-		}
-
-		// /delword 值 - 删除指纹
-		if (head === 'delword') {
-			if (!arg) {
-				await sendTelegramMessage(chatId, '❌ 用法：<code>/delword 关键词</code>');
-				return;
-			}
-			const result = await removeAdFingerprint(env, arg);
-			await sendTelegramMessage(chatId, result.ok
-				? result.changed ? `✅ 已删除指纹: <code>${escapeHtml(arg)}</code>` : `❌ 指纹不存在: <code>${escapeHtml(arg)}</code>`
-				: `❌ 删除失败：${escapeHtml(result.error || '未知错误')}`);
-			return;
-		}
-
-		// /listwords [页码] - 查看指纹库
-		if (head === 'listwords') {
-			const page = Math.max(parseInt(arg) || 1, 1);
-			const offset = (page - 1) * 20;
-			await ensureD1Table(env);
-			const { results } = await env.DB.prepare('SELECT value, type, weight, source, hit_count FROM ad_fingerprints ORDER BY hit_count DESC LIMIT 20 OFFSET ?').bind(offset).all();
-			const lines = ['📚 <b>广告指纹库</b>', ''];
-			if (results.length === 0) {
-				lines.push('（空）用 <code>/addword 关键词</code> 添加。');
-			} else {
-				results.forEach((r, i) => {
-					lines.push(`${offset + i + 1}. <code>${escapeHtml(r.value)}</code> (${r.type}, 权重${r.weight}, 命中${r.hit_count})`);
-				});
-				lines.push('', `第 ${page} 页，共 ${results.length} 条`);
-			}
-			await sendTelegramMessage(chatId, lines.join('\n'));
-			return;
-		}
-		// /addsample：添加 AI 语义比对样本
-		if (head === 'addsample') {
-			if (!arg || arg.length < 4) {
-				await sendTelegramMessage(chatId, '❌ 用法：<code>/addsample 广告文本</code>\n样本至少 4 个字符。');
-				return;
-			}
-			await ensureD1Table(env);
-			const now = new Date().toISOString();
-			const existing = await env.DB.prepare('SELECT id FROM ad_sample_embeddings WHERE text = ?').bind(arg).first();
-			if (existing) {
-				await sendTelegramMessage(chatId, 'ℹ️ 样本已存在，未重复入库。');
-				return;
-			}
-			await env.DB.prepare('INSERT INTO ad_sample_embeddings (text, embedding, created_at) VALUES (NULL, NULL, ?)').bind(now).run();
-			// 更新 text 字段
-			const lastRow = await env.DB.prepare('SELECT id FROM ad_sample_embeddings WHERE text IS NULL ORDER BY id DESC LIMIT 1').first();
-			if (lastRow) {
-				await env.DB.prepare('UPDATE ad_sample_embeddings SET text = ? WHERE id = ?').bind(arg, lastRow.id).run();
-			}
-			const { results: countResult } = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings').first();
-			const { results: readyResult } = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings WHERE embedding IS NOT NULL').first();
-			await sendTelegramMessage(chatId, [
-				'✅ <b>样本已添加</b>',
-				'内容：' + escapeHtml(arg.slice(0, 120)),
-				`样本库：共 <b>${countResult?.cnt || 0}</b> 条，已生成向量 <b>${readyResult?.cnt || 0}</b> 条`
-			].join('\n'));
-			return;
-		}
-		// /clearsamples：清空全部 AI 样本
-		if (head === 'clearsamples') {
-			if (arg !== 'confirm') {
-				await sendTelegramMessage(chatId, '⚠️ 清空操作不可逆，确认请发 <code>/clearsamples confirm</code>。');
-				return;
-			}
-			await ensureD1Table(env);
-			await env.DB.prepare('DELETE FROM ad_sample_embeddings').run();
-			await sendTelegramMessage(chatId, '✅ 已清空全部 AI 样本。');
-			return;
-		}
-		// /warmup：手动补齐语义样本向量
-		if (head === 'warmup') {
-			if (!env.AI || typeof env.AI.run !== 'function') {
-				await sendTelegramMessage(chatId, '⚠️ <b>未绑定 Workers AI</b>\n第三层语义判定不可用，无需补齐向量。');
-				return;
-			}
-			const before = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings').first();
-			if (!before || before.cnt === 0) {
-				await sendTelegramMessage(chatId, '📭 样本库为空，请先用 <code>/addsample 文本</code> 添加样本。');
-				return;
-			}
-			const filled = await topUpAdSampleEmbeddings(env);
-			const after = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings WHERE embedding IS NOT NULL').first();
-			const remain = Math.max(0, before.cnt - (after?.cnt || 0));
-			const lines = [
-				filled > 0 ? `✅ <b>已生成 ${filled} 条向量</b>` : '⚠️ <b>本次未生成任何向量</b>',
-				`进度：<b>${after?.cnt || 0}</b> / ${before.cnt} 条样本已生成向量`
-			];
-			if (remain > 0) {
-				lines.push(`还差 <b>${remain}</b> 条，再发 /warmup 继续。`);
-			} else {
-				lines.push('全部样本向量已补齐，第三层 AI 语义判定现已生效。');
-			}
-			await sendTelegramMessage(chatId, lines.join('\n'));
-			return;
-		}
-		// /whitelist：管理域名白名单
-		if (head === 'whitelist') {
-			if (!arg) {
-				await ensureD1Table(env);
-				const { results } = await env.DB.prepare('SELECT domain, source FROM ad_domain_whitelist ORDER BY created_at DESC LIMIT 20').all();
-				const lines = ['🌐 <b>域名白名单</b>', ''];
-				if (results.length === 0) {
-					lines.push('（空）');
-				} else {
-					results.forEach((r, i) => lines.push(`${i + 1}. <code>${escapeHtml(r.domain)}</code> (${r.source})`));
-				}
-				lines.push('', '添加：<code>/whitelist add example.com</code>');
-				lines.push('删除：<code>/whitelist del example.com</code>');
-				await sendTelegramMessage(chatId, lines.join('\n'));
-				return;
-			}
-			const parts = arg.trim().split(/\s+/);
-			if (parts.length < 2) {
-				await sendTelegramMessage(chatId, '❌ 用法：<code>/whitelist add example.com</code> 或 <code>/whitelist del example.com</code>');
-				return;
-			}
-			const action = parts[0].toLowerCase();
-			const domain = parts[1].toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-			await ensureD1Table(env);
-			if (action === 'add') {
-				const now = new Date().toISOString();
-				await env.DB.prepare('INSERT OR IGNORE INTO ad_domain_whitelist (domain, source, created_at) VALUES (?, ?, ?)').bind(domain, 'manual', now).run();
-				await sendTelegramMessage(chatId, `✅ 已将 <code>${escapeHtml(domain)}</code> 加入白名单。`);
-			} else if (action === 'del') {
-				await env.DB.prepare('DELETE FROM ad_domain_whitelist WHERE domain = ?').bind(domain).run();
-				await sendTelegramMessage(chatId, `✅ 已将 <code>${escapeHtml(domain)}</code> 从白名单移除。`);
-			} else {
-				await sendTelegramMessage(chatId, '❌ 用法：<code>/whitelist add example.com</code> 或 <code>/whitelist del example.com</code>');
-			}
-			return;
-		}
-		// /rescreen：重新筛查观察窗口里的可疑用户
-		if (head === 'rescreen') {
-			try {
-				const observations = await getObservationWindow(env, 20);
-				if (observations.length === 0) {
-					await sendTelegramMessage(chatId, '📭 观察窗口内没有待复判的用户。');
-					return;
-				}
-				let banned = 0;
-				let cleared = 0;
-				for (const o of observations) {
-					const userId = String(o.user_id || '');
-					if (!userId) continue;
-					const score = Number(o.score) || 0;
-					if (score >= 7) {
-						await addToBlacklist(userId, env, { reason: 'ad_auto', by: 'system', note: `复判评分${score}达标` });
-						await banUserFromAllGroups(userId, { probeMembership: true, _env: env });
-						await env.DB.prepare('DELETE FROM ad_observation_window WHERE user_id = ?').bind(userId).run();
-						banned++;
-					} else if (score < 4) {
-						await env.DB.prepare('DELETE FROM ad_observation_window WHERE user_id = ?').bind(userId).run();
-						cleared++;
-					}
-				}
-				await sendTelegramMessage(chatId, [
-					'✅ <b>复判完成</b>',
-					`封禁: ${banned} 人`,
-					`清除: ${cleared} 人`,
-					`剩余: ${observations.length - banned - cleared} 人`
-				].join('\n'));
-			} catch (error) {
-				await sendTelegramMessage(chatId, `❌ 复判失败: ${error.message}`);
-			}
-			return;
-		}
-		// /adstats：查看统计信息
-		if (head === 'adstats') {
-			await ensureD1Table(env);
-			const fpCount = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_fingerprints').first();
-			const sampleCount = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings').first();
-			const readyCount = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_sample_embeddings WHERE embedding IS NOT NULL').first();
-			const whitelistCount = await env.DB.prepare('SELECT COUNT(*) as cnt FROM ad_domain_whitelist').first();
-			const blacklistCount = await env.DB.prepare('SELECT COUNT(*) as cnt FROM blacklist').first();
-			await sendTelegramMessage(chatId, [
-				'📊 <b>统计信息</b>',
-				'',
-				`指纹库: ${fpCount?.cnt || 0} 条`,
-				`AI 样本: ${sampleCount?.cnt || 0} 条 (已生成向量 ${readyCount?.cnt || 0} 条)`,
-				`域名白名单: ${whitelistCount?.cnt || 0} 条`,
-				`黑名单: ${blacklistCount?.cnt || 0} 人`
-			].join('\n'));
-			return;
-		}
+	if (await detectAdOnMessage(message, env)) {
+		return;
 	}
 
-	// /clean_blacklist：第一主人手动清理黑名单中已销号的 Telegram 账号。
-	// 逐条调 getChat 判断是否已销号，命中则从黑名单删除。限私聊，避免群内触发耗时操作。
-	if (text && /^\/clean_blacklist(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+	// /add_ad_admin、/del_ad_admin：第一主人管理 /ad 发起白名单。
+	if (text && /^\/(add_ad_admin|del_ad_admin)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
 		if (!isPrimaryOwner(userId)) {
-			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/clean_blacklist 仅限第一主人使用。');
+			if (!isInGroup) {
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/ad 发起白名单仅限第一主人管理。');
+			}
 			return;
 		}
-		if (isInGroup) {
+		await deleteAuthorizedGroupCommandMessage(message, '/ad-admin');
+		if (!env.DB) {
 			await sendAuthorizedCommandResult(message, ctx, {
-				flashText: 'ℹ️ 请私聊操作',
-				detailText: '⚠️ /clean_blacklist 是耗时操作，仅限私聊使用。',
+				flashText: '❌ 未绑定 D1',
+				detailText: '❌ 未绑定 D1 存储空间，无法管理 /ad 发起白名单。',
 			});
 			return;
 		}
-		if (!env.DB) {
-			await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间。');
+		const match = text.trim().match(/^\/(add_ad_admin|del_ad_admin)(?:@[^\s]+)?\s+(\d+)\s*$/i);
+		if (!match) {
+			await sendAuthorizedCommandResult(message, ctx, {
+				flashText: '❌ 用法错误',
+				detailText: '用法：<code>/add_ad_admin TGID</code> 或 <code>/del_ad_admin TGID</code>',
+			});
 			return;
 		}
-		await sendTelegramMessage(chatId, '⏳ 开始检测黑名单中的销号用户，请稍候...');
-		const result = await cleanDeletedAccountsFromBlacklist(env);
-		const lines = [
-			'🧹 <b>销号清理完成</b>',
-			'',
-			`📊 检测总数:${result.total}`,
-			`✅ 已清理销号:${result.cleaned}`,
-			`❌ 检测失败:${result.failed}`,
-			`📋 正常存活:${result.alive}`,
-		];
-		if (result.cleanedIds.length > 0) {
-			lines.push('');
-			lines.push('<b>已清理的销号用户:</b>');
-			result.cleanedIds.forEach((id) => lines.push(`  • <code>${escapeHtml(id)}</code>`));
-		}
-		if (result.failedIds.length > 0) {
-			lines.push('');
-			lines.push('<b>检测失败（可能已销号或网络问题）:</b>');
-			result.failedIds.forEach((id) => lines.push(`  • <code>${escapeHtml(id)}</code>`));
-		}
-		await sendTelegramMessage(chatId, lines.join('\n'));
+		const enabled = match[1].toLowerCase() === 'add_ad_admin';
+		const result = await setAdVoteAllowlist(env, match[2], enabled, userId);
+		const detail = result.ok
+			? (enabled
+				? '✅ 已将 <code>' + escapeHtml(match[2]) + '</code> 加入 /ad 发起白名单。'
+				: '✅ 已将 <code>' + escapeHtml(match[2]) + '</code> 从 /ad 发起白名单移除。')
+			: '❌ 更新失败：' + escapeHtml(result.error || '未知错误');
+		await sendAuthorizedCommandResult(message, ctx, {
+			flashText: result.ok ? '✅ /ad 白名单已更新' : '❌ /ad 白名单更新失败',
+			detailText: detail,
+		});
 		return;
 	}
 
-	// /clean_switch：第一主人切换自动销号清理开关（每天凌晨4点定时任务）。
-	// 通过内联按钮菜单操作，无需记忆命令。
-	if (text && /^\/clean_switch(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
-		const isInGroup = message.chat.type !== 'private';
-		if (!isPrimaryOwner(userId)) {
-			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/clean_switch 仅限第一主人使用。');
-			return;
-		}
-		const enabled = await getAutoCleanEnabled(env);
-		const toggle = !enabled;
-		await setAutoCleanEnabled(env, toggle);
-		const statusText = toggle ? '✅ 已开启' : '❌ 已关闭';
-		const statusEmoji = toggle ? '🟢' : '🔴';
-		await sendTelegramMessage(chatId,
-			`🔧 <b>自动销号清理</b>\n\n` +
-			`状态: ${statusEmoji} ${statusText}\n\n` +
-			`每天凌晨 4 点自动检测黑名单中的销号用户并移除。\n` +
-			`当前状态: <b>${toggle ? '开启' : '关闭'}</b>`,
-			{
-				inline_keyboard: [[
-					{ text: '✅ 开启', callback_data: 'clean_switch:on' },
-					{ text: '❌ 关闭', callback_data: 'clean_switch:off' },
-				]],
-			}
-		);
+	// /ad 必须先于自动广告检测：白名单成员或助推者回复广告发起投票时，不能把发起人误判为传播者。
+	if (isAdCommand(text)) {
+		await handleAdCommand(message, env, ctx);
 		return;
 	}
 
@@ -10563,77 +6618,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			await cacheModerationMessage(env, message);
 		}
 	}
-	// 缓存"疑似广告"群消息(供 /learnlast 学习被 GKY 删掉的广告);ctx.waitUntil 异步不阻塞
-	if (
-		MSG_CACHE_ENABLED && env.DB && isConfiguredGroup(chatId) &&
-		message.from && !message.from.is_bot &&
-		!(text && text.startsWith('/')) &&
-		looksLikeAdCandidate(message)
-	) {
-		if (ctx && typeof ctx.waitUntil === 'function') {
-			ctx.waitUntil(cacheRecentMessage(env, message));
-		} else {
-			await cacheRecentMessage(env, message);
-		}
-	}
-
-	// ===== /ad_test 广告检测测试模式 =====
-	// 主人转发或发送消息到私聊，机器人回复是否命中广告判据，不做任何数据库写入。
-	// 命令：/ad_test on | /ad_test off | /ad_test status
-	if (text && /^\/ad_test(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
-		const isInGroup = message.chat.type !== 'private';
-		if (!isOwner(userId)) {
-			if (!isInGroup) await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/ad_test 仅限主人使用。');
-			return;
-		}
-		const argMatch = text.trim().match(/^\/ad_test(?:@[^\s]+)?\s*(\S*)/i);
-		const arg = argMatch ? argMatch[1].trim().toLowerCase() : 'status';
-		if (arg === 'on') {
-			const setResult = await setAdTestMode(env, userId, true);
-			console.log(`[ad_test] 开启: userId=${userId}, result=${setResult}`);
-			await sendTelegramMessage(chatId, '✅ <b>广告检测测试模式已开启</b>\n\n转发或发送消息到私聊，机器人会回复是否命中广告判据及依据。\n不会写入任何数据库（不加黑、不学习、不缓存）。\n发送 <code>/ad_test off</code> 关闭。');
-			return;
-		}
-		if (arg === 'off') {
-			await setAdTestMode(env, userId, false);
-			await sendTelegramMessage(chatId, '✅ <b>广告检测测试模式已关闭</b>');
-			return;
-		}
-		const enabled = await getAdTestMode(env, userId);
-		await sendTelegramMessage(chatId, `ℹ️ <b>广告检测测试模式</b>: ${enabled ? '✅ 已开启' : '❌ 已关闭'}\n\n用法：\n/ad_test on  — 开启\n/ad_test off — 关闭\n/ad_test 或 /ad_test status — 查看状态`);
-		return;
-	}
-
-	// 测试模式下的广告检测分析（不写入数据库）
-	if (message.chat.type === 'private' && message.from && !message.from.is_bot) {
-		try {
-			const testMode = await getAdTestMode(env, userId);
-			console.log(`[ad_test] 检测: userId=${userId}, testMode=${testMode}, isService=${isTelegramServiceMessage(message)}, isSlash=${isTelegramSlashCommand(text)}, text=${text?.slice(0, 50)}`);
-			if (testMode && !isTelegramServiceMessage(message) && !isTelegramSlashCommand(text)) {
-				console.log('[ad_test] 运行广告检测分析...');
-				await runAdTestAnalysis(message, env, ctx);
-				return;
-			}
-		} catch (error) {
-			console.error('[ad_test] 分析失败:', error);
-		}
-	}
-
-	// 广告自动检测：普通成员发的疑似广告 → 删消息 + 加黑 + 全群踢 + 通知主人
-	// 在黑名单拦截之后、命令分发之前；管理员豁免
-	// 服务消息（置顶/入群/改群名等）不是用户发言，不参与广告判定 ——
-	// 否则置顶一条含广告词的消息会让【置顶者】被当成广告发布者处置。
-	// 命令消息（/spam /ban /ad 等）也跳过广告检测，避免举报者被误判。
-	if (AD_FILTER_ENABLED && isConfiguredGroup(chatId) && message.from && !message.from.is_bot
-		&& !isTelegramServiceMessage(message) && !isTelegramSlashCommand(text)) {
-		// 先把 D1 自定义词库与学习样本 merge 进来(detectAd 之前)
-		await Promise.all([
-			mergeAdKeywordsFromD1(env),
-			mergeAdSamplesFromD1(env)
-		]);
-		const adResult = await detectAd(message, env);
-		if (await handleAutomaticAdDecision(message, adResult, env)) return;
-	}
+	// ===== 自动广告治理已全部移除 =====
+	// 原有的「疑似广告消息缓存 + 词库/正则自动检测」误封率极高:262 个词规模下,
+	// identity 直杀词（接码/出号/收号/号商）与营销词（频道/客服/私信我）组合即定罪,
+	// 正常用户"我出号了""私信请发频道"全部命中;general 227 词里还含 michael/brown 等人名。
+	// 结论:词库匹配 + 组合定罪这个范式本身不可用,不是判据写得不够巧。
+	// 同时移除的还有两条不看文案的自动通路（GKY 信誉库查杀、跨群刷屏检测）——
+	// 按用户口径,自动广告治理一律归零,只保留真人判定:/ban、/spam、/ad 投票。
+	// 将来若重做,请勿简单恢复词库匹配范式。
 
 	// 处理 /spam 命令 - 举报加黑（支持回复消息 + 直接输入TGID + 批量，群内/私聊双场景）
 	if (isSpamCommand(text)) {
@@ -10646,7 +6638,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const isAdmin = await checkMessageOperatorCanBan(message, userId, env);
 		if (!isAdmin) {
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /spam；私聊仅限主人、副主人或超级管理员。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /spam；私聊仅限主人、副主人、超级管理员或广告发起白名单成员。');
 			}
 			return;
 		}
@@ -10684,21 +6676,18 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 			// 单条
 			if (valid.length === 1 && invalid.length === 0) {
-				// /spam 是唯一的跨群封禁通道：scopeGroups 省略即全局（全部配置群）。
 				const result = await addToBlacklist(valid[0], env, { reason: 'spam', by: operatorId, note });
 				const alreadyExists = result.code === 'EXISTS';
 				let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
-				const lines = [`🎬 操作:举报加黑(/spam，跨群封禁)`];
+				const lines = [`🎬 操作:举报加黑(/spam)`];
 				let flashText;
 				if (result.success || alreadyExists) {
-					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true, _env: env });
+					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
 					targetMention = formatTargetFromBanResults(valid[0], banResults);
 					lines.push(`🎯 目标用户:${targetMention}`);
-					lines.push(`📍 生效范围:${describeBlacklistScope(null)}`);
 					lines.push('');
 					if (alreadyExists) {
 						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
-						if (result.scopeExpanded) lines.push('ℹ️ 该记录原为单群范围，本次已升级为全局生效。');
 					}
 					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/spam' }));
 					flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
@@ -10725,7 +6714,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const perUserBanResults = await mapWithConcurrency(
 				idsToKick,
 				BULK_TASK_CONCURRENCY,
-				async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id, { _env: env }) })
+				async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id) })
 			);
 			for (const { banResults } of perUserBanResults) {
 				const okCount = banResults.filter((r) => r.ok).length;
@@ -10734,9 +6723,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				else banSummary.banPartial += 1;
 			}
 			const failedCount = invalid.length + results.failed.length;
-			const flashText = `✅ 批量加黑(/spam，跨群)：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+			const flashText = `✅ 批量加黑(/spam)：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
 			const baseDetail = renderBatchAddResult(results, invalid, banSummary, userProfiles);
-			let fullDetail = `📍 生效范围:${describeBlacklistScope(null)}${results.scopeExpanded?.length ? `\nℹ️ 其中 ${results.scopeExpanded.length} 条原为单群范围，本次已升级为全局生效。` : ''}\n\n${baseDetail}`;
+			let fullDetail = baseDetail;
 			if (perUserBanResults.length > 0) {
 				const perUserBlocks = [];
 				const chatInfoCache = new Map();
@@ -10776,43 +6765,20 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
 		if (result.success || alreadyExists) {
-			// 加黑成功或已存在 → 优先删除当前群消息，再执行预封禁
-			// 1. 先删除当前群该用户的所有消息（包括 @bot 的消息）
-			const cleanupResult = await cleanupUserAllMessages(env, chatId, repliedUserId, repliedMsg?.from?.username);
-
-			// 2. 检测广告 Bot 的触发者（@bot 的人）
-			const triggererLines = [];
-			if (repliedMsg?.from?.is_bot || repliedMsg?.from?.username?.toLowerCase().includes('bot')) {
-				const botUsername = repliedMsg.from.username;
-				const triggerers = await findBotTriggerers(env, chatId, botUsername, repliedUserId);
-				if (triggerers.length > 0) {
-					triggererLines.push('', '⚠️ <b>检测到广告 Bot 触发者</b>');
-					for (const triggererId of triggerers) {
-						// 封禁触发者（仅当前群）
-						await addToBlacklist(triggererId, env, { reason: 'ad_auto', by: 'system', note: `触发广告 Bot @${botUsername}` });
-						await banUserFromGroups(triggererId, [chatId], { probeMembership: true });
-						triggererLines.push(`  • <code>${escapeHtml(triggererId)}</code> 已封禁（触发 @${escapeHtml(botUsername)}）`);
-					}
-				}
-			}
-
-			// 3. Telegram 群封禁/预封（revoke_messages 默认 true:封禁同时删该用户在各群全部消息）
-			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true, _env: env });
+			// 加黑成功或已存在 → Telegram 群封禁/预封(revoke_messages 默认 true:封禁同时删该用户在各群全部消息)
+			//   + 缓存清扫兜底(补删 revoke 偶尔漏的、当前群近期消息)
+			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true });
+			const cleanupResult = await cleanupCurrentChatUserMessages(env, chatId, repliedUserId, [repliedMsg.message_id]);
 
 			const lines = [
-				`🎬 操作:举报加黑(/spam，跨群封禁)`,
+				`🎬 操作:举报加黑(/spam)`,
 				`🎯 目标用户:${linkedUserId} <code>${escapeHtml(String(repliedUserId))}</code>`,
-				`📍 生效范围:${describeBlacklistScope(null)}`,
 				'',
 				result.success
 					? `✅ 已将用户 ${linkedUserId} 添加到黑名单`
-					: `⚠️ 用户 ${linkedUserId} 已在黑名单中,本次已继续执行 Telegram 群封禁/预封${result.scopeExpanded ? '，并已把生效范围升级为全局' : ''}`,
+					: `⚠️ 用户 ${linkedUserId} 已在黑名单中,本次已继续执行 Telegram 群封禁/预封`,
 				await renderBanResultsDetail(banResults, null, { userId: repliedUserId, retryCommand: '/spam' }),
 			];
-			lines.push(renderCurrentChatCleanupResult(cleanupResult));
-			if (triggererLines.length > 0) {
-				lines.push(...triggererLines);
-			}
 			lines.push(renderCurrentChatCleanupResult(cleanupResult));
 			if (cleanupResult.failed > 0 && cleanupResult.errors.length > 0) {
 				const previews = cleanupResult.errors.slice(0, 3).map((item) => {
@@ -10821,21 +6787,101 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				});
 				lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
 			}
-			// /spam 自动学习指纹（V2：写入 ad_fingerprints 表）
-			if (env.DB) {
-				const adText = repliedMsg?.text || repliedMsg?.caption || '';
-				if (adText.length >= 4) {
-					const fpResult = await addAdFingerprint(env, adText, 'keyword', 0.8, 'spam');
-					if (fpResult.ok) {
-						lines.push('', '📖 <b>已学习广告指纹</b>');
-						lines.push(`✅ 文本已加入指纹库(权重 0.8)`);
-					}
+			// /spam 引用模式 → 自动学习指纹（2026-09-07 落地，主人指定的方案：
+			// 「通过 spam 引用确定广告之后全群封禁并自动学习，全部交给有权限的人来判定」）。
+			//
+			// 设计要点：
+			//   1) 只在【引用模式】学 —— 这个分支本身就是「回复某条消息后发 /spam」，手上有
+			//      确定的广告正文；「/spam 用户ID」那条路径没有正文，学不到任何东西。
+			//   2) source 用 'spam' 而不是 'manual'：
+			//      · 只要不是 'auto' 就自动跳过 learnAdFingerprints 的强动词闸门 —— 那道闸是
+			//        防自动学习把「个人简介」这类中性词学成指纹的，人工判定不需要它；
+			//      · 又不是 'manual'，所以仍受 markAdFingerprintFalsePositive 的退役机制约束
+			//        （那句 DELETE 带 source != 'manual'）。万一判错，/ignore 累计误报后能自动
+			//        清掉，不会留成永久误封源。
+			//   3) 额外拉一次 getChat 取 bio：bio 是最有价值的指纹来源 —— 广告号的联系方式和
+			//      引流矩阵都写在那儿，正文往往只有一句「在吗」。/spam 是低频手动指令，多一个
+			//      请求无所谓，且 fetchAdUserProfile 自带 5 分钟缓存，连发不会重复请求。
+			let spamLearned = 0;
+			let spamSampleAdded = 0;
+			let spamEnriched = 0;
+			try {
+				const spamText = String(repliedMsg.text || repliedMsg.caption || '');
+				const spamProfile = await fetchAdUserProfile(repliedUserId, repliedMsg.from || {});
+				const spamName = [spamProfile.firstName, spamProfile.lastName].filter(Boolean).join(' ').trim();
+				const spamPayload = {
+					name: spamName,
+					username: spamProfile.username ? '@' + String(spamProfile.username).replace(/^@/, '') : '',
+					bio: spamProfile.bio || '',
+					text: spamText,
+					domains: extractAdDomains([spamName, spamProfile.bio, spamText].filter(Boolean).join('\n'))
+				};
+				const spamLearn = await learnAdFingerprints(env, spamPayload, {
+					source: 'spam',
+					createdBy: String(operatorId ?? '')
+				});
+				spamLearned = Number(spamLearn?.learned || 0);
+
+				// ===== 语义样本：AI 通过 /spam 自我学习（2026-09-08 补）=====
+				// 主人原话：「AI 是通过 spam 执行自我学习的」。此前 /spam 只学指纹、不碰样本库，
+				// 而 AI 层是硬命中即封，一条都不喂的话样本库永远停留在中心特征 + 手工 /addsample。
+				// 取材对齐回复学习路径（项 6，_worker.js 12930-12940）：本人正文太短且不含
+				// 举报 / 吐槽语义时，改用引用块内容当样本正文。线上漏放 50+ 个号的共同形态正是
+				// 「正文只有一个字母 c、广告全在引用块里」—— 不这样做学进去的就是「Maybell Tillman c」
+				// 这种纯噪声，对召回零帮助、还会把「英文人名 + 单字母」推成广告特征误伤正常外国用户。
+				const spamQuoted = getAdQuotedText(repliedMsg);
+				const useQuotedForSample = Boolean(spamQuoted)
+					&& spamText.trim().length <= AD_QUOTED_KILL_MAX_OWN_TEXT
+					&& !countAdKeywordHits(spamText, AD_QUOTED_KILL_NEGATORS).length;
+				const spamSampleText = buildAdSampleText({
+					name: spamName,
+					bio: spamProfile.bio || '',
+					text: useQuotedForSample ? spamQuoted : spamText
+				});
+				if (spamSampleText.length >= 4) {
+					const spamSample = await addAdSample(env, spamSampleText, {
+						source: useQuotedForSample ? 'spam-quoted' : 'spam'
+					});
+					if (spamSample.added) spamSampleAdded = 1;
 				}
+				// ===== 短语自我泛化（方案 E）：每攒够一批新样本就提炼一次共现短语 =====
+				// 设计：见 enrichAdCommonPhrases 上方注释。这里【无条件】调用 —— 即使本次是
+				// 重复样本（added=false），也可能已有若干条新样本在等提炼，由函数内部检查点
+				// 判断是否到触发线。
+				// 【不传 createdBy】刻意让它落回默认的 'enrich' —— 那是批量回滚的抓手，
+				// 写成操作人 id 就没法按来源整批清理了（理由见函数内 createdBy 处注释）。
+				const enrichResult = await enrichAdCommonPhrases(env, loadAdDetectionConfig(env), {});
+				if (enrichResult && enrichResult.learned > 0) spamEnriched = enrichResult.learned;
+			} catch (error) {
+				// 学习失败绝不能影响 /spam 的本职（加黑 + 全群封禁 + 清扫）—— 那些已经做完了。
+				console.error('[广告检测] /spam 学习指纹失败:', error);
 			}
+			if (spamLearned > 0) lines.push('🧬 已学习广告指纹:' + spamLearned + ' 条(来源 /spam 人工判定)');
+			if (spamSampleAdded > 0) lines.push('🧠 已加 AI 语义样本:' + spamSampleAdded + ' 条(来源 /spam 人工判定)');
+			if (spamEnriched > 0) lines.push('🧠 共性提炼:从新样本自动提炼出 ' + spamEnriched + ' 条指纹(共现 ≥2 次)');
 
 			await replyToAdmin(message, ctx, {
 				flashText: `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} ${linkedUserId}`,
 				detailText: withActionContext(message, lines.join('\n'), replySpamNote),
+				isInGroup,
+				notifySecondaryOwners: true
+			});
+		} else {
+			// 写库失败(已存在 / 未绑存储等)— 也走双通道,字段齐全
+			const plainMsg = result.message.replace(/<[^>]+>/g, '');
+			const failLines = [
+				`🎬 操作:举报加黑(/spam)`,
+				`🎯 目标用户:${linkedUserId} <code>${escapeHtml(String(repliedUserId))}</code>`,
+				'',
+			];
+			if (result.code === 'EXISTS') {
+				failLines.push('⚠️ <b>该用户已在黑名单中,请勿重复添加</b>');
+			} else {
+				failLines.push(result.message);
+			}
+			await replyToAdmin(message, ctx, {
+				flashText: `⚠️ ${linkedUserId}: ${escapeHtml(plainMsg)}`,
+				detailText: withActionContext(message, failLines.join('\n'), replySpamNote),
 				isInGroup,
 				notifySecondaryOwners: true
 			});
@@ -10892,10 +6938,22 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 		const latestJob = await loadBulkJob(env, job.id) || job;
 		let detailText = formatBulkJobDetail(latestJob, isRun ? '▶️ <b>批量任务已继续执行</b>' : '📦 <b>批量任务状态</b>');
+		let jobKeyboard = null;
+		let jobFallbackLine = '';
 		if (!isRun && isOwner(userId)) {
-			const pageInfo = getBulkJobPageIds(latestJob, requestedPage);
-			const profiles = await resolveBatchUserProfiles(pageInfo.ids, latestJob.sourceChatId);
-			detailText += `\n\n${formatBulkJobUserPage(latestJob, pageInfo.page, profiles)}`;
+			if (isInGroup) {
+				// 群内触发时详情要经 replyToAdmin 包一层审计头（「主人操作通知 / 来源:群内」），
+				// 那层包装依赖 message 上下文，回调里【还原不出来】——
+				// 硬挂按钮会让编辑后的消息把审计头吃掉。所以群内路径保持原有文本翻页。
+				const pageInfo = getBulkJobPageIds(latestJob, requestedPage);
+				const profiles = await resolveBatchUserProfiles(pageInfo.ids, latestJob.sourceChatId);
+				detailText += `\n\n${formatBulkJobUserPage(latestJob, pageInfo.page, profiles)}`;
+			} else {
+				const rendered = await renderBulkJobOwnerView(env, latestJob, requestedPage);
+				detailText = rendered.text;
+				jobKeyboard = rendered.keyboard;
+				jobFallbackLine = rendered.fallbackLine;
+			}
 		}
 		if (isInGroup) {
 			await replyToAdmin(message, ctx, {
@@ -10905,7 +6963,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				notifySecondaryOwners: false
 			});
 		} else {
-			await sendTelegramMessageChunks(chatId, detailText);
+			await sendAdPagedMessage(chatId, detailText, jobKeyboard, jobFallbackLine);
 		}
 		return;
 	}
@@ -10922,16 +6980,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const checkArg = text.trim().replace(/^\/check(?:@[^\s]+)?\s*/i, '').trim();
 		const hasTgidArg = /^\d+$/.test(checkArg);
 
-		// /check 属于主人层命令：只有主人与副主人（高级管理员）可用，
-		// 额外管理员与普通群管理员一律不开放，菜单里也不会出现。
-		const isAdmin = isOwner(userId);
+		// /check 属于高级管理命令，普通 Telegram 群管理员不开放。
+		const isAdmin = isPrivilegedManager(userId);
 		const quietGroupCommand = isInGroup && isConfiguredSourceGroup && !isPrimaryOwner(userId);
 
 		if (hasTgidArg) {
 			// 带 TGID 参数:私聊 / 群内均可
 			if (!isAdmin) {
 				if (message.chat.type === 'private') {
-					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/check 仅限主人与副主人使用。');
+					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
 				}
 				return;
 			}
@@ -10961,7 +7018,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 无参数:沿用原"群内回复消息"用法
 		if (!isInGroup) {
 			if (!isAdmin) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/check 仅限主人与副主人使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
 				return;
 			}
 			await sendTelegramMessage(chatId, 'ℹ️ 私聊查询请用:<code>/check TGID</code>\n例:<code>/check 993005028</code>\n群内可回复某条消息发 <code>/check</code> 查该用户。');
@@ -11055,10 +7112,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 普通的 /start 命令在后面的欢迎消息分支统一处理
 	}
 
-	// 处理 /blacklist 命令 - 主人层查看 D1 黑名单（仅主人与副主人）
+	// 处理 /blacklist 命令 - 私聊管理员查看 D1 黑名单
 	if (text && /^\/blacklist(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		if (message.chat.type !== 'private') {
-			const isAdmin = isOwner(userId);
+			const isAdmin = isPrivilegedManager(userId);
 			if (isAdmin) {
 				await deleteAuthorizedGroupCommandMessage(message, '/blacklist');
 			}
@@ -11075,17 +7132,18 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				getD1BlacklistCount(env),
 				readD1BlacklistRecent(env, BLACKLIST_PAGE_LIMIT)
 			]);
+			const operatorUsernames = await resolveBlacklistOperatorUsernames(blacklist);
 			await replyToAdmin(message, ctx, {
 				flashText: `📋 黑名单共 ${total} 条，完整结果已发送给主人`,
-				detailText: renderBlacklist(blacklist, { total, alreadyRecent: true }),
+				detailText: renderBlacklist(blacklist, { total, alreadyRecent: true, operatorUsernames }),
 				isInGroup: true,
 			});
 			return;
 		}
 
-		const isAdmin = isOwner(userId);
+		const isAdmin = isPrivilegedManager(userId);
 		if (!isAdmin) {
-			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/blacklist 仅限主人与副主人使用。');
+			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n此功能仅限主人、副主人或超级管理员使用。');
 			return;
 		}
 
@@ -11099,10 +7157,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			readD1BlacklistRecent(env, BLACKLIST_PAGE_LIMIT)
 		]);
 		const operatorUsernames = await resolveBlacklistOperatorUsernames(blacklist);
-		// 保持单条发送：分块函数的 sanitizeTelegramText 会剥离全部代理对码元（📋👑🕵️ 等
-		// emoji 全没），且阈值按 HTML 原文长度算（30 条原文 4823 字符 > 3500），会把本来
-		// 发得出去的一条消息无谓拆成两条。默认 30 条可见字符仅约 2790，远低于 Telegram
-		// 的 4096 上限，单条足够。若把 BLACKLIST_PAGE_LIMIT 调到 45 条以上再考虑分块。
+		// 保持单条发送：splitTelegramHtmlBlocks 的阈值按 HTML 原文长度算（30 条原文约
+		// 4800 字符 > 3500），会把本来发得出去的一条消息无谓拆成两条。默认 30 条可见字符
+		// 仅约 2800，远低于 Telegram 的 4096 上限，单条足够。
+		// 若把 BLACKLIST_PAGE_LIMIT 调到 45 条以上，再改用 sendTelegramMessageChunks。
 		await sendTelegramMessage(chatId, renderBlacklist(blacklist, { total, alreadyRecent: true, operatorUsernames }));
 		return;
 	}
@@ -11111,7 +7169,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 仅 OWNER_IDS[0] 第一主人可用。其他角色群内静默、私聊提示权限不足。
 	if (text && /^\/help(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		const isOwnerUser = isOwner(userId);
+		const isOwnerUser = isPrimaryOwner(userId);
 		if (!isOwnerUser) {
 			// 群内完全静默(连"权限不足"都不发,避免暴露命令存在);私聊也不暴露隐藏指令
 			if (!isInGroup) {
@@ -11122,38 +7180,25 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		await deleteAuthorizedGroupCommandMessage(message, '/help');
 		// 隐藏指令仅在私聊展开(群内不回,避免其他成员看到指令清单)
 		if (isInGroup) {
+			// 刻意显式传 6000（略长于 FLASH_MESSAGE_TTL_MS 默认值）：这条是引导性提示，
+			// 要留够时间让主人看到"去私聊发 /help"，不随全局时长调短。
 			await sendFlashMessage(chatId, 'ℹ️ 请私聊我发送 /help 查看 OWNER_IDS 专属指令。', ctx, 6000);
 			return;
 		}
-		// /help 命令改为裸文本可点击发送：Telegram 对纯文本里的 /xxx 识别为 bot_command 实体、
-		// 渲染成蓝色链接并支持点一下直接发送。<code> 包裹的只给「点击复制」。
+		// 命令一律【裸文本】不包 <code>：Telegram 只会把纯文本里的 /xxx 识别成 bot_command
+		// 实体、渲染成蓝色链接并支持「点一下直接发送」；一旦包进 <code>，点击就只是复制。
 		const helpLines = [
 			'🔐 <b>第一主人专属指令</b>（其他人无反应，也不出现在命令菜单里）',
-			'',
-			'<b>━━ 广告检测 V2(私聊)━━</b>',
-			'/addword 关键词　添加广告指纹(自动加入指纹库)',
-			'/delword 关键词　删除广告指纹',
-			'/listwords [页码]　查看广告指纹库',
-			'/addsample 文本　添加 AI 语义比对样本',
-			'/clearsamples confirm　清空全部 AI 样本',
-			'/warmup　预热 AI 样本向量',
-			'/whitelist [add|del] 域名　管理域名白名单',
-			'/adstats　查看统计信息',
-			'/rescreen [N]　重新筛查观察窗口里的可疑用户',
-			'/pending [N]　查看待确认的广告判定快照',
-			'/confirm 序号　确认判定正确，学入指纹库并封禁',
-			'/ignore 序号　判定错误，解黑并解封',
-			'/ad_test　广告检测测试模式(开/关)',
 			'',
 			'<b>━━ 人工封禁 ━━</b>',
 			'/ban TGID [原因]　加入全局黑名单 + 全群封禁',
 			'/spam　回复广告使用：删消息 + 全群封禁 + 撤回其历史发言',
 			'/unban TGID　移出黑名单 + 全群解封（裸发 /unban 是自己走自助解封，不是解封别人）',
 			'',
-			'<b>━━ 额外管理员（仅私聊）━━</b>',
-			'/add_admin TGID [备注]　添加额外管理员(可使用 /ban 和 /spam)',
-			'/del_admin TGID　移除额外管理员',
-			'/list_admin　列出全部额外管理员',
+			'<b>━━ 广告举报投票 ━━</b>',
+			'/ad [原因]　回复广告发起群内投票，通过后加黑并全群封禁',
+			'/add_ad_admin TGID　允许该成员发起 /ad 投票',
+			'/del_ad_admin TGID　取消该成员的发起权限',
 			'',
 			'<b>━━ 动态群组（仅私聊）━━</b>',
 			'/addgroup -100xxx [备注]　新增治理群组，不用改环境变量',
@@ -11164,6 +7209,27 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/admins　查看主人 / 副主人 / 超级管理员名单',
 			'/groups　查看当前生效群组信息',
 			'/leavegroup -100xxx　让 bot 退出该群',
+			'',
+			'<b>━━ 广告检测与指纹库（仅私聊）━━</b>',
+			'自动判定为广告的用户会即时加黑 + 全群封禁 + 自动学入指纹与 AI 样本，并把快照推给你复核。',
+			'判定正确无需任何操作；快照长期保留，只在误判时用 /ignore 回滚。',
+			'/pending [N]　列出待复核的自动判定快照，默认 10 条（最新在前）',
+			'/ignore 序号　判定错误：解黑 + 全群解封 + 删掉学到的指纹与 AI 样本',
+			'　　支持批量 /ignore 3 5 7 与区间 /ignore 3-8',
+			'/rescreen [N]　重新筛查观察窗口里的可疑用户，默认 10 人',
+			'/adstats　指纹库规模、分类占比、Top 命中、观察窗口与配置总览',
+			'',
+			'<b>━━ 指纹与样本维护（仅私聊）━━</b>',
+			'/words [关键词] [页码]　翻看指纹库，按命中次数倒序，每页 ' + AD_WORDS_PAGE_LIMIT + ' 条',
+			'　　带关键词即搜索（只匹配指纹内容，不匹配来源），翻页用消息下方按钮',
+			'/addword 值 [类型]　手动新增指纹，类型可省略自动推断',
+			'/delword 值　删除指纹',
+			'/delword noise　批量删掉命中 0 次的噪声指纹（需二次确认，不动种子）',
+			'/delword type:username　批量删掉整类指纹（需二次确认，不动种子）',
+			'/addsample 文本　新增 AI 语义比对样本',
+			'/warmup　补齐样本向量（向量为 0 时第三层 AI 不生效，反复发直到补满）',
+			'/clearsamples　清空全部 AI 样本，需二次确认令牌',
+			'/whitelist [list|add|del] [域名]　维护域名白名单，命中即豁免',
 		];
 		await sendTelegramMessageChunks(chatId, helpLines.join('\n'));
 		return;
@@ -11173,7 +7239,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 仅 OWNER_IDS[0] 主人私聊可用;群内完全静默,避免暴露权限配置和用户资料。
 	if (text && /^\/admins(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		if (!isOwner(userId)) {
+		if (!isPrimaryOwner(userId)) {
 			if (!isInGroup) {
 				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限主人使用。');
 			}
@@ -11192,7 +7258,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 仅 OWNER_IDS[0] 主人私聊可用;群内完全静默,避免暴露群组配置。
 	if (text && /^\/groups(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		if (!isOwner(userId)) {
+		if (!isPrimaryOwner(userId)) {
 			if (!isInGroup) {
 				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限主人使用。');
 			}
@@ -11211,7 +7277,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 仅 OWNER_IDS[0] 主人私聊可用；群内发送只撤回命令，不执行退出。
 	if (text && /^\/leavegroup(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
-		if (!isOwner(userId)) {
+		if (!isPrimaryOwner(userId)) {
 			if (!isInGroup) {
 				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n该命令仅限主人私聊使用。');
 			}
@@ -11270,9 +7336,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	if (text && /^\/(addgroup|delgroup|listgroups)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
 		const isInGroup = message.chat.type !== 'private';
 		// 群内一律静默（避免泄漏命令存在），私聊才给权限提示
-		if (!isOwner(userId)) {
+		if (!isPrimaryOwner(userId)) {
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n动态群组管理仅限主人使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n动态群组管理仅限第一主人使用。');
 			}
 			return;
 		}
@@ -11400,88 +7466,44 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				'',
 				`📊 当前生效群组:${totalGroups} 个（环境变量 ${ENV_GROUP_IDS.length} + 指令添加 ${DYNAMIC_GROUP_IDS.length + 1}）`,
 				'',
-				'ℹ️ 该群已纳入全套治理:黑名单拦截、复入群踢回、广告自动检测、/ban 本群封禁、/spam 跨群封禁、/purge 清扫、批量任务。',
+				'ℹ️ 该群已纳入全套治理:黑名单拦截、复入群踢回、广告自动检测、/ban /spam 全群封禁、/purge 清扫、批量任务。',
 				'⚠️ 群数增加会线性放大全群操作的耗时与请求数，批量任务会更早转为异步执行。',
 			].filter(Boolean).join('\n'),
 		);
 		return;
 	}
 
-	// ===== 广告词库热更新命令(仅主人可用)=====
-	// /addword /delword /listwords /importdefault
-	if (text && /^\/(addword|delword|listwords|importdefault)(?:@[^\s]+)?(?:\s|$)/i.test(text.trim())) {
+
+
+
+	// 处理 /ban 命令 - 添加用户到黑名单（支持批量、群内/私聊双场景；兼容 /ban@机器人名）
+	if (isBanCommand(text)) {
 		const isInGroup = message.chat.type !== 'private';
-		const isOwnerUser = isOwner(userId);
-		if (!isOwnerUser) {
-			// 仅主人可用;非主人在私聊提示,群内静默(避免泄漏命令存在)
+		if (isInGroup && !isConfiguredGroup(chatId)) return;
+
+		// 仅真人可通过 /ban 写入 D1 黑名单：作为管理员的第三方机器人一律忽略（GroupAnonymousBot 匿名管理员=真人，放行）
+		if (isBotOperator(message.from)) return;
+
+		// 普通管理员必须是当前群管理员；高级管理员保持原有权限。
+		const isAdmin = await checkMessageOperatorCanBan(message, userId, env);
+		if (!isAdmin) {
+			// 群内静默忽略（避免泄漏命令存在）；私聊明确告知权限不足
 			if (!isInGroup) {
-				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告词库管理仅限主人使用。');
+				await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n普通群管理员只能在自己管理的 GROUP_ID 配置群内使用 /ban；私聊仅限主人、副主人、超级管理员。');
 			}
 			return;
 		}
-		await deleteAuthorizedGroupCommandMessage(message, '/adwords');
-		if (!env.DB) {
-			await sendAuthorizedCommandResult(message, ctx, {
-				flashText: '❌ 未绑定 D1，完整提示已发送给主人',
-				detailText: '❌ 未绑定 D1 存储空间,无法管理广告词库。',
-			});
-			return;
-		}
+		await deleteAuthorizedGroupCommandMessage(message, '/ban');
 
-		const { head, rest } = parseTelegramCommand(text);
-
-		// ===== 回复模式：回复消息封禁（与 /spam 对称）=====
-		if (repliedMsg && !rawArg) {
-			const repliedUserId = repliedMsg?.from?.id;
-			if (!repliedUserId) {
-				const usageText = '❌ 使用方法：\n• 回复消息后发 <code>/ban</code>\n• 或直接 <code>/ban 用户ID</code>（支持批量：<code>/ban 123,456,789</code>）';
-				await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
-				return;
-			}
-			const result = await addToBlacklist(repliedUserId, env, { reason: 'manual', by: operatorId, scopeGroups: banScopeGroups });
-			const alreadyExists = result.code === 'EXISTS';
-			const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
-			let targetMention = `<code>${escapeHtml(String(repliedUserId))}</code>`;
-			const lines = [`🎬 操作:加入黑名单（${banScopeLabel}）`];
-			let flashText;
-			if (result.success || alreadyExists) {
-				const banResults = await banUserFromGroups(repliedUserId, banTargetGroupIds, { probeMembership: true });
-				const cleanupResult = isInGroup
-					? await cleanupCurrentChatUserMessages(env, chatId, repliedUserId)
-					: null;
-				targetMention = formatTargetFromBanResults(repliedUserId, banResults);
-				lines.push(`🎯 目标用户:${linkedUserId} ${targetMention}`);
-				lines.push(`📍 生效范围:${describeBlacklistScope(result.scopeGroups ?? banScopeGroups)}`);
-				lines.push('');
-				if (alreadyExists) {
-					lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
-					if (result.scopeExpanded) lines.push('ℹ️ 已把本群并入该记录的生效范围。');
-				}
-				lines.push(await renderBanResultsDetail(banResults, null, { userId: repliedUserId, retryCommand: '/ban' }));
-				if (cleanupResult) {
-					lines.push(renderCurrentChatCleanupResult(cleanupResult));
-				}
-				flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${repliedUserId}</code>（${banScopeLabel}）\n` + renderBanResults(banResults);
-			} else {
-				lines.push(`🎯 目标用户:${linkedUserId}`);
-				lines.push('');
-				lines.push(result.message);
-				flashText = `⚠️ <code>${repliedUserId}</code> ${result.message.replace(/<[^>]+>/g, '')}`;
-			}
-			await replyToAdmin(message, ctx, {
-				flashText,
-				detailText: withActionContext(message, lines.join('\n'), ''),
-				isInGroup,
-				notifySecondaryOwners: true
-			});
-			return;
-		}
-
-		// ===== TGID 模式：直接通过 ID 封禁 =====
+		// 提取参数（支持单个 / 批量；开头 TGID 列表之后的文本作为执行原因）
+		// 用正则提取,与 /spam 完全对称:兼容 /ban、/ban@机器人名、多空格;彻底不依赖命令长度,
+		// 根除早期 slice(5) 吃掉参数首字符那类"命令一改短就错位"的隐患。
+		const argMatch = text.trim().match(/^\/ban(?:@[^\s]+)?\s*([\s\S]*)/i);
+		const rawArg = argMatch ? argMatch[1] : '';
 		const { valid, invalid, note } = parseTargetIdsAndNote(rawArg);
 
 		if (valid.length === 0 && invalid.length === 0) {
-			const usageText = `❌ 使用方法：\n• 回复消息后发 <code>/ban</code>\n• 或直接 <code>/ban 用户ID</code>（支持批量：<code>/ban 123,456,789</code>，最多 ${BATCH_LIMIT} 个）`;
+			const usageText = `❌ 使用方法：<code>/ban 用户ID</code> 或 <code>/ban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
 			await sendModerationCommandFeedback(message, ctx, { flashText: usageText });
 			return;
 		}
@@ -11496,7 +7518,6 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			invalid,
 			note,
 			isInGroup,
-			scopeGroups: banScopeGroups,
 			requestUrl
 		})) {
 			return;
@@ -11504,19 +7525,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 		// 单条且无格式错误
 		if (valid.length === 1 && invalid.length === 0) {
-			const result = await addToBlacklist(valid[0], env, {
-				reason: 'manual',
-				by: operatorId,
-				note,
-				scopeGroups: banScopeGroups
-			});
+			const result = await addToBlacklist(valid[0], env, { reason: 'manual', by: operatorId, note });
 			const alreadyExists = result.code === 'EXISTS';
 			// 统一详情格式:无论成功失败都展示完整字段
 			let targetMention = `<code>${escapeHtml(valid[0])}</code>`;
-			const lines = [`🎬 操作:加入黑名单（${banScopeLabel}）`];
+			const lines = [`🎬 操作:加入黑名单`];
 			let flashText;
 			if (result.success || alreadyExists) {
-				const banResults = await banUserFromGroups(valid[0], banTargetGroupIds, { probeMembership: true });
+				const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
 				// 与 /spam 对齐：Telegram 的 revoke_messages 只对【仍在群里】的成员生效，
 				// 目标若已退群/已被别人踢过就变成预封，历史发言一条都撤不掉。
 				// 这里补一层兜底：从 moderation_messages 捞出该 TGID 在【当前群】缓存的消息 ID
@@ -11527,11 +7543,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 					: null;
 				targetMention = formatTargetFromBanResults(valid[0], banResults);
 				lines.push(`🎯 目标用户:${targetMention}`);
-				lines.push(`📍 生效范围:${describeBlacklistScope(result.scopeGroups ?? banScopeGroups)}`);
 				lines.push('');
 				if (alreadyExists) {
 					lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
-					if (result.scopeExpanded) lines.push('ℹ️ 已把本群并入该记录的生效范围。');
 				}
 				lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/ban' }));
 				if (cleanupResult) {
@@ -11544,7 +7558,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 						lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
 					}
 				}
-				flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>（${banScopeLabel}）\n` + renderBanResults(banResults);
+				flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
 			} else {
 				// 失败(已存在/未绑存储等)→ 追加原因
 				lines.push(`🎯 目标用户:${targetMention}`);
@@ -11562,20 +7576,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		}
 
 		// 批量
-		const results = await addManyToBlacklist(valid, env, {
-			reason: 'manual',
-			by: operatorId,
-			note,
-			scopeGroups: banScopeGroups
-		});
+		const results = await addManyToBlacklist(valid, env, { reason: 'manual', by: operatorId, note });
 		const idsToKick = [...results.success, ...results.exists];
 		const userProfiles = await resolveBatchUserProfiles(idsToKick, chatId);
 		const banSummary = { success: idsToKick.length, banOkAll: 0, banPartial: 0, banFailedAll: 0 };
-		// 每次最多并发 3 个用户；每个用户内部仍按目标群串行，避免连接与 Telegram 限流突增。
+		// 每次最多并发 3 个用户；每个用户内部仍按配置群串行，避免连接与 Telegram 限流突增。
 		const perUserBanResults = await mapWithConcurrency(
 			idsToKick,
 			BULK_TASK_CONCURRENCY,
-			async (id) => ({ userId: id, banResults: await banUserFromGroups(id, banTargetGroupIds) })
+			async (id) => ({ userId: id, banResults: await banUserFromAllGroups(id) })
 		);
 		for (const { banResults } of perUserBanResults) {
 			const okCount = banResults.filter((r) => r.ok).length;
@@ -11584,10 +7593,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			else banSummary.banPartial += 1;
 		}
 		const failedCount = invalid.length + results.failed.length;
-		const flashText = `✅ 批量加黑（${banScopeLabel}）：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+		const flashText = `✅ 批量加黑：成功 ${results.success.length}${results.exists.length ? ` / 已存在 ${results.exists.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
 		// 详细 detailText：批量汇总 + 每个用户的逐群明细
 		const baseDetail = renderBatchAddResult(results, invalid, banSummary, userProfiles);
-		let fullDetail = `📍 生效范围:${describeBlacklistScope(banScopeGroups)}\n\n${baseDetail}`;
+		let fullDetail = baseDetail;
 		if (perUserBanResults.length > 0) {
 			const perUserBlocks = [];
 			const chatInfoCache = new Map();
@@ -11622,29 +7631,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		if (rest.trim()) {
 			const isInGroup = message.chat.type !== 'private';
 
-			// /unban 分两层：
-			// - 主人/副主人/超级管理员：全局解封，删除整条 D1 记录并解封全部配置群；
-			// - 当前群管理员（含匿名管理员）：只能解除【本群】——把本群从记录的生效范围里摘掉，
-			//   仅解封本群。若记录是 /spam 写入的全局黑名单，一律拒绝，不允许被降级。
-			const isPrivileged = isPrivilegedManager(userId);
-			const isCurrentGroupManager = !isPrivileged
-				&& isInGroup
-				&& isConfiguredGroup(chatId)
-				&& !isBotOperator(message.from)
-				&& await checkMessageOperatorCanBan(message, userId, env);
-			const isAdmin = isPrivileged || isCurrentGroupManager;
+			// /unban 只能由主人、副主人或超级管理员执行。
+			const isAdmin = isPrivilegedManager(userId);
 			if (!isAdmin) {
 				if (!isInGroup) {
-					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n私聊 /unban 仅限主人、副主人或超级管理员；群管理员请在自己管理的配置群内使用，且只能解除本群。');
+					await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n/unban 仅限主人、副主人或超级管理员使用。');
 				}
 				return;
 			}
 			await deleteAuthorizedGroupCommandMessage(message, '/unban');
-
-			// 群管理员 → 只作用于当前群；主人层 → null 表示全局。
-			const unbanScopeGroups = isPrivileged ? null : [String(chatId)];
-			const unbanTargetGroupIds = resolveScopeTargetGroupIds(unbanScopeGroups);
-			const unbanScopeLabel = isPrivileged ? '全部配置群' : '仅当前群';
 
 			const { valid, invalid } = parseBatchTgids(rest);
 
@@ -11664,7 +7659,6 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				invalid,
 				note: '',
 				isInGroup,
-				scopeGroups: unbanScopeGroups,
 				requestUrl
 			})) {
 				return;
@@ -11673,30 +7667,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 单条且无格式错误
 			if (valid.length === 1 && invalid.length === 0) {
 				const targetId = valid[0];
-				const eligibility = await checkManyUnbanEligibility([targetId], env, {
-					allowD1Removal: true,
-					scopeGroups: unbanScopeGroups
-				});
+				const eligibility = await checkManyUnbanEligibility([targetId], env, { allowD1Removal: isAdmin });
 				const userProfiles = await resolveBatchUserProfiles([targetId], chatId);
 				const targetMention = formatBatchUserTarget(targetId, userProfiles);
 				const lines = [
-					`🎬 操作:D1 黑名单资格检查 + Telegram 原生群解封（${unbanScopeLabel}）`,
+					`🎬 操作:D1 黑名单资格检查 + Telegram 原生群解封`,
 					`🎯 目标用户:${targetMention}`,
 					'',
 				];
-
-				if (eligibility.globalScoped.includes(targetId)) {
-					lines.push(
-						'⛔ <b>该记录是全局黑名单（/spam 写入），已拒绝本群解封</b>',
-						'ℹ️ 全局记录不允许被单群降级；请联系主人、副主人或超级管理员执行全局 <code>/unban</code>。'
-					);
-					await replyToAdmin(message, ctx, {
-						flashText: `⛔ <code>${targetId}</code> 是全局黑名单，本群无法单独解封`,
-						detailText: lines.join('\n'),
-						isInGroup
-					});
-					return;
-				}
 
 				if (eligibility.blacklisted.includes(targetId)) {
 					lines.push('⛔ <b>目标仍在 D1 黑名单，已拒绝解封</b>', 'ℹ️ D1 记录保持不变，未调用 Telegram 解封接口。');
@@ -11721,42 +7699,35 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				}
 
 				const d1RecordRemoved = eligibility.d1Removed.includes(targetId);
-				const unbanResults = await unbanUserFromGroups(targetId, unbanTargetGroupIds);
+				const unbanResults = await unbanUserFromAllGroups(targetId);
 				lines.push(
 					d1RecordRemoved
-						? (isPrivileged
-							? '✅ <b>目标原在 D1 黑名单，已由管理层移除记录并允许解封</b>'
-							: '✅ <b>已把本群从该记录的生效范围中移除，并允许本群解封</b>')
+						? '✅ <b>目标原在 D1 黑名单，已由管理层移除记录并允许解封</b>'
 						: '✅ <b>目标不在 D1 黑名单，允许执行 Telegram 原生解封</b>',
 					d1RecordRemoved
-						? (isPrivileged
-							? 'ℹ️ D1 黑名单记录已删除；本次仅调用 Telegram 原生解封接口。'
-							: 'ℹ️ 该记录若在其它群仍有范围则继续生效；范围清空时记录已整条删除。')
+						? 'ℹ️ D1 黑名单记录已删除；本次仅调用 Telegram 原生解封接口。'
 						: 'ℹ️ 本次未修改任何 D1 记录。',
 					'',
 					'<b>Telegram 群解封结果</b>:',
 					await renderUnbanResultsDetail(unbanResults, null, { userId: targetId, retryCommand: '/unban' })
 				);
 				await replyToAdmin(message, ctx, {
-					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封（${unbanScopeLabel}）\n${renderUnbanResults(unbanResults)}`,
+					flashText: `🔓 <code>${targetId}</code> D1 检查通过，已尝试群解封\n${renderUnbanResults(unbanResults)}`,
 					detailText: lines.join('\n'),
 					isInGroup
 				});
 				return;
 			}
 
-			// 批量：先按范围移除/收窄命中的 D1 记录，再对全部资格通过目标执行群解封。
-			const results = await checkManyUnbanEligibility(valid, env, {
-				allowD1Removal: true,
-				scopeGroups: unbanScopeGroups
-			});
+			// 批量：管理层先移除命中的 D1 记录，再对全部资格通过目标执行群解封。
+			const results = await checkManyUnbanEligibility(valid, env, { allowD1Removal: isAdmin });
 			const idsToUnban = [...results.eligible];
 			const userProfiles = await resolveBatchUserProfiles(valid, chatId);
 			const unbanSummary = { okAll: 0, partial: 0, failedAll: 0 };
 			const perUserUnbanResults = await mapWithConcurrency(
 				idsToUnban,
 				BULK_TASK_CONCURRENCY,
-				async (id) => ({ userId: id, unbanResults: await unbanUserFromGroups(id, unbanTargetGroupIds) })
+				async (id) => ({ userId: id, unbanResults: await unbanUserFromAllGroups(id) })
 			);
 			for (const { unbanResults } of perUserUnbanResults) {
 				const okCount = unbanResults.filter((r) => r.ok).length;
@@ -11765,8 +7736,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				else unbanSummary.partial += 1;
 			}
 			const failedCount = invalid.length + results.failed.length;
-			const flashText = `🔓 批量解封（${unbanScopeLabel}）：允许 ${results.eligible.length}${results.blacklisted.length ? ` / D1拒绝 ${results.blacklisted.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
-			let detailText = `📍 解封范围:${describeBlacklistScope(unbanScopeGroups)}\n\n${renderBatchUnbanEligibilityResult(results, invalid, userProfiles)}`;
+			const flashText = `🔓 批量解封：允许 ${results.eligible.length}${results.blacklisted.length ? ` / D1拒绝 ${results.blacklisted.length}` : ''}${failedCount ? ` / 失败 ${failedCount}` : ''}`;
+			let detailText = renderBatchUnbanEligibilityResult(results, invalid, userProfiles);
 			if (idsToUnban.length > 0) {
 				const unbanHeaderLines = ['<b>Telegram 群解封结果</b>:', `✅ 全部群解封成功: ${unbanSummary.okAll}`];
 				if (unbanSummary.partial) unbanHeaderLines.push(`⚠️ 部分群解封: ${unbanSummary.partial}`);
@@ -11804,7 +7775,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 群聊权限与拆分前完全一致：只有第一主人能触发，其他任何人（普通成员、群管理员、
 		// 超级管理员、副主人、匿名管理员）一律【纯静默】—— 不回、不撤回、不通知主人、
 		// 零 Telegram 请求。私聊不进此判定，任何人都能看到介绍语。
-		if (message.chat.type !== 'private' && !isOwner(getMessageActorId(message))) {
+		if (message.chat.type !== 'private' && !isPrimaryOwner(getMessageActorId(message))) {
 			return;
 		}
 		// 刻意【不】走 blockSelfUnbanIfBlacklisted：这段只是自我介绍，黑名单用户也该看得到
@@ -11837,7 +7808,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		// 原因：这段清单是给「被封禁用户私聊 bot」用的自助流程，任何人都能在群里
 		// 把它刷出来会污染群消息流，且清单里含解封确认整句，等于公开教学如何触发解封。
 		// 私聊完全不进此判定，权限与行为保持原样。
-		if (message.chat.type !== 'private' && !isOwner(getMessageActorId(message))) {
+		if (message.chat.type !== 'private' && !isPrimaryOwner(getMessageActorId(message))) {
 			return;
 		}
 
@@ -12275,12 +8246,18 @@ async function deleteMessage(chatId, messageId) {
 // 发一条群内闪屏提示，ttlMs 毫秒后自动撤回
 // ctx 是 Cloudflare Worker 的 ExecutionContext；ctx.waitUntil 让 Worker 在响应返回后继续等
 // ctx 缺失（比如离线测试或非 Worker 环境）则退化为只发不撤回
-async function sendFlashMessage(chatId, text, ctx, ttlMs = 5000) {
+// 群内闪屏：发一条短提示，ttlMs 毫秒后自动撤回。
+// ttlMs 省略时用 FLASH_MESSAGE_TTL_MS（硬编码默认 5000，可被环境变量
+// FLASH_MESSAGE_TTL_MS 覆盖）；显式传值的调用点保留自己的时长。
+// ttlMs <= 0 表示永不撤回，此时不注册后台任务。
+// ⚠️ ctx 必须由调用方透传：延时撤回挂在 ctx.waitUntil 上，传 null 会让提示永久留在群里。
+async function sendFlashMessage(chatId, text, ctx, ttlMs) {
+	const ttl = Number.isFinite(Number(ttlMs)) ? Number(ttlMs) : FLASH_MESSAGE_TTL_MS;
 	const result = await sendTelegramMessage(chatId, text);
 	const messageId = result?.result?.message_id;
-	if (!messageId || !ctx || typeof ctx.waitUntil !== 'function') return result;
+	if (!messageId || ttl <= 0 || !ctx || typeof ctx.waitUntil !== 'function') return result;
 	ctx.waitUntil((async () => {
-		await new Promise((r) => setTimeout(r, ttlMs));
+		await new Promise((r) => setTimeout(r, ttl));
 		await deleteMessage(chatId, messageId);
 	})());
 	return result;
@@ -12403,8 +8380,8 @@ async function checkUserStatus(userId, groupId = GROUP_ID) {
 // 检查用户是否是任一配置群组的管理员
 // 检查用户是否是任一配置群组的管理员 / 超级管理员
 // 权限层级（高 → 低）:超级管理员 > 群管理员 > 普通用户
-// 额外管理员（add_admin 添加）拥有普通管理命令权限。
-// 这里直接把 extra admin 当成 admin,所以额外管理员用户即使不是任何群的成员也能使用 /ban /unban /spam 等命令
+// 超级管理员（SUPER_ADMINS 名单）拥有普通管理命令权限。
+// 这里直接把 super 当成 admin,所以 SUPER_ADMINS 用户即使不是任何群的成员也能使用 /ban /unban /spam 等命令
 //
 // 用 getChatAdministrators 拉群管理员列表本地匹配，比 getChatMember 更稳:
 // - 不要求 bot 是该群管理员（仅要求 bot 在群里）
@@ -12414,15 +8391,15 @@ async function checkUserStatus(userId, groupId = GROUP_ID) {
 async function checkIfUserIsAdmin(userId) {
 	const userIdStr = String(userId);
 
-	// 主人/副主人直接放行（最高权限，先于额外管理员/群管理员检查）
+	// 主人/副主人直接放行（最高权限，先于超管/群管理员检查）
 	if (isOwner(userIdStr)) {
 		console.log(`[管理员鉴权] 用户 ${userId} 是主人/副主人 ✅`);
 		return true;
 	}
 
-	// 额外管理员直接放行（最高权限,优先于群管理员检查）
-	if (isModerationAdminCache && isModerationAdminCache.has(userIdStr)) {
-		console.log(`[管理员鉴权] 用户 ${userId} 是额外管理员 ✅`);
+	// 超级管理员直接放行（最高权限,优先于群管理员检查）
+	if (isSuperAdmin(userIdStr)) {
+		console.log(`[管理员鉴权] 用户 ${userId} 是超级管理员 ✅`);
 		return true;
 	}
 
@@ -12579,14 +8556,17 @@ async function getGroupInfo() {
 
 async function handleBanlist(chatId) {
 	function parseBanlistHTML(html, tgid) {
-		// 检查是否没有封禁记录
+		// 检查是否没有封禁记录。
+		// 这条正则里的繁体【必须保留】：「並沒有封鎖記錄」是 GKY 那个第三方站点
+		// 自己输出的繁体原文，改成简体就永远匹配不上，「无记录」这条分支会彻底失效。
+		// 项目内其它繁体已于 2026-09-08 按主人要求全部清成简体，只有这里是例外。
 		const noRecordPattern = /并沒有封鎖記錄|has no (?:ban|be) record/i;
 		if (noRecordPattern.test(html)) {
 			return {
 				success: true,
 				banned: false,
 				tgid: tgid,
-				message: '此TG帳號并沒有封鎖記錄 / This TG account has no ban record'
+				message: '此TG账号并没有封锁记录 / This TG account has no ban record'
 			};
 		}
 
@@ -12682,204 +8662,6 @@ async function handleBanlist(chatId) {
 	return JSON.stringify(result);
 }
 
-// ===== /ad_test 广告检测测试模式 =====
-// 测试模式状态存储在 D1 的 ad_test_mode 表中（key=ownerId, value=on/off）。
-// 开启后，主人在私聊中转发/发送消息，机器人回复是否命中广告判据及依据。
-// 整个测试流程不写入任何数据库（不加黑、不学习样本、不缓存消息）。
-
-const AD_TEST_MODE_TABLE = 'ad_test_mode';
-
-// 确保测试模式表存在（幂等）
-async function ensureAdTestModeTable(env) {
-	if (!env.DB) return false;
-	try {
-		await env.DB.exec(
-			`CREATE TABLE IF NOT EXISTS ${AD_TEST_MODE_TABLE} (
-				owner_id TEXT PRIMARY KEY,
-				enabled INTEGER NOT NULL DEFAULT 0,
-				updated_at INTEGER NOT NULL DEFAULT 0
-			)`
-		);
-		return true;
-	} catch (error) {
-		console.error('[ad_test] 建表失败:', error.message);
-		return false;
-	}
-}
-
-async function getAdTestMode(env, ownerId) {
-	if (!env.DB) return false;
-	try {
-		await ensureAdTestModeTable(env);
-		const row = await env.DB.prepare(
-			`SELECT enabled FROM ${AD_TEST_MODE_TABLE} WHERE owner_id = ?`
-		).bind(String(ownerId)).first();
-		return Boolean(row?.enabled);
-	} catch (error) {
-		console.error('[ad_test] 读取状态失败:', error.message);
-		return false;
-	}
-}
-
-async function setAdTestMode(env, ownerId, enabled) {
-	if (!env.DB) return false;
-	try {
-		await ensureAdTestModeTable(env);
-		const now = Math.floor(Date.now() / 1000);
-		await env.DB.prepare(
-			`INSERT INTO ${AD_TEST_MODE_TABLE} (owner_id, enabled, updated_at)
-			 VALUES (?, ?, ?)
-			 ON CONFLICT(owner_id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at`
-		).bind(String(ownerId), enabled ? 1 : 0, now).run();
-		return true;
-	} catch (error) {
-		console.error('[ad_test] 写入状态失败:', error.message);
-		return false;
-	}
-}
-
-// ===== 自动销号清理开关 =====
-// 全局开关（不区分 owner），存储在 auto_clean_settings 表中。
-// Cron 触发器每次执行前先读取此开关，关闭则跳过。
-
-const AUTO_CLEAN_TABLE = 'auto_clean_settings';
-
-async function ensureAutoCleanTable(env) {
-	if (!env.DB) return false;
-	try {
-		await env.DB.exec(
-			`CREATE TABLE IF NOT EXISTS auto_clean_settings (
-				key TEXT PRIMARY KEY,
-				value INTEGER NOT NULL DEFAULT 1,
-				updated_at INTEGER NOT NULL DEFAULT 0
-			)`
-		);
-		return true;
-	} catch (error) {
-		console.error('[auto_clean] 建表失败:', error.message);
-		return false;
-	}
-}
-
-async function getAutoCleanEnabled(env) {
-	if (!env.DB) return false;
-	try {
-		await ensureAutoCleanTable(env);
-		const row = await env.DB.prepare(
-			'SELECT value FROM auto_clean_settings WHERE key = ?'
-		).bind('enabled').first();
-		// 默认开启（1），只有显式设为 0 才关闭
-		return row ? Boolean(row.value) : true;
-	} catch (error) {
-		console.error('[auto_clean] 读取开关失败:', error.message);
-		return true; // 默认开启
-	}
-}
-
-async function setAutoCleanEnabled(env, enabled) {
-	if (!env.DB) return false;
-	try {
-		await ensureAutoCleanTable(env);
-		const now = Math.floor(Date.now() / 1000);
-		await env.DB.prepare(
-			`INSERT INTO auto_clean_settings (key, value, updated_at)
-			 VALUES ('enabled', ?, ?)
-			 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
-		).bind(enabled ? 1 : 0, now).run();
-		return true;
-	} catch (error) {
-		console.error('[auto_clean] 写入开关失败:', error.message);
-		return false;
-	}
-}
-
-// 分析消息是否命中广告判据（只分析，不写入数据库）
-async function runAdTestAnalysis(message, env, ctx) {
-	const chatId = message.chat.id;
-	const lines = ['🧪 <b>广告检测测试</b>', ''];
-
-	// 收集消息载体信息
-	const text = message.text || message.caption || '';
-	const hasForward = Boolean(message?.forward_origin || message?.forward_from || message?.forward_from_chat);
-	const hasContact = Boolean(message.contact);
-	const hasReply = Boolean(message.reply_to_message);
-
-	lines.push(`📝 消息类型:${hasForward ? ' 转发消息' : hasContact ? ' 名片' : hasReply ? ' 引用回复' : ' 普通消息'}`);
-	if (text) lines.push(`📄 正文长度:${text.length} 字符`);
-	lines.push('');
-
-	// 运行 detectAd（内部会调用 detectAdLegacy 和 detectQuotedAdEvidence）
-	// 注意：这里只用于分析，结果不会触发封禁/学习/缓存
-	await Promise.all([
-		mergeAdKeywordsFromD1(env),
-		mergeAdSamplesFromD1(env)
-	]).catch(() => {});
-
-	const adResult = await detectAd(message, env);
-
-	// 汇总检测结果
-	if (adResult.isAd) {
-		lines.push('🔴 <b>结果：命中广告判据</b>');
-		lines.push('');
-		if (adResult.strong) lines.push(`⚡ 强特征:${escapeHtml(adResult.strong)}`);
-		lines.push(`📊 评分:${adResult.score}`);
-		if (adResult.source) lines.push(`📍 命中来源:${escapeHtml(adResult.source)}`);
-		if (adResult.hits && adResult.hits.length > 0) {
-			lines.push('');
-			lines.push('<b>命中依据:</b>');
-			adResult.hits.forEach((hit, i) => lines.push(`  ${i + 1}. ${escapeHtml(hit)}`));
-		}
-	} else {
-		lines.push('🟢 <b>结果：未命中广告判据</b>');
-		lines.push('');
-		lines.push(`📊 评分:${adResult.score}${adResult.score > 0 ? '（未达阈值 ' + AD_SCORE_THRESHOLD + '）' : ''}`);
-		if (adResult.hits && adResult.hits.length > 0) {
-			lines.push('');
-			lines.push('<b>部分命中（未达阈值）:</b>');
-			adResult.hits.forEach((hit, i) => lines.push(`  ${i + 1}. ${escapeHtml(hit)}`));
-		}
-	}
-
-	// 引用内容检测
-	if (adResult.quoteAd) {
-		lines.push('');
-		lines.push('💬 <b>引用内容检测:</b>');
-		lines.push(`   ⚡ 强特征:${escapeHtml(adResult.quoteAd.strong || '无')}`);
-		lines.push(`   📊 评分:${adResult.quoteAd.score || 0}`);
-		if (adResult.quoteAd.hits && adResult.quoteAd.hits.length > 0) {
-			adResult.quoteAd.hits.forEach((hit, i) => lines.push(`   ${i + 1}. ${escapeHtml(hit)}`));
-		}
-	}
-
-	// 资料卡检测
-	if (adResult.identityEvidence && adResult.identityEvidence.length > 0) {
-		lines.push('');
-		lines.push('👤 <b>资料卡检测:</b>');
-		adResult.identityEvidence.forEach((hit, i) => lines.push(`  ${i + 1}. ${escapeHtml(hit)}`));
-	}
-
-	// 补充信息
-	lines.push('');
-	lines.push('ℹ️ <b>补充信息:</b>');
-	lines.push(`   • 自动广告检测:${AD_FILTER_ENABLED ? '✅ 已开启' : '❌ 已关闭'}`);
-	lines.push(`   • 严格模式:${AD_STRICT_MODE ? '✅ 已开启' : '❌ 已关闭'}`);
-	lines.push(`   • 词库数量:${AD_KEYWORDS.length + AD_KEYWORDS_FINANCE.length + AD_KEYWORDS_PORN.length + AD_KEYWORDS_SPAM.length + AD_KEYWORDS_FRAUD.length} 个`);
-	lines.push(`   • 样本数量:${AD_SAMPLE_FINGERPRINTS.length} 条`);
-	lines.push('');
-
-	// 预览原始内容（截断）
-	if (text) {
-		const preview = text.slice(0, 200);
-		lines.push('📋 <b>正文预览:</b>');
-		lines.push(`<code>${escapeHtml(preview)}${text.length > 200 ? '...' : ''}</code>`);
-	}
-
-	lines.push('');
-	lines.push('ℹ️ 测试模式不会写入任何数据库（不加黑、不学习、不缓存）。');
-
-	await sendTelegramMessage(chatId, lines.join('\n'));
-}
-
 // 通过群组ID获取群组信息
 async function getChatInfoFromId(chatId) {
 	try {
@@ -12923,4 +8705,5318 @@ async function getChatInfoFromId(chatId) {
 		console.error('获取群组信息时出错:', error);
 		return null;
 	}
+}
+
+// ============================================================================
+// 广告检测系统 v2（三层判定：结构化评分 → D1 指纹库 → Workers AI 语义）
+// ----------------------------------------------------------------------------
+// 词表与权重全部来自真实广告样本（emoji 对称名 + 交易动词 Bio + bot 链接 + 业务词），
+// 实测覆盖 33/35，余下两例由指纹库与 AI 语义层兜底。
+// 纯 D1 实现：会话快照、二次确认令牌一律落 D1 表 + 手动剪枝，全项目不依赖 KV。
+// 降级链：AI 未绑定 → 退化为「评分 + 指纹」；D1 不可用 → 整套检测静默跳过，
+// 绝不影响 /ban /spam /unban /ad 等既有功能。
+// ============================================================================
+
+// 判定阈值默认值（全部可被同名环境变量覆盖，解析失败一律回落默认值）
+const DEFAULT_AD_SCORE_THRESHOLD = 7;
+const DEFAULT_AD_OBSERVATION_SCORE = 5;
+const DEFAULT_AD_OBSERVATION_HOURS = 24;
+const DEFAULT_AD_AI_SIMILARITY_THRESHOLD = 0.78;
+const DEFAULT_AD_FINGERPRINT_MIN_CONFIDENCE = 0.6;
+
+// 指纹直接封禁所需权重（低于此值只加分，不单独定罪）
+const AD_FINGERPRINT_BAN_WEIGHT = 0.8;
+// ===== 短语自我泛化（方案 E · AI 自我学习闭环）=====
+// /spam 每新增一批样本后，从样本库里扫【新样本】做共现提炼：
+// 跨样本重复出现 >= AD_ENRICH_MIN_OCCURRENCE 次、4~8 字、过三重闸（豁免词 / 强动词·业务词 / 形态）
+// 的子串，升级成 keyword 型、source='auto'、weight=AD_ENRICH_WEIGHT 的指纹。
+// 提炼素材是「主人 /spam 人工确认过的广告」，不是自动封禁路径的路过文本，误面天然小。
+const AD_ENRICH_EVERY = 5;           // 每新增多少条样本触发一次提炼
+const AD_ENRICH_MIN_OCCURRENCE = 2;  // 子串至少跨样本出现多少次才进候选
+const AD_ENRICH_MAX_RESULTS = 20;    // 单次提炼最多入库的指纹条数
+const AD_ENRICH_PHRASE_MIN = 4;      // 子串长度下限（中文按码点计）
+const AD_ENRICH_PHRASE_MAX = 8;      // 子串长度上限
+const AD_ENRICH_WEIGHT = 0.8;        // 自动提炼指纹的权重（与 AD_FINGERPRINT_BAN_WEIGHT 同为 0.8）
+const AD_ENRICH_CHECKPOINT_KEY = 'ad_enrich_checkpoint';
+// AI 相似度落在 [软加分下限, 阈值) 区间时只加分，不直接定罪
+const AD_AI_SOFT_BONUS_FLOOR = 0.65;
+const AD_AI_SOFT_BONUS_SCORE = 2;
+// 指纹命中加分
+const AD_FINGERPRINT_HIT_SCORE = 3;
+// 关键词计分：【只有交易动词与业务关键词同现才给分，单类命中一律 0 分】。
+//
+// 2026-09-08 主人定的规则，原话：「单个词不封不计入分数，只有多个词才能计入分数，
+// 因为你如果单个词计入分数的话会误封很多人。」
+//
+// 旧模型是「命中任一类 +2、两类同现再 +2」，等于让阈值（7）去承担语义判断，而
+// `实名` / `赚钱` / `汇率` / `同城` / `上门` / `推广` / `引流` / `一手` / `日结`
+// 这些词正常人天天说 —— 凑齐两三项就误封。实测 @MiLov1900 两次被误封都走这条路。
+//
+// 新模型只保留合取判据：单类命中只记录进 reasons（供人工判断），不计一分；
+// 两类同现给 AD_KEYWORD_COMBO_SCORE，取 6 = 旧模型同现时的总分（2 + 2 + 2），
+// 所以真广告（收购 + USDT、高价收 + 网赚）的分数与改动前完全一致，召回率不受影响。
+// 与双通道结构查杀（招揽意图 ∧ 行业指向）是同一个思路的两处落地。
+const AD_KEYWORD_COMBO_SCORE = 6;
+
+// 弱交易动词命中分。归 0：弱动词（详聊 / 咨询 / 有需要 / 兼职）本就是单类词里最弱的一档，
+// 在「单类词不计分」规则下没有任何理由还留着 +1。命中仍写进 reasons 供人工判断。
+const AD_WEAK_TRADE_VERB_SCORE = 0;
+
+// 结构化评分的下限。旧代码用 Math.max(0, score) 把负分夹到 0，后果是
+// 【豁免词减分完全是假的】—— 主人往 AD_EXEMPT_KEYWORDS 里加的每个词都只在回执里
+// 显示「-3 命中豁免词」，实际一分没减（实测 @MiLov1900 正文「签到」吃满 -3 仍是 0 分起算）。
+// 改为允许负分，下限 -3 = 单次豁免减免的额度：既让豁免词真正生效，又不让它无限累积成
+// 「写满技术词就永久免检」的漏洞。真广告不受影响 —— 指纹 / AI / 结构查杀都是布尔定罪，不看分数。
+const AD_SCORE_FLOOR = -3;
+
+// 群内受限状态得分。原值为 5，是 2026-09-07 误封事故的另一半原因。
+//
+// 语义澄清：getChatMember 返回的 'restricted' 意思是「该用户在本群被禁言 / 限权」，
+// 【不是】「Telegram 官方限制了这个账号」。旧代码与旧通知文案都按后者理解，属于误读 Bot API。
+// 本文件内部对同一字段本就有正确用法（isRedundantAdVoteTarget 把它当「本群被封禁/禁言」
+// 处理），两处口径此前不一致。
+//
+// 给 5 分会造成循环自锁：
+//   1) 管理员因吵架 / 刷屏临时禁言某人 -> 该人 status='restricted'；
+//   2) 其资料里只要再有任意一个 +2 的词 -> 2 + 5 = 7 分正好撞上封禁线；
+//   3) 更糟的是本文件自己的 muteChatMember 也会把人置成 restricted ——
+//      等于 bot 先禁言、之后再判定时自己补 5 分把人永久封掉。
+// 降到 2：它仍是有效的辅助信号（广告号被举报后常先被禁言），但再也无法与单个词凑够封禁线。
+const AD_RESTRICTED_STATUS_SCORE = 0;
+
+// —— 方案 6（双轨 bio 检测）参数 ——
+// bio 只能靠 getChat 拿，一次一个人。所以问题从来不是「查不查 bio」，而是「什么时候查」。
+// 旧做法「每条消息都查」实测每条消息 3 个 Telegram 请求（getChatAdministrators +
+// getChat + getChatMember），活跃群直接逼近 429，而换来的只是「改 bio 后快几分钟被抓」。
+//
+// 双轨：
+//   轨一（消息路径）：每人首次发言查一次 bio，之后 AD_BIO_RECHECK_DAYS 天内不再查。
+//   轨二（定时扫描）：cron 按 bio_checked_at 升序滚动复查名册，每天 AD_SCAN_DAILY_LIMIT 个。
+// 两轨叠加后，稳态下正常消息零 getChat，而任何发言过的人都被 bio 检测覆盖。
+//
+// 3 天：轨二每天扫 300 个已经在滚动覆盖，轨一只需做兜底，不必压得更短。
+const AD_BIO_RECHECK_DAYS = 3;
+const AD_BIO_RECHECK_SECONDS = AD_BIO_RECHECK_DAYS * 24 * 3600;
+
+// 名册保留期。超过这个时长没再发言的人从名册剪枝 —— 大概率已退群，
+// 留着只会白占扫描配额。90 天足够覆盖「长期潜水但仍在群」的正常用户。
+const AD_MEMBER_RETENTION_SECONDS = 90 * 24 * 3600;
+
+// 定时扫描配额：每天 300 个，分 10 批 x 30 个，批间隔 3 秒。
+// 批间隔的作用是把 300 次 getChat 摊到 30 秒里（约 10 req/s），
+// 远离 Telegram 约 30 req/s 的全局线，也给同一时刻的消息路径留出余量。
+const AD_SCAN_DAILY_LIMIT = 300;
+const AD_SCAN_BATCH_SIZE = 30;
+const AD_SCAN_BATCH_INTERVAL_MS = 3000;
+
+// 管理员列表缓存 TTL。getChatAdministrators 是三个热路径调用里唯一【跨用户共享】的
+//（同群所有人用同一份列表），却原本一次都没缓存 —— 每条消息白调一次。
+// 5 分钟：新任管理员最迟 5 分钟后被豁免，期间他会被送去判定，但资料干净不会被封。
+const AD_ADMIN_CACHE_TTL_MS = 5 * 60 * 1000;
+
+// —— 结构判据（2026-09 线上漏放 50+ 号后新增，不依赖任何关键词）——
+// 那批号的共同形态：转发一个随机字母名频道（bxbd / hjff），自己正文只发一个字母（v / z / n），
+// 广告词全在转发体里 —— 而 getAdDetectionBodyText 只读 text/caption，一个词都取不到，
+// 导致当时的正文预筛得 0 分、在第一行就 return，三层判定全部没跑。
+//（该预筛门槛已于本轮整体移除，见 detectAdOnMessage；此处保留复盘以说明结构判据的来由。）
+// 词表永远追不上新话术，但「投放脚本的结构」比话术稳定得多，故改从结构下手。
+
+// ===== 转发来源（频道 / 群组）判定总开关 =====
+// 2026-09-08 主人下令关闭，原话：「有的用户喜欢用频道私聊，所以关于频道跟群聊的判定
+// 还是很容易造成误封，去除频道跟群组判定。」
+//
+// 关掉的是「他挂了 / 转发了什么频道」这一整个维度：来源频道对称 emoji / 数字前缀 /
+// 业务词 / 交易动词 / 随机字母名（scoreAdForwardChat），以及「极短正文 + 转发来源同现」
+// （scoreAdMessageContext）。这两处合计最多贡献 12 分，而封禁线只有 7 —— 一个把频道
+// 当私聊入口的正常用户，转发一条自家频道消息就可能单凭这个维度被封。
+//
+// 保留的是主人认可的两条主路径：资料卡查杀（用户名 + 简介）、正文查杀（简介 + 正文），
+// 以及种子指纹命中即封。函数本体不删 —— 判据本身没错，错在它的误伤面，
+// 留着并由本开关控制，将来要恢复只改这一行。
+const AD_FORWARD_JUDGE_ENABLED = false;
+
+// 随机字母名频道分。判据仍在（isAdRandomChannelName），但 AD_FORWARD_JUDGE_ENABLED
+// 关闭后整条路径不计分，故归 0；开关重新打开时应恢复为 4（= scoreAdForwardChat 的 isAd 门槛，
+// 低于门槛的分数在 evaluateAdSuspect 里根本不会被累加）。
+const AD_RANDOM_CHANNEL_SCORE = 0;
+
+// 机器生成型昵称分（Faker 西方全名 / 非常用书写系统短随机名）。
+// 真实外国用户也可能叫 John Smith，故只给 2，单独绝不足以定罪。
+// 这条【属于资料卡维度，不受转发判定开关影响】，保留原值。
+const AD_GENERATED_NAME_SCORE = 2;
+
+// 极短正文的长度上限。线上那批号正文是单个字母，阈值取 4 留出变异余量 ——
+// 把正文改成 vvv / abcd 的规避成本极低，卡在 1 等于白设。
+const AD_MINIMAL_TEXT_MAX_LENGTH = 4;
+
+// 「极短正文 + 转发来源」同现分。随 AD_FORWARD_JUDGE_ENABLED 一并归 0：
+// 这条判据的两个构成要素之一就是「有转发来源」，属于被主人关闭的频道维度。
+// 开关恢复时应改回 4。
+const AD_MINIMAL_TEXT_FORWARD_SCORE = 0;
+
+// 豁免词减分（详见 AD_EXEMPT_KEYWORDS 上方说明）：
+// 无交易动词时全额减免，保护纯技术讨论；有交易动词时打折，避免真广告夹带术语就此蒙过。
+const AD_EXEMPT_PENALTY = -3;
+const AD_EXEMPT_PENALTY_WITH_TRADE = -1;
+
+// 平台自身域名：结构上不该被当作广告特征，绝不学入指纹库，也不计链接可疑分。
+// 与用户可维护的 ad_domain_whitelist 分离 —— 后者是「这个群认为无害」，
+// 本名单是「学它必然造成大面积误伤」，因此不允许被用户误删。
+// 实测事故：t.me 曾被学成 weight=1 的 domain 指纹并命中 10 次，
+// 导致任何人分享 Telegram 链接都可能被判广告。
+const AD_PLATFORM_DOMAINS = new Set([
+	't.me', 'telegram.me', 'telegram.org', 'telegra.ph', 'telesco.pe',
+	'telegram.dog', 'tg.dev'
+]);
+
+// 是否为平台自身域名（含真子域，判定口径与 isAdDomainWhitelisted 一致）。
+function isAdPlatformDomain(domain) {
+	const value = normalizeAdDomain(domain);
+	if (!value) return false;
+	if (AD_PLATFORM_DOMAINS.has(value)) return true;
+	const parts = value.split('.');
+	// 上界取 length - 1，保证永不单独匹配顶级域：
+	// evil-t.me / t.me.evil.tk 都不该被当成平台域名放过。
+	for (let i = 1; i < parts.length - 1; i += 1) {
+		if (AD_PLATFORM_DOMAINS.has(parts.slice(i).join('.'))) return true;
+	}
+	return false;
+}
+// AI 样本库每请求懒加载补齐数量（避免首请求超时与子请求超限）
+// AD_SAMPLE_TARGET_COUNT 现在只作为「首批补齐进度」的参考值使用，不再是向量生成的硬上限 ——
+// 2026-09-08 起 topUpAdSampleEmbeddings 会一直补到库里没有 embedding IS NULL 为止。
+const AD_SAMPLE_TARGET_COUNT = 30;
+const AD_SAMPLE_LAZY_BATCH = 8;
+// 单次判定最多载入多少条【学习来的】样本向量参与余弦比对。
+// 种子样本（source = seed / seed-core，约 34 条）不受这个上限约束、永远全部载入 ——
+// 那是主人定的「中心特征」，被新样本挤掉就等于把中心丢了。
+//
+// 为什么还要有上限：每条向量 1024 维、JSON 存储约 12 KB，200 条已是 ~2.4 MB 的
+// D1 读取 + JSON.parse，再往上会明显吃掉单请求 CPU 预算（60 秒 WeakMap 缓存只摊掉重复开销，
+// 冷启动那一次照样要付）。取 200 条最新学习样本 + 全部种子，足够覆盖变体识别；
+// 更老的学习样本此时早已由 /spam 学成指纹，在第二层命中即封，不依赖 AI 层召回。
+const AD_SAMPLE_LEARNED_QUERY_LIMIT = 200;
+// Workers AI 嵌入模型（与样本库维度绑定；换模型必须清空 ad_sample_embeddings）
+// ⚠️ 必须使用 Cloudflare 目录里真实存在的模型 ID。曾误用 '@cf/baai/bge-base-zh-v1.5' ——
+// 该模型不存在（bge 系列只有 -en- 三个尺寸与 bge-m3，没有 -zh- 变体），
+// 每次调用都被 Ai._parseError 拒绝，第三层长期空转且日志只见栈不见因。
+// bge-m3 是多语言模型，中文广告文本正是其适用场景；1024 维，60000 token 上下文。
+const AD_EMBEDDING_MODEL = '@cf/baai/bge-m3';
+const AD_EMBEDDING_DIMENSION = 1024;
+// 筛查记录保留期（秒）：14 天后剪枝，防止 D1 无限增长
+const AD_SCREENING_RETENTION_SECONDS = 14 * 24 * 3600;
+// /pending 快照【长期保留】；/clearsamples 二次确认 60 秒
+//
+// 【2026-09-08 从 1 小时改成 100 年】主人的原话：「关于快照只保留一个小时，时间太短了，
+// 实现无限制时间能不能做到？还是说会触发 telegram 亦或者是 cloudflare 的阈值警告。」
+// 结论是两边都不构成问题：快照纯存 D1、不碰任何 TG API；单条约 4~5 KB
+// （reasons / snapshot 各截断 2000 字符），一天封 50 个号也就一年约 90 MB，
+// D1 付费层容量差两个数量级。真正的卡点是代码自己的 1~50 序号池，那个在
+// allocateAdPendingSnapshot 里一起改掉了。
+//
+// 不用「永不过期」的写法（比如把 expires_at 设成 NULL 或 0）是因为 expires_at 这一列
+// 现在承担了「是否已复核」的语义：已被 /ignore 或 /unban 处理过的快照会被置成 0，
+// 于是 expires_at > now 这个既有条件天然把它们排除出 /pending 列表，
+// 而行本身留在表里占住序号 —— 这是防止序号复用解封错人的关键，详见 deleteAdPendingSnapshot。
+const AD_PENDING_SNAPSHOT_TTL_SECONDS = 100 * 365 * 24 * 3600;
+const AD_CONFIRM_TOKEN_TTL_SECONDS = 60;
+// /pending 单次列出的默认与上限条数。
+// 【这两个数字只管分页，不再是序号池大小】—— 改成长期保留之后序号无上限单调递增。
+const AD_PENDING_DEFAULT_LIMIT = 20;
+const AD_PENDING_MAX_LIMIT = 50;
+// 域名白名单与指纹库运行期缓存 60 秒
+const AD_WHITELIST_CACHE_TTL_MS = 60000;
+const AD_FINGERPRINT_CACHE_TTL_MS = 60000;
+// 建表失败后的冷却时间：避免 D1 故障时每请求重试打爆子请求预算
+const AD_SCHEMA_RETRY_COOLDOWN_MS = 60000;
+// 存量回查单次上限：Bot API 无法枚举群成员，只能对 ad_user_screening 里的存量记录逐个回查
+const AD_RESCREEN_BATCH_LIMIT = 30;
+
+// 交易动词：广告 Bio 的核心信号，也是自动学习的闸门词。
+// 没有交易动词的短语不许进指纹库，否则「个人简介」这类中性词会被学成广告特征。
+const AD_TRADE_VERBS = [
+	'长期收购', '高价收', '专业收', '收购', '出售', '代收', '代付', '收单', '接单', '批发',
+	'注册即送', '免费领', '招代理', '日结', '月入', '日入', '稳赚',
+	'推广', '引流', '拉人', '代发', '群发', '加V', '加微', '加薇',
+	'包售后', '秒结', '洗急', '走量', '一手', '优先加价',
+	// 招募型话术（2026-09 线上漏放 50 个号后补充）：原词表偏「网赚 / 虚拟币 / 账号交易」，
+	// 对「招探花9000一单，提供设备」这类色情招募几乎空白 —— 实测该正文交易动词命中数为 0。
+	// 「提供设备 / 包吃住」在正常语境也可能出现，故仍只给 +2，
+	// 必须配合业务关键词触发协同分才够 6 分进观察窗口，不会单独定罪。
+	'招人', '招工', '急招', '招募', '提供设备', '设备免费', '包吃住', '包住',
+	'工资日结', '当天结', '不押金', '无押金', '车接车送', '安排住宿',
+	// 线下交付型（2026-09-09 名片广告漏检后补）：主人截图的名片显示名是
+	// 「假钞玩妹交流群🔥快递面交都可」—— 离线实测这句在四张词表 + 两组正则里【逐词零命中】，
+	// 名片通道通了也定不了罪。「面交」是线下成交动作，正常群聊几乎不用（要用也是「见面」「当面」），
+	// 且它单独出现【不构成任何证据】—— 必须配 AD_BUSINESS_KEYWORDS 里的行业词凑成形态 A 才定罪。
+	'面交', '当面交易'
+];
+
+// 弱交易动词：形态上像招揽，但在正常语境里同样高频，单独出现不构成任何广告证据。
+//
+// 2026-09-07 线上误封事故的直接原因就在这里。被误封用户的 Bio 是「西嗨~ 私聊请通过」——
+// 一句「加好友请通过」的普通说明，却因「私聊」曾被列为满权交易动词（+2），
+// 叠加「本群受限状态 +5」后正好 7 分撞上封禁线，该用户被全群封禁 14/14。
+//
+// 这些词与强动词的本质区别：强动词（收购 / 代付 / 秒结）自带交易意图，
+// 正常人几乎不会写进资料卡；弱动词（私聊 / 咨询 / 有需要）只是「联系方式说明」，
+// 广告号用它，普通用户也用它 —— 真正区分两者的是同句里的业务关键词，不是这些词本身。
+//
+// 「代理」尤其危险：本项目部署在代理 / CDN 技术群，那是群内最高频的正常词汇之一，
+// 留在强动词表里等于给整个群的日常发言都预置 +2。
+//
+// 三条硬性区别对待（见 scoreAdProfile / scoreAdMessageText / learnAdFingerprints）：
+//   1) 只给 AD_WEAK_TRADE_VERB_SCORE —— 2026-09-08 起该常量为 0，命中只进 reasons 不计分；
+//   2) 【不触发协同分】—— 协同分的语义是「交易意图 + 行业指向同现」，
+//      「私聊」+「USDT」远达不到这个强度，正常人聊币价也会说「私聊我细说」；
+//   3) 【不作为自动学习闸门】—— learnAdFingerprints 的 no_trade_verb 闸门只认强动词，
+//      否则「私聊请通过」这类句子会被学成永久指纹，之后所有这么写资料的人一律误杀。
+//
+// 「私聊」已于 2026-09-08 按主人要求【移出本表、移入 AD_EXEMPT_KEYWORDS】——
+// 它不只是「不构成证据」，而是应当反过来减分的正常用语（「私信请走频道」是标准写法）。
+const AD_WEAK_TRADE_VERBS = [
+	'详聊', '咨询', '欢迎咨询', '有需要', '进群联系',
+	'代理', '招聘', '兼职', '一单', '单价'
+];
+
+// 业务关键词：广告的行业指向词（网赚 / 菠菜 / 虚拟币 / 色情引流）
+const AD_BUSINESS_KEYWORDS = [
+	'USDT', 'U商', 'U币', '泰达', '网赚', '菠菜', '博彩', '棋牌', '彩票',
+	'du商', 'du 商', '商宝', '宝账号', '赚钱', '搞钱', '包盒', '盒项目', '价格表',
+	'收号', '收网', '老账号', '实名', '四件套', '卡料', '料子', '发卡', '跑分',
+	'洗钱', '洗白', '出黑', '接u', '出u', '换汇', '汇率', '代练', '刷单', '刷量',
+	'约炮', '辣妞', '黑丝', '反差', '女主妇', '一夜', '同城', '上门', '风口项目',
+	// 色情招募类（2026-09 线上漏放补充）：原词表只有「约炮 / 辣妞 / 黑丝」等内容型词汇，
+	// 缺「探花」这类从业者招募黑话 —— 实测「探花来，一单9k，设备免费」整条得分为 0。
+	'探花', '操逼', '约啪', '楼凤', '外围', '空降', '快餐', '包夜', '上门服务',
+	'技师', '推油', '陪玩陪聊', '色粉', '视频裸', '裸聊', '福利姬', '资源群',
+	// 伪钞类（2026-09-09 名片广告漏检后补）：旧代码 RECOMMENDED_AD_KEYWORDS.fraud 里
+	// 就有这两个词，走的是「名片显示名命中即杀」的单词直杀通道；本项目【不采用单词直杀】，
+	// 只把它们当行业指向词，仍需 AD_TRADE_VERBS 的招揽动词同现才凑成形态 A。
+	// 这两个词是纯违法标的，正常群聊不存在使用场景（讨论反假币会说「假币鉴别」，
+	// 那也仍需招揽动词才定罪），所以误封面接近于零。
+	'假钞', '假币'
+];
+
+// 豁免词：命中且无交易动词时整体减分，保护正常用户。
+// 典型误伤场景：资料卡写「双向机器人」「开源项目」的技术用户。
+//
+// 本项目部署在代理 / CDN 技术群，这类群的日常讨论天然会撞上广告词表：
+// 聊「一单流量」「设备指纹」「上门装机」「日结带宽」都可能命中交易动词或业务词。
+// 因此把代理传输协议、反代 path、TLS、浏览器/代理指纹、ECH 等术语全部纳入豁免，
+// 命中即 -3，抵掉「交易动词 +2」或「业务词 +2」，使正常技术讨论不进观察窗口。
+// 豁免采用【条件减免】：
+//   - 无交易动词（纯技术讨论）→ 减 AD_EXEMPT_PENALTY（-3），足以把误命中的业务词抵掉；
+//   - 有交易动词（可能是夹带术语的广告）→ 只减 AD_EXEMPT_PENALTY_WITH_TRADE（-1）。
+// 若一律减 3，「收购 vless 账号 USDT 日结」= 2+2+2-3 = 3 分会被放行；打折后为 5 分，
+// 正好进观察窗口。而纯技术讨论本就不含交易动词，或只含「一单 / 日结」却无业务词、
+// 不触发协同分，打折分支对它们没有影响 —— 两头都能兼顾。
+const AD_EXEMPT_KEYWORDS = [
+	'双向', '机器人', 'bot', '开源', 'github', 'gitlab', '助手', '工具', '客服',
+	'通知', '订阅', '备份', '监控', '签到', '翻译', '下载', '论坛', '博客', '文档',
+	// —— 代理传输协议 ——
+	'vless', 'vmess', 'trojan', 'shadowsocks', 'ss节点', 'ssr', 'hysteria', 'tuic',
+	'naive', 'wireguard', 'openvpn', 'anytls', 'reality', 'xhttp', 'xtls', 'mkcp',
+	'grpc', 'httpupgrade', 'splithttp', 'websocket', 'ws路径', 'quic', 'h2', 'h3',
+	'xray', 'sing-box', 'singbox', 'clash', 'mihomo', 'v2ray', 'v2fly', 'hiddify',
+	// —— 反代与路径 ——
+	'反代', '反向代理', '回源', '中转', '落地', '分流', '路由规则', 'cdn',
+	'path路径', '伪装路径', 'workers', 'pages', 'argo', 'tunnel', 'nginx', 'caddy',
+	'负载均衡', '优选ip', '优选域名', 'ip优选', '节点订阅', '订阅链接', '订阅转换',
+	// —— 传输层安全 TLS ——
+	'tls', 'utls', 'mtls', 'sni', '证书', 'acme', 'ssl', '握手', '加密套件',
+	'alpn', 'esni', 'ech', '前置代理', '域前置',
+	// —— 浏览器 / 代理指纹 ——
+	'指纹', '浏览器指纹', 'ja3', 'ja4', 'tls指纹', 'client hello', 'chrome指纹',
+	'ua伪装', 'fingerprint', '特征识别', '流量特征', '主动探测', '抗封锁',
+	// —— 通用技术语境 ——
+	'延迟', '丢包', '带宽', '限速', '端口', '协议', '内核', '配置文件', '教程',
+	'部署', '自建', '搭建', '编译', '调试', '抓包', '日志', 'api', 'json', 'yaml',
+	// —— 2026-09-08 主人指定追加 ——
+	// '私聊'：从 AD_WEAK_TRADE_VERBS 移过来。「私信请走频道」「加好友请先私聊」是
+	//   标准的联系方式说明，2026-09-07 误封事故（「西嗨~ 私聊请通过」被封）的直接词源。
+	// '代理' / '官方中文'：线上自动学习学出了 `[keyword] 代理 官方中文` 这条坑词
+	//   （权重 1、命中 0、来源 auto）。本项目部署在代理 / CDN 技术群，这两个词是群内日常。
+	//   注意光加豁免词治不了那条指纹 —— 指纹层是命中即封、不走减分，还需要 /delword 删掉它，
+	//   并靠 learnAdFingerprints 里新增的豁免词闸门防止再学回来。
+	// 't.me'：主人原话「t.me 不该成为封禁词，也加豁免。因为正常用户大部分都会使用这个。
+	//   只有广告用户或者个别用户会直接 @bot 简介 @bot，所以 t.me 加封禁词只会误封更多」。
+	//   同样注意：hasAdSuspiciousLink 里那条独立的 t.me 判据已一并删除，加词只是双保险。
+	'私聊', '代理', '官方中文', 't.me'
+];
+
+// 回复学习触发词与否定词（第一主人普通回复即可标注广告）
+// 触发词一律要求成词。历史词表里的单字「封」、英文子串「ad」和「学习」都是裸子串匹配，
+// 会把「封面不错」「already done」「学习了」这类正常回复判成封禁指令，而 positive 分支是
+// 强制 verdict='ban'（删消息 + 全群封禁 + 拉黑 + 学指纹），误伤不可逆，故一律移除。
+// 英文触发词改走词边界正则，避免 bad / road / download / ready 被 'ad' 命中。
+// 否定词永远先于触发词匹配：「不要封」含「要封」、「取消封禁」含「封禁」，靠顺序保证不误封。
+const AD_REPLY_LEARN_TRIGGERS = ['广告', '垃圾', '封了', '封他', '封她', '封掉', '该封', '要封', '封禁'];
+// 【2026-09-10】移除裸 spam 触发：管理员忘带 / 随手打 spam 会触发全群封禁，误操作代价太大。
+// /spam 斜杠命令走命令分发分支（isTelegramSlashCommand 守卫），不受此处影响。
+const AD_REPLY_LEARN_TRIGGER_PATTERNS = [];
+const AD_REPLY_LEARN_NEGATORS = [
+	'不是广告', '不算广告', '非广告', '别封', '不要封', '不用封', '不该封',
+	'误封', '误判', '不是spam', 'not spam', '不是垃圾', '取消封', '解封'
+];
+
+// 指纹类型白名单：/addword 只接受这四类，防止脏类型污染指纹库。
+// 【方案 A】'username' 保留在列表里【仅为兼容历史数据】—— loadAdFingerprints 仍要能
+// 读出库里的旧 username 行交给 markAdFingerprintFalsePositive 清理；
+// 但 matchAdFingerprints 会跳过它们、addAdFingerprint 也拒绝新写入。
+const AD_FINGERPRINT_TYPES = ['keyword', 'domain', 'username', 'bio'];
+
+// ===== 权限人 username 永不学习白名单（2026-09-10 主人下令）=====
+// 主人 / 副主人 / 超级管理员的 @handle 绝不允许进指纹库。
+//
+// 起因：广告号发言时艾特主人 → 主人的 @handle 被学成指纹 → 此后任何人艾特主人都被封。
+// 方案 A 已从结构上删掉 username 学习路径，这道白名单是【第二层保险】，防的是另一类漏法：
+// 主人的 @handle 出现在【被截取的 keyword 短语】里。例如广告号简介写
+// 「收购账号 联系 @ym94203」，「收购」命中交易动词，往后截 24 字连带把 @ym94203
+// 包进 keyword 短语 —— 那条短语权重虽已降到 0.5 不单独定罪，但仍会 +3 计分，
+// 而且一旦有人用 /spam 人工提交（source != 'auto'，跳过豁免词闸门）就会以权重入库。
+//
+// 环境变量 AD_PROTECTED_USERNAMES：逗号分隔（半角 / 全角均可），@ 前缀可省。
+// 例：`ym94203,suqi_20` 或 `@ym94203，@suqi_20`。
+// 留空则只靠方案 A 的结构性移除兜底（已足够，白名单是加固而非必需）。
+const DEFAULT_AD_PROTECTED_USERNAMES = [];
+let AD_PROTECTED_USERNAMES = [];
+
+// 解析静态用户资料表：环境变量 STATIC_USER_PROFILES 格式为 JSON 字符串。
+// 例：{"197282502":{"first_name":"威廉","username":"RealNeoMan"}}
+// 每条 value 可含 first_name / last_name / username，id 字段由 key 自动补全。
+// 解析失败时返回空对象，不中断启动流程。
+function parseStaticUserProfiles(raw) {
+	if (raw == null || String(raw).trim() === '') return {};
+	try {
+		const parsed = JSON.parse(String(raw).trim());
+		if (typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+		const result = {};
+		for (const [tgid, info] of Object.entries(parsed)) {
+			if (!/^\d+$/.test(tgid)) continue;
+			result[tgid] = {
+				id: Number(tgid),
+				first_name: String(info?.first_name ?? ''),
+				last_name: String(info?.last_name ?? ''),
+				username: String(info?.username ?? ''),
+			};
+		}
+		return result;
+	} catch (_) {
+		console.error('[静态用户资料] STATIC_USER_PROFILES 解析失败，格式应为 JSON 字符串');
+		return {};
+	}
+}
+
+// 解析受保护 username 列表：统一小写、去 @ 前缀、过滤非法形态。
+function parseAdProtectedUsernames(raw) {
+	const source = raw == null || String(raw).trim() === ''
+		? DEFAULT_AD_PROTECTED_USERNAMES
+		: String(raw).split(/[,，\s]+/);
+	const list = (Array.isArray(source) ? source : [source])
+		.map((v) => String(v || '').trim().replace(/^@+/, '').toLowerCase())
+		// Telegram username 规则：5-32 位字母数字下划线。不合规的丢弃，
+		// 避免把 '' 或 '@' 这类空值加进去导致 includes 全量命中。
+		.filter((v) => /^[a-z0-9_]{5,32}$/.test(v));
+	return [...new Set(list)];
+}
+
+// 候选值里是否含受保护的 username。子串判定 —— keyword 短语是截断片段，
+// 受保护 handle 可能夹在中间（「收购账号 联系 @ym94203」）。
+function containsAdProtectedUsername(value) {
+	if (!AD_PROTECTED_USERNAMES.length) return false;
+	const lower = String(value || '').toLowerCase();
+	if (!lower) return false;
+	return AD_PROTECTED_USERNAMES.some((name) => lower.includes('@' + name) || lower.includes(name));
+}
+
+// 结构化评分正则（全部来自真实样本的名称 / 用户名形态）
+// 对称 emoji：`💚高价收网赚号💚`、`7💚高价收网赚号💚` —— 广告号最强的单一信号。
+const AD_SYMMETRIC_EMOJI_RE = /^([\p{Emoji_Presentation}☀-➿]{1,3})(.+)\1$/u;
+const AD_NUMERIC_PREFIX_RE = /^[1-9][\p{Emoji_Presentation}☀-➿]/u;
+const AD_HAS_EMOJI_RE = /[\p{Emoji_Presentation}☀-➿]/u;
+const AD_LINK_RE = /(@[A-Za-z0-9_]{5,}|t\.me\/[^\s]+|https?:\/\/[^\s]+)/;
+const AD_BOT_MENTION_RE = /@[A-Za-z0-9_]{2,}bot\b/i;
+// 随机 username：只认「字母与数字交替出现」的机器批量生成形态。
+//
+// 2026-09-07 第二起误封事故的直接原因就在这里。原正则是：
+//     /^(?:[a-z]{4,}[0-9]{0,4}|[a-z]+[0-9]+[a-z]+[0-9]*)$/i
+// 第一个分支 [a-z]{4,}[0-9]{0,4} 匹配「≥4 字母 + 0~4 数字」，配合调用处的 /[0-9]/
+// 数字要求，实际语义退化成「字母开头、末尾带数字的用户名就 +1」—— john1990、
+// alice2024、tom99、MiLov1900 全中。那不是随机串，那是全世界最常见的用户名取法
+// （名字 + 生日 / 年份），零区分度。被误封用户 @MiLov1900 就是这么中的 +1。
+//
+// 修的时候还查出第二个问题：原正则【连真正的随机串都抓不到】。xk3f9a2b 这种
+// 典型机器生成形态，第一分支要求前面 ≥4 个连续字母（它只有 xk 两个）、第二分支
+// 的「字母段-数字段-字母段」段数不够，两边都落空。也就是说这条判据上线以来
+// 只抓到了噪声（单词+数字）和 abc123def 一类，真正想抓的形态一个都没进来。
+//
+// 现在按「熵集中在交错处」重写，两个分支各管一种真实形态：
+//   ① (?:[a-z]+[0-9]+){2,}[a-z]*  字母数字交替 ≥2 轮：xk3f9a2b、a1b2c3、x9y8z7q
+//   ② [a-z]+[0-9]+[a-z]+          字母-数字-字母 且以字母收尾：abc123def
+// 「单词 + 数字」（字母开头、数字收尾、只交替一轮）两个分支都不匹配，即 MiLov1900、
+// john1990、tom99 一律放行 —— 这个形态本身不携带任何广告信息，调多长的边界值都是噪声。
+const AD_RANDOM_USERNAME_RE = /^(?:(?:[a-z]+[0-9]+){2,}[a-z]*|[a-z]+[0-9]+[a-z]+)$/i;
+
+// 随机字母数字 username 命中分。【归 0】：2026-09-08 主人下令，原话：
+// 「关于用户的用户名，用户名只有带广告词才加分，不然这样很容易误封用户。」
+//
+// 这条判据是「不看广告词、光看长相就加分」的典型：@MiLov1900 两次被误封都吃了这 +1
+// （第一次靠它凑到 7 分撞线）。正则虽已按「熵集中在交错处」重写、放行了 MiLov1900 这种
+// 「单词+数字」形态，但形态本身不携带任何广告信息 —— 抓到的 xk3f9a2b 既可能是广告号，
+// 也可能是随手注册的正常账号，靠它定罪就是拿长相当证据。
+// 判据本体保留（reasons 里仍记录，供 /pending 人工判断），只是不再计一分。
+const AD_RANDOM_USERNAME_SCORE = 0;
+
+const AD_DOMAIN_CANDIDATE_RE = /(?:https?:\/\/)?(?:[A-Za-z0-9_-]+\.)+[A-Za-z]{2,}(?:\/[^\s]*)?/g;
+
+// 域名白名单预置种子：AI 模型站 / 国内外官方站 / 视频站 / 图片站 / Telegram 官方。
+// 建表时一次性写入，避免空白名单状态下正常用户贴官方链接被计分。
+const AD_DOMAIN_WHITELIST_SEED = [
+	'github.com', 'gitlab.com', 'gitee.com', 'npmjs.com', 'pypi.org', 'stackoverflow.com',
+	'anthropic.com', 'claude.ai', 'openai.com', 'chatgpt.com', 'gemini.google.com',
+	'huggingface.co', 'deepseek.com', 'moonshot.cn', 'bigmodel.cn', 'aliyun.com',
+	'cloudflare.com', 'workers.dev', 'google.com', 'microsoft.com', 'apple.com',
+	'amazon.com', 'mozilla.org', 'baidu.com', 'qq.com', 'taobao.com', 'jd.com',
+	'163.com', 'sina.com.cn', 'zhihu.com', 'juejin.cn', 'csdn.net', 'cnblogs.com',
+	'youtube.com', 'youtu.be', 'bilibili.com', 'b23.tv', 'douyin.com', 'vimeo.com',
+	'netflix.com', 'imgur.com', 'unsplash.com', 'pixiv.net', 'flickr.com', 'sm.ms',
+	'telegram.org', 'telegram.me', 'core.telegram.org', 'wikipedia.org', 'archive.org'
+];
+
+// AI 语义层样本种子（真实广告文本，供首次部署初始化向量库）
+const AD_SAMPLE_SEED_TEXTS = [
+	'💚高价收网赚号💚 长期收购网 du 商宝账号，老账号优先加价',
+	'2💚高价收网赚号💚 专业收购网 du 账号',
+	'😊青山落日😊 最新项目一天稳宝8-20U，进群联系',
+	'小额洗急 两分钟一单赚几百 私聊我',
+	'7💚高价收网赚号💚 收各种赚钱包盒项目',
+	'真宝玩家注册即送88-388USDT无需实名 大额无忧',
+	'约炮极品辣妞组 真实头像 进入社区查看 黑丝反差女主妇',
+	'最新赚钱风口项目 春节前带家人来找我 薪6000+',
+	'长期收购各类账号 价格表私聊 秒结不拖欠',
+	'招代理日结佣金 无需经验 加微详聊'
+];
+
+// ===== 指纹种子库（2026-09-07 建立）=====
+//
+// 来源：主人提供的 35 张真实广告截图，逐张提取后的铁证短语。
+//
+// 【为什么要下移一层】这批特征此前只以上面的 AD_SAMPLE_SEED_TEXTS 形式喂给第三层
+// AI 语义 —— 那一层要绑 env.AI、要懒加载 embedding、还要过相似度阈值，是概率性的。
+// 实测图 27、图 28 两个号线上漏放时 AI 层就在跑，却没拦住。种子指纹把同一批特征
+// 下移到第二层：零成本、确定性、不依赖任何外部绑定，命中即封。
+//
+// 【选词判据】指纹是子串匹配（matchAdFingerprints 里 haystack.includes(row.normalized)），
+// 且 weight >= AD_FINGERPRINT_BAN_WEIGHT(0.8) 时命中即封禁、不参与凑分。
+// 所以入表门槛只有一条：这个字符串出现在正常人昵称/用户名/简介/发言里的概率必须≈0。
+// 判据不是「像不像广告」，而是「正常人会不会说出这几个字」——
+// 前者会让「项目」「代理」进表，后者才守得住。
+//
+// 【被剔除的高危词及原因】以下词在广告里天天出现，但正常语境同样用，一律不收：
+//   四件套    → 床上用品，家居群日常词
+//   跑分      → 手机性能跑分（安兔兔），技术群高频
+//   菠菜      → 蔬菜
+//   注册即送  → 电商促销标准话术（注册即送优惠券）
+//   无需实名  → 正常产品说明
+//   日结佣金  → 正常兼职群用语（只收「招代理日结」这类限定组合）
+//   承兑      → 正常金融术语
+//   实名号    → 「我这个是实名号」正常人会说
+//   洗急      → 单独两字虽不成词，但「清洗急救箱」一类罕见串仍会命中，只收「小额洗急」
+//   网赌账号  → 「举报网赌账号」会命中，只收「网赌账号回收」这类带动作的组合
+//   稳宝      → 可能是品牌名
+//   du        → 单独两字母命中 education / produce / module 等无数英文词，必须带中文上下文
+//   项目 / 代理 / 账号 / 联系 / 咨询 / 专业 / 兼职 / 招聘 / 推广 → 通用商业词，子串匹配下是灾难
+//
+// 【空格变体】normalizeAdFingerprintValue 只把连续空白压成单个半角空格，不会删空格。
+// 所以「网 du 商」与「网du商」是两条不同指纹，广告两种写法都有，必须都入表。
+//
+// 【为什么可以收得这么保守】变体不靠种子穷举 —— 有权限的人 /spam 引用一次就自动学成
+// 新指纹（见 handleSpamCommand 的引用分支）。种子只负责钉死「正常人绝不会说」的铁证，
+// 剩下的交给人工判定 + 自动学习，这样种子表永远不会成为误封源头。
+const AD_FINGERPRINT_SEED = [
+	// —— 收购账号型：35 图里的主力形态 ——
+	{ type: 'keyword', value: '收网赚号' },
+	{ type: 'keyword', value: '高价收网赚' },
+	{ type: 'keyword', value: '收购网赚' },
+	{ type: 'keyword', value: '长期收购各类账号' },
+	{ type: 'keyword', value: '收各种赚钱' },
+	{ type: 'keyword', value: '赚钱包盒' },
+	{ type: 'keyword', value: '价格表私聊' },
+	{ type: 'keyword', value: '秒结不拖欠' },
+
+	// —— 赌博黑话：du 是「赌」的规避写法，必须带中文上下文 ——
+	{ type: 'keyword', value: '网 du 商' },
+	{ type: 'keyword', value: '网du商' },
+	{ type: 'keyword', value: 'du 商宝' },
+	{ type: 'keyword', value: 'du商宝' },
+	{ type: 'keyword', value: '商宝账号' },
+	{ type: 'keyword', value: '真宝玩家' },
+	{ type: 'keyword', value: '大额无忧' },
+
+	// —— 网赌号回收：图 27 漏放事故的原型（当时结构化评分只给 3 分）——
+	{ type: 'keyword', value: '网赌账号回收' },
+	{ type: 'keyword', value: '回收网赌' },
+	{ type: 'keyword', value: '收网赌' },
+	{ type: 'keyword', value: '输钱号' },
+	{ type: 'keyword', value: '亏损号' },
+
+	// —— 洗钱跑单黑话 ——
+	{ type: 'keyword', value: '小额洗急' },
+
+	// —— 色情引流：独立的行业维度，双通道的「招揽 ∧ 行业」合取抓不到这一类 ——
+	{ type: 'keyword', value: '约炮' },
+	{ type: 'keyword', value: '辣妞' },
+	{ type: 'keyword', value: '黑丝反差' },
+
+	// —— 招募代理：只收限定组合，单独的「日结佣金」是正常兼职词 ——
+	{ type: 'keyword', value: '招代理日结' },
+	{ type: 'keyword', value: '代理日结佣金' },
+
+	// 【2026-09-10 方案 A：7 条 username 种子已移除】
+	// 原有 @sx8888888sx / @s88888888x_bot / @sx8888888x / @wbwa02ir / @hfzfl /
+	// @uiruqnbot / @yurnfbot 七条引流账号种子，随 username 维度整体下线。
+	// 原注释写「零误封风险」，线上证伪了这个判断 —— username 型权重 0.8 恰好触及
+	// AD_FINGERPRINT_BAN_WEIGHT，是【单条即定罪】通道，一旦有人在正文里提到这些
+	// @handle（举报、转述、警示他人「别加这个号」）就会被当成广告号封掉。
+	// 举报者反被封是这条通道最典型的误伤形态。
+	// 具体引流账号的召回让位于误封治理，这是主人定的口径。
+];
+
+// 运行期缓存（按 env.DB 弱引用，isolate 复用时自动隔离不同库）
+const D1_AD_DETECTION_INIT_PROMISES = new WeakMap();
+const D1_AD_DETECTION_RETRY_AT = new WeakMap();
+const AD_DOMAIN_WHITELIST_CACHE = new WeakMap();
+const AD_FINGERPRINT_CACHE = new WeakMap();
+const AD_SAMPLE_EMBEDDING_CACHE = new WeakMap();
+
+// 读取广告检测配置。数字型环境变量一律先判空串再 parseInt + 有限性 + 范围校验：
+// 直接 Number(env.X) 时空串会得到 0 且 isFinite(0) 为真，会把封禁阈值顶成 0，
+// 使零分的正常用户全部被判广告 —— 这是必须避开的陷阱。
+function loadAdDetectionConfig(env) {
+	const pickInt = (raw, fallback, min, max) => {
+		if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+		const n = parseInt(String(raw).trim(), 10);
+		if (!Number.isFinite(n) || n < min || n > max) return fallback;
+		return n;
+	};
+	const pickFloat = (raw, fallback, min, max) => {
+		if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
+		const n = parseFloat(String(raw).trim());
+		if (!Number.isFinite(n) || n < min || n > max) return fallback;
+		return n;
+	};
+	return {
+		scoreThreshold: pickInt(env.AD_SCORE_THRESHOLD, DEFAULT_AD_SCORE_THRESHOLD, 1, 100),
+		observationScore: pickInt(env.AD_OBSERVATION_SCORE, DEFAULT_AD_OBSERVATION_SCORE, 1, 100),
+		observationHours: pickInt(env.AD_OBSERVATION_HOURS, DEFAULT_AD_OBSERVATION_HOURS, 1, 720),
+		aiSimilarityThreshold: pickFloat(env.AD_AI_SIMILARITY_THRESHOLD, DEFAULT_AD_AI_SIMILARITY_THRESHOLD, 0.1, 1),
+		fingerprintMinConfidence: pickFloat(env.AD_FINGERPRINT_MIN_CONFIDENCE, DEFAULT_AD_FINGERPRINT_MIN_CONFIDENCE, 0, 1),
+		aiEnabled: Boolean(env?.AI && typeof env.AI.run === 'function'),
+		// 方案 E：短语自我泛化。AD_ENRICH_EVERY=0 表示完全关闭自动提炼。
+		enrichEvery: pickInt(env.AD_ENRICH_EVERY, AD_ENRICH_EVERY, 0, 200),
+		enrichMinOccurrence: pickInt(env.AD_ENRICH_MIN_OCCURRENCE, AD_ENRICH_MIN_OCCURRENCE, 2, 20),
+		enrichMaxResults: pickInt(env.AD_ENRICH_MAX_RESULTS, AD_ENRICH_MAX_RESULTS, 1, 100),
+		// 双通道结构查杀的处置模式。默认 ban：命中即封，不参与凑分。
+		//   ban     命中即封禁（默认）
+		//   observe 只写观察记录并推快照，不封 —— 上线初期想先看误伤面时用
+		//   off     完全关闭，退回纯评分 + 指纹 + AI 三层
+		// 用环境变量而非改代码控制，是为了万一真误伤，改一个变量重新部署即可降级，
+		// 不必等改代码。
+		structureKill: (() => {
+			const raw = String(env?.AD_CARD_KILL ?? 'ban').trim().toLowerCase();
+			return ['ban', 'observe', 'off'].includes(raw) ? raw : 'ban';
+		})()
+	};
+}
+
+async function d1AdDetectionTablesExist(env) {
+	return d1TablesExist(env, [
+		'ad_fingerprints',
+		'ad_user_screening',
+		'ad_sample_embeddings',
+		'ad_domain_whitelist',
+		'ad_pending_snapshots',
+		'ad_confirm_tokens',
+		'ad_group_members',
+		'ad_scan_state'
+	]);
+}
+
+// 建立广告检测的 8 张 D1 表。范式与 ensureAdVoteTables 一致：
+// promise 去重 → 核心表先行 → 逐条建表/建索引 → 存在性复验 → 失败删缓存并冷却 60 秒。
+// 冷却是为了避免 D1 抖动时每条消息都重试一次迁移，把子请求预算耗光。
+async function ensureAdDetectionTables(env) {
+	if (!env.DB) return false;
+	const cached = D1_AD_DETECTION_INIT_PROMISES.get(env.DB);
+	if (cached) return cached;
+	const retryAt = D1_AD_DETECTION_RETRY_AT.get(env.DB);
+	if (retryAt && Date.now() < retryAt) return false;
+	const initPromise = (async () => {
+		try {
+			if (!(await ensureD1Table(env))) throw new Error('D1 核心结构不可用');
+			await runD1SchemaStatement(env, 'ad_fingerprints', 'CREATE TABLE IF NOT EXISTS ad_fingerprints (id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT NOT NULL UNIQUE, type TEXT NOT NULL, value TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1, match_count INTEGER NOT NULL DEFAULT 0, false_positive_count INTEGER NOT NULL DEFAULT 0, confidence REAL NOT NULL DEFAULT 1, source TEXT, created_by TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
+			await runD1SchemaStatement(env, 'idx_ad_fingerprints_type', 'CREATE INDEX IF NOT EXISTS idx_ad_fingerprints_type ON ad_fingerprints (type)', { optional: true });
+			await runD1SchemaStatement(env, 'idx_ad_fingerprints_value', 'CREATE INDEX IF NOT EXISTS idx_ad_fingerprints_value ON ad_fingerprints (value)', { optional: true });
+
+			await runD1SchemaStatement(env, 'ad_user_screening', 'CREATE TABLE IF NOT EXISTS ad_user_screening (user_id TEXT PRIMARY KEY, chat_id TEXT, score INTEGER NOT NULL DEFAULT 0, reasons TEXT, snapshot TEXT, layer TEXT, joined_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)');
+			await runD1SchemaStatement(env, 'idx_ad_user_screening_expires', 'CREATE INDEX IF NOT EXISTS idx_ad_user_screening_expires ON ad_user_screening (expires_at)', { optional: true });
+
+			await runD1SchemaStatement(env, 'ad_sample_embeddings', 'CREATE TABLE IF NOT EXISTS ad_sample_embeddings (id INTEGER PRIMARY KEY AUTOINCREMENT, text_hash TEXT NOT NULL UNIQUE, sample_text TEXT NOT NULL, embedding TEXT, dimension INTEGER, source TEXT, created_at INTEGER NOT NULL)');
+			await runD1SchemaStatement(env, 'idx_ad_sample_pending', 'CREATE INDEX IF NOT EXISTS idx_ad_sample_pending ON ad_sample_embeddings (dimension)', { optional: true });
+
+			await runD1SchemaStatement(env, 'ad_domain_whitelist', 'CREATE TABLE IF NOT EXISTS ad_domain_whitelist (domain TEXT PRIMARY KEY, added_by TEXT, source TEXT, created_at INTEGER NOT NULL)');
+
+			await runD1SchemaStatement(env, 'ad_pending_snapshots', 'CREATE TABLE IF NOT EXISTS ad_pending_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT NOT NULL, chat_id TEXT, score INTEGER NOT NULL DEFAULT 0, reasons TEXT, snapshot TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
+			await runD1SchemaStatement(env, 'idx_ad_pending_owner_seq', 'CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_pending_owner_seq ON ad_pending_snapshots (owner_id, seq)', { optional: true });
+			await runD1SchemaStatement(env, 'idx_ad_pending_expires', 'CREATE INDEX IF NOT EXISTS idx_ad_pending_expires ON ad_pending_snapshots (expires_at)', { optional: true });
+
+			await runD1SchemaStatement(env, 'ad_confirm_tokens', 'CREATE TABLE IF NOT EXISTS ad_confirm_tokens (token TEXT PRIMARY KEY, action TEXT NOT NULL, payload TEXT, user_id TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
+			await runD1SchemaStatement(env, 'idx_ad_confirm_expires', 'CREATE INDEX IF NOT EXISTS idx_ad_confirm_expires ON ad_confirm_tokens (expires_at)', { optional: true });
+
+			// 发言者名册。一张表同时承担两件事，刻意不拆：
+			//   ① 方案 5 的扫描源 —— 【不能用 moderation_messages 代替】：那张表只保留最近
+			//      200 条消息（cacheModerationMessage 里 pruneAutoincrementCacheTable 剪枝），
+			//      拿它当名册只能扫到最近说话的几十个人，历史发言者全部丢失。本表按 user_id
+			//      主键 upsert，只增不删（除超期剪枝），是真正的全量名册。
+			//   ② 方案 3 的「已查 bio」台账 —— bio_checked_at 记录上次拉 getChat 的时刻，
+			//      消息路径据此决定要不要再花一次 API。
+			// 合一的理由：两者的键完全相同（user_id），拆两张表等于每条消息多一次 D1 查询。
+			// chat_id 存【最近一次发言的群】—— 判定与封禁需要一个具体群做上下文；
+			// 因为判据主体是昵称与 bio（跨群相同）、restricted 又已归零不计分，
+			// 用哪个群几乎不影响结论，故不按 (user_id, chat_id) 建组合主键 ——
+			// 那会让同一人在 N 个群里占 N 行，把扫描配额直接乘以 N。
+			await runD1SchemaStatement(env, 'ad_group_members', 'CREATE TABLE IF NOT EXISTS ad_group_members (user_id TEXT PRIMARY KEY, chat_id TEXT, first_name TEXT, last_name TEXT, username TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, bio_checked_at INTEGER NOT NULL DEFAULT 0)');
+			// 扫描按 bio_checked_at 升序取「最久没查过的人」，这个索引是 cron 的主查询路径。
+			await runD1SchemaStatement(env, 'idx_ad_members_bio_checked', 'CREATE INDEX IF NOT EXISTS idx_ad_members_bio_checked ON ad_group_members (bio_checked_at)', { optional: true });
+			await runD1SchemaStatement(env, 'idx_ad_members_last_seen', 'CREATE INDEX IF NOT EXISTS idx_ad_members_last_seen ON ad_group_members (last_seen)', { optional: true });
+
+			// 定时扫描的跨次状态（当日已扫计数、当日日期戳）。
+			// 不复用 schema_meta：那张表语义是「迁移版本」，混入运行期状态会让
+			// d1AdDetectionTablesExist 之类的完整性检查难以判断。单独一张 key-value 表最省事。
+			// 【没有游标列】—— 扫描顺序由 bio_checked_at ASC 决定，查过就把时间戳推到现在，
+			// 于是它自动排到队尾。这是自平衡的，不需要显式游标，也不会因为增删行而错位。
+			await runD1SchemaStatement(env, 'ad_scan_state', 'CREATE TABLE IF NOT EXISTS ad_scan_state (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER NOT NULL)');
+
+			if (!(await d1AdDetectionTablesExist(env))) throw new Error('D1 广告检测表迁移不完整');
+			await seedAdDetectionData(env);
+			return true;
+		} catch (error) {
+			console.error('D1 广告检测表初始化失败: ' + formatD1SchemaError(error));
+			return false;
+		}
+	})();
+	D1_AD_DETECTION_INIT_PROMISES.set(env.DB, initPromise);
+	const initialized = await initPromise;
+	if (!initialized) {
+		D1_AD_DETECTION_INIT_PROMISES.delete(env.DB);
+		D1_AD_DETECTION_RETRY_AT.set(env.DB, Date.now() + AD_SCHEMA_RETRY_COOLDOWN_MS);
+	} else {
+		D1_AD_DETECTION_RETRY_AT.delete(env.DB);
+	}
+	return initialized;
+}
+
+// 首次建表后写入种子：域名白名单 + AI 语义样本（embedding 留空，由懒加载补齐）。
+// 两者都用 INSERT OR IGNORE，重复部署不会覆盖用户后来手工增删的结果。
+async function seedAdDetectionData(env) {
+	try {
+		const existing = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_domain_whitelist').first();
+		if (!Number(existing?.c)) {
+			const now = Math.floor(Date.now() / 1000);
+			const statements = AD_DOMAIN_WHITELIST_SEED.map((domain) => env.DB
+				.prepare('INSERT OR IGNORE INTO ad_domain_whitelist (domain, added_by, source, created_at) VALUES (?, ?, ?, ?)')
+				.bind(domain, 'system', 'seed', now));
+			if (statements.length) await env.DB.batch(statements);
+		}
+	} catch (error) {
+		console.error('[广告检测] 白名单种子写入失败:', error);
+	}
+	try {
+		// 判空条件从「整表为空」改成「没有 source='seed' 的行」：下面还有第二批种子，
+		// 两批必须能各自独立补灌。整表判空会让后加的批次在老库上永远灌不进去。
+		const existing = await env.DB.prepare("SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE source = 'seed'").first();
+		if (!Number(existing?.c)) {
+			const now = Math.floor(Date.now() / 1000);
+			const statements = AD_SAMPLE_SEED_TEXTS.map((text) => env.DB
+				.prepare('INSERT OR IGNORE INTO ad_sample_embeddings (text_hash, sample_text, embedding, dimension, source, created_at) VALUES (?, ?, NULL, NULL, ?, ?)')
+				.bind(adTextHash(text), text.slice(0, 500), 'seed', now));
+			if (statements.length) await env.DB.batch(statements);
+		}
+	} catch (error) {
+		console.error('[广告检测] 语义样本种子写入失败:', error);
+	}
+	try {
+		// ===== 中心特征下沉到 AI 层（2026-09-08）=====
+		// 主人定的口径：「AI 必须学习原有的中心指纹以及 spam 的变体，然后它会自我优化
+		// 更多的广告类型变体特征」。此前这两套数据【完全隔离】—— AD_FINGERPRINT_SEED 只进
+		// 指纹表，AI 那边只有上面 10 条 AD_SAMPLE_SEED_TEXTS，于是 AI 的「广告概念」是
+		// 建立在 10 条样本上的，抓变体能力远低于主人的预期。这批灌进去后样本基数 10 → 36。
+		//
+		// 【只取 type === 'keyword'】username 类（@sx8888888sx 那 7 条）当语义样本有害无益：
+		// 那是账号名不是广告话术，嵌入向量里没有可迁移的语义，反而可能让 AI 把
+		// 「任何 @字母数字 串」学成广告特征 —— 正常用户 @ 好友就会开始往高相似度靠。
+		//
+		// 【长度门槛交给 addAdSample 的 text.length < 4】这里不额外过滤也能挡住「约炮」
+		// 「辣妞」这类 2 字词，但走 INSERT 直写绕过了那道门槛，所以必须在这里自己滤 ——
+		// 2 字样本语义太稀薄，会把含这两个字的正常短句一起拉到高相似度。
+		// 这些短词本来就在指纹层命中即封，不进 AI 样本库没有召回损失。
+		const existing = await env.DB.prepare("SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE source = 'seed-core'").first();
+		if (!Number(existing?.c)) {
+			const now = Math.floor(Date.now() / 1000);
+			const coreTexts = AD_FINGERPRINT_SEED
+				.filter((item) => item.type === 'keyword' && String(item.value ?? '').trim().length >= 4)
+				.map((item) => String(item.value).trim());
+			const statements = coreTexts.map((text) => env.DB
+				.prepare('INSERT OR IGNORE INTO ad_sample_embeddings (text_hash, sample_text, embedding, dimension, source, created_at) VALUES (?, ?, NULL, NULL, ?, ?)')
+				.bind(adTextHash(text), text.slice(0, 500), 'seed-core', now));
+			if (statements.length) {
+				await env.DB.batch(statements);
+				console.log('[广告检测] 已把 ' + statements.length + ' 条中心特征灌入 AI 样本库');
+			}
+		}
+	} catch (error) {
+		console.error('[广告检测] 中心特征样本写入失败:', error);
+	}
+	try {
+		// 判空条件刻意不是「整表为空」（前两段那样）—— 指纹表会被自动学习持续写入，
+		// 只要有一条自动指纹先落地，判整表就再也灌不进种子了。这里只数 source='seed' 的条数。
+		// 副作用是符合既有惯例的：主人 /delword 删掉某条种子后，其余种子仍在 → 计数 > 0
+		// → 重新部署不会把删掉的那条灌回来。
+		const existing = await env.DB.prepare("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE source = 'seed'").first();
+		if (!Number(existing?.c)) {
+			const now = Math.floor(Date.now() / 1000);
+			// weight 一律 1.0：种子全是铁证，命中即封（AD_FINGERPRINT_BAN_WEIGHT = 0.8）。
+			// source 用 'seed' 而不是 'manual'：manual 会被 markAdFingerprintFalsePositive 的
+			// 退役 DELETE 豁免掉（那句带 source != 'manual'），种子必须留着这道安全网 ——
+			// 万一某条选词失手造成误封，/ignore 累计 3 次误报后它会自动退役。
+			const statements = AD_FINGERPRINT_SEED.map((item) => env.DB
+				.prepare('INSERT OR IGNORE INTO ad_fingerprints (fingerprint, type, value, weight, match_count, false_positive_count, confidence, source, created_by, created_at, updated_at) '
+					+ 'VALUES (?, ?, ?, 1, 0, 0, 1, ?, ?, ?, ?)')
+				.bind(adFingerprintKey(item.type, item.value), item.type, item.value, 'seed', 'system', now, now));
+			if (statements.length) await env.DB.batch(statements);
+			console.log('[广告检测] 已写入指纹种子 ' + statements.length + ' 条');
+		}
+	} catch (error) {
+		console.error('[广告检测] 指纹种子写入失败:', error);
+	}
+}
+
+// 广告检测总开关：D1 未绑定或建表失败时整套检测静默跳过，既有功能不受影响。
+async function adDetectionReady(env) {
+	if (!env?.DB) return false;
+	try {
+		return await ensureAdDetectionTables(env);
+	} catch (error) {
+		console.error('[广告检测] 就绪检查失败:', error);
+		return false;
+	}
+}
+
+// 广告检测专用运行期缓存。不复用 loadD1RuntimeCachedValue：后者用 JSON 深拷贝，
+// 会把 Set / Map 拍成空对象，且 TTL 固定 15 秒；这里要缓存 Set 且 TTL 60 秒。
+// 返回的是同一引用，所有调用方只读不改。
+async function loadAdCachedValue(cache, db, ttlMs, loader) {
+	if (!db) return null;
+	const cached = cache.get(db);
+	if (cached?.promise) return await cached.promise;
+	if (cached && cached.expiresAt > Date.now()) return cached.value;
+	const promise = Promise.resolve().then(loader);
+	cache.set(db, { value: null, expiresAt: 0, promise });
+	try {
+		const value = await promise;
+		cache.set(db, { value, expiresAt: Date.now() + ttlMs, promise: null });
+		return value;
+	} catch (error) {
+		cache.delete(db);
+		throw error;
+	}
+}
+
+// 归一化域名：剥协议 → 剥用户信息 → 剥路径/查询 → 剥端口 → 小写 → 去首尾点。
+// 通配写法 `*.example.com` 原样保留（白名单里有意义），其余一律压成裸域名。
+function normalizeAdDomain(raw) {
+	let value = String(raw ?? '').trim().toLowerCase();
+	if (!value) return '';
+	const wildcard = value.startsWith('*.');
+	if (wildcard) value = value.slice(2);
+	value = value.replace(/^[a-z][a-z0-9+.-]*:\/\//, '');
+	const atIndex = value.lastIndexOf('@');
+	if (atIndex !== -1) value = value.slice(atIndex + 1);
+	value = value.split(/[/?#\\]/)[0];
+	if (value.startsWith('[')) {
+		const close = value.indexOf(']');
+		value = close === -1 ? value.slice(1) : value.slice(1, close);
+	} else {
+		const colon = value.indexOf(':');
+		if (colon !== -1) value = value.slice(0, colon);
+	}
+	value = value.replace(/^\.+/, '').replace(/\.+$/, '');
+	if (!value || !/^[a-z0-9.-]+$/.test(value)) return '';
+	if (!value.includes('.')) return '';
+	return wildcard ? '*.' + value : value;
+}
+
+// 从任意文本抽取域名候选。返回去重后的裸域名数组。
+function extractAdDomains(text) {
+	const source = String(text ?? '');
+	if (!source) return [];
+	const found = new Set();
+	AD_DOMAIN_CANDIDATE_RE.lastIndex = 0;
+	let match;
+	while ((match = AD_DOMAIN_CANDIDATE_RE.exec(source)) !== null) {
+		const domain = normalizeAdDomain(match[0]);
+		if (domain && !domain.startsWith('*.')) found.add(domain);
+		if (found.size >= 32) break;
+	}
+	return [...found];
+}
+
+// 白名单判定：精确命中，或作为白名单域的真子域命中。
+// 循环上界取 parts.length - 1，保证永不单独匹配顶级域；
+// 因此 evil-github.com / github.com.cn / github.com.evil.tk 一律判为不在白名单，
+// 只有 github.com 与 api.github.com 这类真子域才通过。
+function isAdDomainWhitelisted(domain, whitelistSet) {
+	if (!whitelistSet || typeof whitelistSet.has !== 'function') return false;
+	const value = normalizeAdDomain(domain);
+	if (!value) return false;
+	const bare = value.startsWith('*.') ? value.slice(2) : value;
+	if (whitelistSet.has(bare)) return true;
+	const parts = bare.split('.');
+	for (let i = 1; i < parts.length - 1; i++) {
+		const parent = parts.slice(i).join('.');
+		if (whitelistSet.has(parent) || whitelistSet.has('*.' + parent)) return true;
+	}
+	return false;
+}
+
+// 读取白名单（60 秒缓存）。读失败时返回种子集合兜底，
+// 避免 D1 抖动的瞬间把用户贴的官方链接判成广告链接。
+async function loadAdDomainWhitelist(env) {
+	const fallback = () => new Set(AD_DOMAIN_WHITELIST_SEED);
+	if (!env?.DB) return fallback();
+	try {
+		const value = await loadAdCachedValue(AD_DOMAIN_WHITELIST_CACHE, env.DB, AD_WHITELIST_CACHE_TTL_MS, async () => {
+			if (!(await adDetectionReady(env))) return fallback();
+			const { results } = await env.DB.prepare('SELECT domain FROM ad_domain_whitelist').all();
+			const set = new Set();
+			for (const row of results || []) {
+				const domain = normalizeAdDomain(row?.domain);
+				if (domain) set.add(domain.startsWith('*.') ? domain : domain);
+			}
+			return set.size ? set : fallback();
+		});
+		return value instanceof Set ? value : fallback();
+	} catch (error) {
+		console.error('[广告检测] 读取域名白名单失败:', error);
+		return fallback();
+	}
+}
+
+async function addAdDomainWhitelist(env, rawDomain, addedBy) {
+	const domain = normalizeAdDomain(rawDomain);
+	if (!domain) return { ok: false, reason: 'invalid' };
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const result = await env.DB
+			.prepare('INSERT OR IGNORE INTO ad_domain_whitelist (domain, added_by, source, created_at) VALUES (?, ?, ?, ?)')
+			.bind(domain, String(addedBy ?? ''), 'manual', Math.floor(Date.now() / 1000)).run();
+		AD_DOMAIN_WHITELIST_CACHE.delete(env.DB);
+		return { ok: true, domain, added: Number(result?.meta?.changes || 0) > 0 };
+	} catch (error) {
+		console.error('[广告检测] 添加域名白名单失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+async function removeAdDomainWhitelist(env, rawDomain) {
+	const domain = normalizeAdDomain(rawDomain);
+	if (!domain) return { ok: false, reason: 'invalid' };
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const result = await env.DB.prepare('DELETE FROM ad_domain_whitelist WHERE domain = ?').bind(domain).run();
+		AD_DOMAIN_WHITELIST_CACHE.delete(env.DB);
+		return { ok: true, domain, removed: Number(result?.meta?.changes || 0) > 0 };
+	} catch (error) {
+		console.error('[广告检测] 删除域名白名单失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+// === 第一层：结构化评分 ===
+// 权重全部按真实样本回归而来，命中项同类只计一次，reasons 供快照与私聊通知展示。
+
+function countAdKeywordHits(text, keywords) {
+	const source = String(text ?? '');
+	if (!source) return [];
+	const lower = source.toLowerCase();
+	const hits = [];
+	for (const word of keywords) {
+		const needle = String(word).toLowerCase();
+		if (needle && lower.includes(needle)) hits.push(word);
+		if (hits.length >= 6) break;
+	}
+	return hits;
+}
+
+// Bio 重复段落：广告号常把同一句话按行复读，正常用户极少这样写。
+function hasAdRepeatedSegment(text) {
+	const source = String(text ?? '').trim();
+	if (source.length < 8) return false;
+	const segments = source.split(/[\n\r,，。;；|｜/、]+/).map((s) => s.trim()).filter((s) => s.length >= 3);
+	if (segments.length < 2) return false;
+	const seen = new Set();
+	for (const segment of segments) {
+		if (seen.has(segment)) return true;
+		seen.add(segment);
+	}
+	return false;
+}
+
+// 文本里是否含非白名单引流链接。
+//
+// 2026-09-08 主人下令重排本函数的三条判据，原话：「t.me 不该成为封禁词，也加豁免。
+// 因为正常用户大部分都会使用这个。只有广告用户或者个别用户会直接 @bot 简介 @bot，
+// 所以 t.me 加封禁词只会误封更多。」
+//
+// | 判据                    | 现状 | 理由 |
+// |-------------------------|------|------|
+// | @xxxbot（AD_BOT_MENTION_RE） | 保留，单独成立 | 主人明确认定这才是广告特征 |
+// | t.me/                   | 【已删除】 | 正常用户分享 Telegram 链接是常态；@MiLov1900 两次误封都吃了这个 +2 |
+// | @任意5位以上handle       | 【收紧】需同现业务关键词 | 单纯 @ 某人是聊天常态，只有「@handle + 行业指向」才是引流 |
+// | 非白名单裸域名           | 保留，单独成立 | 与 Telegram 无关的外部站点仍是引流出口 |
+//
+// options.businessHit 由调用方传入（scoreAdProfile / scoreAdMessageText 里已算好
+// businessHits，不重复扫词表）。缺省 false —— 没有业务词上下文时按最宽松处理，
+// 宁可漏一个 @ 提及，也不让不带上下文的调用方凭空造出 +2。
+function hasAdSuspiciousLink(text, whitelistSet, options = {}) {
+	const source = String(text ?? '');
+	if (!source) return false;
+	if (AD_BOT_MENTION_RE.test(source)) return true;
+	// @handle 只在同现业务关键词时才算引流出口，详见上表。
+	if (options.businessHit === true && /@[A-Za-z0-9_]{5,}/.test(source)) return true;
+	for (const domain of extractAdDomains(source)) {
+		if (isAdPlatformDomain(domain)) continue;			// 平台裸域名不再重复计分（t.me 亦在此列）
+		if (!isAdDomainWhitelisted(domain, whitelistSet)) return true;
+	}
+	return false;
+}
+
+// 评分账号资料：名称 + username + bio + 受限状态。
+// ===== 双通道结构查杀（2026-09-07 第三次漏放事故后新建）=====
+//
+// 事故复盘：昵称「♻网赌账号回收h🀄」、bio「6大量收网赌亏损号输钱号 联系 @sx8888888sx
+// 双向联系 @s88888888x_bot 权威」的号，在结构化评分里只拿到 2 分（封禁线 7）：
+//     +2 业务关键词：收网      ← 「大量收网赌」跨词边界拼出的巧合子串，不是设计意图
+//     +2 含非白名单引流链接
+//     +1 随机字母数字 username
+//     -3 命中豁免词：双向 / bot ← 他自己写的「双向联系 @xxx_bot」成了挡箭牌
+// 强交易动词命中 0 个 —— bio 写的是「大量收」，词表里有「专业收」「高价收」「代收」，
+// 独缺「大量收」；因为强动词为 0，豁免走「无交易动词」分支吃满 -3 而不是 -1。
+// 同一个机制此前还漏放过「佳佳（邪恶姐姐）」（bio 列 3 个同前缀引流账号，
+// 靠「双向机器人」拿 -3）。两个号词汇毫无交集，结构一模一样。
+//
+// 这里不再往词表里补词 —— 补词是打地鼠，广告号插一个字（高价「回」收）就绕过去了。
+// 改成三条与具体词汇解耦的设计：
+//
+//   1) 【构词模式代替固定短语】(大量|高价|长期|专业|急|现金)\s*[收购] 一条正则覆盖
+//      「大量收 / 高价回收 / 专业收 / 急收 / 现金收」全部变体，不必逐个入表。
+//   2) 【两个正交维度合取定罪】招揽意图 ∧ 行业指向。只谈行业（技术群聊菠菜防护、
+//      聊 USDT 行情）不封；只谈交易（收藏老相机出闲置、回收老硬盘）不封；两个都有
+//      才是广告。这个合取天然把正常语境挡在外面，比调阈值精确得多。
+//   3) 【豁免词完全不参与】结构判定不做任何减分。豁免词的本意是保护写「双向机器人」
+//      「开源项目」的技术用户，但正常技术用户不会同时写出招揽意图 + 行业指向，
+//      所以结构判定根本不需要它来兜底 —— 而它留在这条路径上只会被广告号当挡箭牌。
+//
+// 两条通道喂给同一个判定核，区别只在输入文本：
+//   通道 card：username + bio     → 资料卡本身就是广告牌，就地正法，与他发什么无关
+//   通道 body：bio + 本条正文      → 资料卡侥幸过关的，一旦正文发广告，合起来绝对查杀
+// 通道 body 的价值在「两边各半条线索」：bio 写「收U」、正文写「有 USDT 现汇的老板私我」，
+// 单看任何一边都不够定罪，合起来招揽 + 行业俱全。
+
+// 招揽意图：广告号「要买 / 要卖 / 要招」的动作。用构词模式而非固定短语。
+const AD_SOLICIT_PATTERNS = [
+	// 数量/价格修饰 + 收购。负向排除是关键：「大量收集数据」「喜欢收藏老相机」
+	// 「长期收听」在正常语境高频，它们后面跟的是完全不同的宾语。
+	/(大量|大批|高价|长期|专业|诚[心意]|急|现金|全国|低价)\s*[收购](?!集|藏|录|纳|听|拾|割|尾|支|入|盘)/,
+	// 收/购 + 账号类宾语。广告号的核心业务就是账号与卡料交易。
+	// 「帐号」保留：那是简体异体写法（帐/账通用），不是繁体。
+	/[收购]\s*[回]?\s*(号|账号|帐号|账户|卡|料|币|u\b|U\b)/,
+	// 供给侧动作词。
+	/(出售|出租|转让|批发|代办|代开|承接|承兑|包出)/,
+	// 招募下游。
+	/(招|收)\s*(代理|下级|下家|车手|水军|学员|渠道)/,
+	// 「回收 / 求购 / 收购」整词 —— 这三个是中文交易广告最高频的动词，
+	// 单独成词时不需要修饰语也足以构成招揽意图。
+	/(回收|求购|收购)/
+];
+
+// 行业指向：广告号「做哪门生意」。与招揽意图正交 —— 只有两者同现才定罪。
+const AD_BIZ_PATTERNS = [
+	/(网赌|赌博|博彩|菠菜|棋牌|彩票|六合|时时彩)/,
+	/(输钱号|亏损号|老账号|实名号|四件套|卡料|跑分|黑产)/,
+	/(网赚|搞钱|赚钱|日入|月入|躺赚|暴利)/,
+	/(usdt|泰达|u商|du商|虚拟币|换汇|跑币)/i,
+	// 单字母 U 指代 USDT 是圈内写法，必须带交易动作才算 —— 单独一个 U 是噪声。
+	/[收出接放]\s*(u|U)\b/, /\b(u|U)\s*[商币源]/
+];
+
+const AD_STRUCT_MATCH = (patterns, text) => patterns.some((re) => re.test(text));
+
+// ===== 身份查杀（identity）：昵称 + 简介，单类命中即封 =====
+// 2026-09-08 主人下令新增。原话三句，第三句纠正了前两句的对象：
+//   ①「关于用户的用户名，用户名只有带广告词才加分，不然这样很容易误封用户。」
+//   ②「用户名带广告的词必封。」
+//   ③「用户名只能英文加数字，那说明你抓的是 @用户名，那我描述错了。你真正要抓的是
+//      用户简介跟用户名字，而不是用户名。因为用户名要嘛纯英文、要嘛英文加数字，无法判定。」
+//
+// 所以本通道的判定域是【昵称（first+last name）+ 简介（bio）】，刻意【不含 @handle】——
+// Telegram 的 @handle 只允许 [A-Za-z0-9_]，中文一个字都进不去，而两张中文词表
+// （AD_TRADE_VERBS 45 条 / AD_BUSINESS_KEYWORDS 63 条）唯一的 ASCII 词条是 'USDT'，
+// 拿 @handle 做中文词判定等于判不了。@handle 的「长相」判据也已按①归零
+// （见 AD_RANDOM_USERNAME_SCORE）。
+//
+// 与资料卡查杀（card）的分工：
+//   card     ：昵称 + @handle + 简介，要求「招揽意图 ∧ 行业指向」【两类同现】
+//   identity ：昵称 + 简介，放宽到【单类命中即封】
+// identity 更狠，抓的是「名字/简介里只写了半句就已经没有正当解释空间」的号，
+// 例如昵称只写「回收账号」（只有招揽、没写行业）或只写「网赌」（只有行业、没写招揽）。
+//
+// 【为什么单类判据只认强构词模式、不认那两张宽词表】
+// AD_BUSINESS_KEYWORDS 里有大量正常人天天说的词：外围（外围电路 / 外围设备，技术群高频）、
+// 快餐、空降、技师、资源群、实名、汇率、同城、上门、赚钱、料子、一夜、收网、刷量、洗白。
+// 这些词在「两类同现才计分」的评分层是安全的（要配上交易动词才计分），但拿来做
+// 「单类命中即封」就是灾难 —— 昵称叫「外围设备维修」「同城顺风车」会被就地正法。
+// 而 AD_SOLICIT_PATTERNS / AD_BIZ_PATTERNS 本来就是为「命中即封」设计的：前者带负向排除
+// （「大量收集数据」「喜欢收藏老相机」「长期收听」全部排掉），后者全是网赌 / 卡料 /
+// 四件套 / 跑分 / USDT 这类没有正当用途的硬核行业词。
+//
+// 要放宽到宽词表，把下面这个开关改成 true 即可（两张表的单类命中也会定罪）。
+const AD_IDENTITY_KILL_WIDE = false;
+
+// 招揽构词的技术语境负向排除。【只用于 identity 通道】——
+// AD_SOLICIT_PATTERNS 最后一条 /(回收|求购|收购)/ 是整词判据，在 card 通道里它必须
+// 配上行业指向才定罪，所以「垃圾回收机制」安全；但 identity 通道是【单类即封】，
+// 「垃圾回收」「内存回收」「回收站清理工具」会当场误封 —— 这几个词组在技术群极高频。
+const AD_IDENTITY_TECH_RECYCLE_RE = /(垃圾|内存|资源|缓存|磁盘|空间|对象|连接|线程|句柄|旧物|废品|电池|塑料|纸箱)\s*回收|回收\s*(站|机制|器|策略|算法)/;
+
+// 行业构词【硬清单】：只用于 identity 通道的单类即封，是 AD_BIZ_PATTERNS 的严格子集。
+//
+// 为什么必须另立一张而不能直接用 AD_BIZ_PATTERNS：那张表是为【两类同现】设计的，
+// 里面有一批词在正常语境高频，配上招揽动词才是广告，单独出现完全无罪 ——
+//   四件套  →「纯棉四件套现货 床单被套一起发」是家居商户（项目里就有这条反例回归断言）
+//   跑分    →「手机跑分」「CPU 跑分」「安兔兔跑分」，技术群天天说
+//   老账号  →「我这个老账号」
+//   棋牌    →「棋牌室」「棋牌类游戏开发」
+//   彩票 / 赚钱 / 搞钱 / 月入 / 虚拟币 / 换汇 / usdt → 正常讨论、外贸换汇、行情教程
+// 这些词【不进本清单】，它们照旧在 card / body 通道靠两类同现定罪：
+// 「四件套 + 收购」封，「四件套 + 床单被套」放行。
+//
+// 进本清单的标准只有一条：【该词组在正常中文语境里没有任何正当用途】。
+//
+// 【不收繁体变体】：2026-09-08 主人下令「繁体全部去掉，如果有的广告会繁体变体，没事，
+// 我通过 /spam 提交并学习也一样的」。所以本文件全部广告词表（含 AD_SOLICIT_PATTERNS /
+// AD_BIZ_PATTERNS / 三张关键词表）一律只写简体，繁体广告走 /spam 手动学习成指纹。
+// 后来者不要「顺手补全繁体」—— 词表每加一倍字面量就多一倍误封面，而 /spam 学出来的
+// 指纹是完整短语、命中即封，比正则变体精准得多。
+// 唯一例外见 parseBanlistHTML：那条繁体是 GKY 第三方站点的返回原文，不是我们的词表。
+const AD_IDENTITY_BIZ_HARD_PATTERNS = [
+	// 赌博博彩黑话。刻意不含「棋牌」「彩票」「六合」——
+	// 「六合」是地名（南京六合区）与「六合八荒」，只收「六合彩」。
+	/(网赌|赌博|博彩|菠菜|六合彩|时时彩|百家乐|网络赌)/,
+	// 黑产料件黑话。刻意不含「四件套」「跑分」「老账号」，理由见上。
+	/(输钱号|亏损号|实名号|卡料|黑产|洗钱|出黑|料子出|四件套出|出四件套)/,
+	// 网赚黑话。「赚钱」「搞钱」不收，只收带量词与黑话形态的。
+	// 「月入过 / 月入上」也刻意不收 —— 「月入过万讨论组」是正常职场话题，
+	// 而「日入过万」在中文里几乎只出现在网赚广告里，两者不对称。
+	/(网赚|躺赚|日入过|日入上|日入[0-9]|暴利项目|日结佣金)/,
+	// 虚拟币交易黑话。单独的 usdt / 虚拟币 / 换汇不收（技术群与外贸群日常），
+	// 只收带交易动作或圈内简称的形态。
+	/(泰达币|u商|du商|跑币|承兑usdt|usdt承兑)/i,
+	/[收出接放]\s*(u|U)\b/, /\b(u|U)\s*[商源]/
+];
+
+// 判定核：昵称 + 简介，单类命中即封。
+function judgeAdIdentityKill(payload) {
+	const name = String(payload?.name ?? '').trim();
+	const bio = String(payload?.bio ?? '').trim();
+	const source = [name, bio].filter(Boolean).join('\n');
+	if (!source) return { guilty: false, channel: 'identity', form: '', reasons: [] };
+
+	// 豁免闸门【刻意做成不对称的】，两类构词的误报风险根本不同：
+	//   行业硬构词（AD_IDENTITY_BIZ_HARD_PATTERNS）= 网赌 / 博彩 / 卡料 / 洗钱 / 网赚 /
+	//     躺赚 / u商 / 收U —— 没有任何正当用途，【不受豁免词影响】，
+	//     否则广告号在昵称里塞个「bot」「机器人」就能免死。
+	//   招揽构词（AD_SOLICIT_PATTERNS）= 收购 / 回收 / 求购 / 出售 / 招代理 —— 部分词
+	//     在正常语境成立（垃圾回收、回收站、出售二手显卡），【保留豁免词闸门】+ 技术负向排除。
+	//   宽词表（AD_IDENTITY_KILL_WIDE 打开时）—— 匹配最松，同样保留豁免词闸门。
+	const exemptHits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
+
+	const bizStruct = AD_STRUCT_MATCH(AD_IDENTITY_BIZ_HARD_PATTERNS, source);
+	const solicitStruct = AD_STRUCT_MATCH(AD_SOLICIT_PATTERNS, source)
+		&& !AD_IDENTITY_TECH_RECYCLE_RE.test(source);
+	const wideTrade = AD_IDENTITY_KILL_WIDE ? countAdKeywordHits(source, AD_TRADE_VERBS) : [];
+	const wideBiz = AD_IDENTITY_KILL_WIDE ? countAdKeywordHits(source, AD_BUSINESS_KEYWORDS) : [];
+
+	// 受豁免影响的判据与不受影响的判据分开收集。
+	const hardHits = [];
+	if (bizStruct) hardHits.push('行业黑话');
+	const softHits = [];
+	if (solicitStruct) softHits.push('招揽构词');
+	if (wideTrade.length) softHits.push('交易动词：' + wideTrade.slice(0, 2).join('/'));
+	if (wideBiz.length) softHits.push('业务关键词：' + wideBiz.slice(0, 2).join('/'));
+
+	if (!hardHits.length && !softHits.length) return { guilty: false, channel: 'identity', form: '', reasons: [] };
+
+	const softAlive = softHits.length > 0 && exemptHits.length === 0;
+	if (!hardHits.length && !softAlive) {
+		return {
+			guilty: false,
+			channel: 'identity',
+			form: '',
+			reasons: ['（身份查杀命中 ' + softHits.join(' + ') + '，但命中豁免词 '
+				+ exemptHits.slice(0, 3).join('/') + '，单类判据放行）']
+		};
+	}
+	const hits = [...hardHits, ...(softAlive ? softHits : [])];
+
+	// 命中位置写进 reasons：主人拿 /pending 复核时要能一眼看出是名字还是简介中的枪。
+	const hitIn = (part) => {
+		if (!part) return false;
+		if (AD_STRUCT_MATCH(AD_IDENTITY_BIZ_HARD_PATTERNS, part)) return true;
+		if (!softAlive) return false;
+		if (AD_STRUCT_MATCH(AD_SOLICIT_PATTERNS, part) && !AD_IDENTITY_TECH_RECYCLE_RE.test(part)) return true;
+		return AD_IDENTITY_KILL_WIDE && (countAdKeywordHits(part, AD_TRADE_VERBS).length > 0
+			|| countAdKeywordHits(part, AD_BUSINESS_KEYWORDS).length > 0);
+	};
+	const where = [];
+	if (hitIn(name)) where.push('名字');
+	if (hitIn(bio)) where.push('简介');
+
+	return {
+		guilty: true,
+		channel: 'identity',
+		form: 'S',			// S = single，单类命中形态，与 card 的 A / B / A+B 区分
+		reasons: ['身份查杀命中（' + (where.join('+') || '资料卡') + '，单类即封）：' + hits.join(' + ')
+			+ (exemptHits.length ? '（含豁免词 ' + exemptHits.slice(0, 2).join('/') + '，但行业黑话不受豁免）' : '')]
+	};
+}
+
+// 引流出口分析。核心约定：【自己的 @handle 不算出口】—— 它是身份标识，
+// 每个人都有；把它算进出口会让所有设了用户名的人凭空多一个「引流渠道」。
+function analyzeAdOutlets(text, selfUsername) {
+	const self = String(selfUsername || '').toLowerCase().replace(/^@+/, '');
+	const mentions = [...new Set(
+		(String(text || '').match(/@[A-Za-z0-9_]{4,32}/g) || []).map((x) => x.slice(1).toLowerCase())
+	)].filter((x) => x !== self);
+	const linkCount = (String(text || '').match(/(https?:\/\/\S+|t\.me\/\S+)/gi) || []).length;
+	// 账号名含 4 位以上连续重复数字（8888888 / 66666）是批量注册号的强特征，
+	// 正常人的 @handle 极少这么取。
+	const repeatedDigit = mentions.filter((x) => /(\d)\1{3,}/.test(x));
+	// 引流矩阵：同一人批量注册的号前缀高度雷同（jiajia33998 / jiajia3369bot / jiajia3399）。
+	// 「佳佳（邪恶姐姐）」那个号一个广告词都没有，靠的就是这一条。
+	let sharedPrefix = false;
+	for (let i = 0; i < mentions.length && !sharedPrefix; i++) {
+		for (let j = i + 1; j < mentions.length; j++) {
+			let k = 0;
+			while (k < mentions[i].length && k < mentions[j].length && mentions[i][k] === mentions[j][k]) k += 1;
+			if (k >= 4) { sharedPrefix = true; break; }
+		}
+	}
+	return {
+		mentions,
+		count: mentions.length + linkCount,
+		hasBot: mentions.some((x) => /bot$/.test(x)),
+		repeatedDigit,
+		sharedPrefix
+	};
+}
+
+// 判定核。两条通道共用，channel 只用于回执与日志，不影响判定本身。
+function judgeAdStructure(text, selfUsername, channel) {
+	const source = String(text || '').trim();
+	if (!source) return { guilty: false, channel, form: '', reasons: [] };
+
+	const solicit = AD_STRUCT_MATCH(AD_SOLICIT_PATTERNS, source)
+		|| countAdKeywordHits(source, AD_TRADE_VERBS).length > 0;
+	const biz = AD_STRUCT_MATCH(AD_BIZ_PATTERNS, source)
+		|| countAdKeywordHits(source, AD_BUSINESS_KEYWORDS).length > 0;
+	const outlets = analyzeAdOutlets(source, selfUsername);
+
+	// 形态 A 明说型：招揽 ∧ 行业。刻意【不要求有联系出口】——
+	// 「大量收U 秒结」这句话本身就是广告，他会私聊你，不留联系方式一样是广告。
+	const formA = solicit && biz;
+	// 形态 B 引流矩阵型：不说业务，只堆账号。三个独立信号任一成立即可 ——
+	// 正常人 bio 里不会列 3 个账号、不会有同前缀小号群、不会有两个 8888 号。
+	const formB = outlets.mentions.length >= 3 || outlets.sharedPrefix || outlets.repeatedDigit.length >= 2;
+
+	const form = formA && formB ? 'A+B' : (formA ? 'A' : (formB ? 'B' : ''));
+	if (!form) return { guilty: false, channel, form: '', reasons: [] };
+
+	const label = channel === 'card' ? '资料卡查杀' : (channel === 'quoted' ? '引用体查杀' : '正文查杀');
+	const detail = [];
+	if (solicit) detail.push('招揽意图');
+	if (biz) detail.push('行业指向');
+	if (outlets.count) detail.push('引流出口×' + outlets.count + (outlets.hasBot ? '(含bot)' : ''));
+	if (outlets.repeatedDigit.length) detail.push('重复数字账号×' + outlets.repeatedDigit.length);
+	if (outlets.sharedPrefix) detail.push('同前缀引流矩阵');
+	return {
+		guilty: true,
+		channel,
+		form,
+		reasons: [label + '命中（形态 ' + form + '）：' + detail.join(' + ')]
+	};
+}
+
+// 通道 card：只看 username + bio。刻意不含正文与昵称之外的任何输入 ——
+// 它要回答的问题是「这张资料卡本身是不是广告牌」，与他此刻说了什么无关。
+// 昵称计入：Telegram 界面上昵称就是资料卡最显眼的一行（「♻网赌账号回收h🀄」）。
+function judgeAdProfileCard(payload) {
+	const text = [payload?.name, payload?.username, payload?.bio].filter(Boolean).join('\n');
+	return judgeAdStructure(text, payload?.username, 'card');
+}
+
+// 通道 body：bio + 本条正文。资料卡单独不够定罪、但正文补上了缺的那一半时在此收网。
+function judgeAdBodyWithBio(payload) {
+	if (!String(payload?.text || '').trim()) return { guilty: false, channel: 'body', form: '', reasons: [] };
+	const text = [payload?.bio, payload?.text].filter(Boolean).join('\n');
+	return judgeAdStructure(text, payload?.username, 'body');
+}
+
+// ===== 通道 quoted：引用体查杀 =====
+// 2026-09-08 主人选定「两条都要（最严也最安全）」后新增。
+//
+// 抓的形态是【他自己几乎什么都没说，却引用了一整条广告】：
+// 主人给的实例是昵称 Maybell Tillman、正文只有一个字母 `c`、引用块里是
+// 「操逼赚钱，招探花9000一单，提供设备」。这也是线上漏放 50+ 个号的共同长相
+// （正文全是 v / z / n / x / c 一个字母）—— 广告词一个都不在他自己的正文里，
+// 所以评分层、card、body 三条路全都看不见，一路 0 分走到底。
+//
+// 【为什么不能直接把引用体当成他自己的正文】
+// 引用体是【别人】写的。正常用户引用一条广告然后吐槽「这什么垃圾」，
+// 引用体里照样全是广告词 —— 直接并入判定等于把举报的人和发广告的人一起封。
+// 管理员不受影响（isPrivilegedManager 在 detectAdOnMessage 入口就 return 了），
+// 但普通群友天天这么干，这是本通道最大的误封面。
+//
+// 所以定罪要【同时】过两道门槛（主人选的就是这一档，最严）：
+//   门槛一 自己正文近乎为空（≤ AD_QUOTED_KILL_MAX_OWN_TEXT 个字符）
+//          —— 正常人引用别人的消息一定会说点什么（吐槽 / 提醒 / 追问），
+//             只发一个字母的唯一动机就是「让引用的广告露出来」，靠引用体蹭曝光。
+//   门槛二 自己正文不含举报 / 吐槽语义
+//          —— 与门槛一并不冗余：「广告」「垃圾」「骗子」都只有 2 个字，
+//             照样能过门槛一。群友引用广告只回「广告」两个字是最常见的举报方式，
+//             这一档必须放行。复用 AD_REPLY_LEARN_TRIGGERS 正合适 ——
+//             那张表的语义本来就是「这个人在说：这是广告」。
+//
+// 判据本体直接复用 judgeAdStructure（招揽 ∧ 行业 两类同现），不另立标准：
+// 那个函数的 solicit / biz 已经把两张构词表与两张关键词表都并进去了。
+// 实例验算：「提供设备」在 AD_TRADE_VERBS → solicit 成立；
+//          「赚钱」在 AD_BIZ_PATTERNS → biz 成立；形态 A 定罪。
+//
+// 【绕过成本】：广告号只要在正文里多打几个正常字（「看看」「哈哈」）就能过门槛一。
+// 这是主人认可的兜底分工 —— 那种变体交给 /spam 手动学成指纹（命中即封，比正则精准）。
+// 刻意不去追那条尾巴：把门槛一放宽到十几个字，就会开始误封「@某人 你看这个广告」。
+const AD_QUOTED_KILL_MAX_OWN_TEXT = 4;
+
+// 纯 ASCII 正文的放宽档（2026-09-09 方案 B）。来源是旧代码 isShortQuoteWrapperText
+//（e80658e^:6393-6411）的双档设计：它对 ASCII 用 ≤8、对含中日韩的用 ≤4。
+//
+// 为什么 ASCII 可以比中文松一倍：`h` `t` `k` `ok` `hello` `123456` `laowang` 这种
+// 纯字母数字外壳在中文群里【没有任何正常语义】—— 真人用中文聊天，不会突然回一串拼音或随机字母。
+// 而中文短回复（好的 / 谢谢 / 卧槽 / 牛逼）恰恰是最常见的正常反应，所以中文档一个字都不敢放。
+//
+// 主人的实战情报（原话）：「现在这个引用广告带短字符是只有广告才会这样做。而且大部分都是
+// 这样的内容。它不会加多个字符 它最多就是单个字符。也就是我截图的那样。」
+// 截图实物：正文只有一个 `h`，引用框是 ungrf 频道的「招募探花，提供设备，收探花视频9000一部」。
+// 那条 1 字符的 `h` 现在这套代码已经能杀（1 ≤ 4）；放宽到 8 是把 `hello` / `123456` /
+// `laowang` 这类 5~8 字的同类外壳一起收进来，属于同一形态的尾巴。
+//
+// 【刻意不做的两件事】：
+//   1. 不引入旧代码的 HARMLESS_SHORT_REPLY_PATTERN 白名单 —— 那是门槛二的职责，
+//      本次改动只动门槛一的阈值，判据与门槛二一律不动。
+//   2. 不动中文档 —— 含任何非 ASCII 字符（中日韩 / emoji / 全角标点）时，
+//      连长度算法都走原来的 own.length，行为与改动前【逐字节一致】，零回归风险。
+const AD_QUOTED_KILL_MAX_OWN_TEXT_ASCII = 8;
+
+// 举报 / 吐槽语义。命中即放行本通道。
+// 前半段复用回复学习触发词（广告 / 垃圾 / 封了 / 封他 / 该封 …），
+// 后半段补的是「不说封、只表态」的常见短回复 —— 举报的人未必用得上「封」字。
+const AD_QUOTED_KILL_NEGATORS = [
+	...AD_REPLY_LEARN_TRIGGERS,
+	'骗子', '骗人', '诈骗', '假的', '割韭菜', '别信', '不要信', '小心', '警惕', '注意',
+	'举报', '拉黑', '屏蔽', '踢了', '踢他', '什么鬼', '什么玩意', '傻逼', '滚'
+];
+
+function judgeAdQuotedKill(payload) {
+	const quoted = String(payload?.quoted || '').trim();
+	if (!quoted) return { guilty: false, channel: 'quoted', form: '', reasons: [] };
+
+	const own = String(payload?.text || '').trim();
+
+	// 门槛一：自己正文必须近乎为空。阈值按语种分档（见两个常量的注释）：
+	//   纯 ASCII 可打印字符 → 剥掉非字母数字后 ≤8，且原文 ≤16（原文上限沿用旧代码的 16）
+	//   含任何非 ASCII（中日韩 / emoji / 全角标点）→ 原封不动走 own.length ≤ 4
+	// ownAsciiCore === null 就是「不是纯 ASCII」，此时长度算法与阈值都与改动前完全一致。
+	const ownAsciiCore = /^[\x20-\x7E]*$/.test(own) ? own.replace(/[^A-Za-z0-9]+/g, '') : null;
+	const ownWeight = ownAsciiCore === null ? own.length : ownAsciiCore.length;
+	const ownLimit = ownAsciiCore === null ? AD_QUOTED_KILL_MAX_OWN_TEXT : AD_QUOTED_KILL_MAX_OWN_TEXT_ASCII;
+	if (ownWeight > ownLimit || own.length > AD_QUOTED_KILL_MAX_OWN_TEXT_ASCII * 2) {
+		return { guilty: false, channel: 'quoted', form: '', reasons: [] };
+	}
+	// 门槛二：自己正文一旦带举报 / 吐槽语义就放行 —— 那是群友在举报，不是广告号在引流。
+	const negatorHits = countAdKeywordHits(own, AD_QUOTED_KILL_NEGATORS);
+	if (negatorHits.length) {
+		return {
+			guilty: false,
+			channel: 'quoted',
+			form: '',
+			reasons: ['（引用体含广告词，但本人正文是举报语义 ' + negatorHits.slice(0, 2).join('/') + '，放行）']
+		};
+	}
+
+	const verdict = judgeAdStructure(quoted, payload?.username, 'quoted');
+	if (!verdict.guilty) return verdict;
+
+	// 豁免闸门与 scoreAdMessageText 保持同一套不对称口径：
+	// 引用体命中技术豁免词【且没有强交易动词】才放行 —— 纯技术贴被引用不该定罪；
+	// 一旦出现强动词（收购 / 代付 / 提供设备 / 秒结），塞几个术语也不免死，
+	// 否则「收购 vless 账号 USDT 日结」这种夹带术语的广告会整条溜过去。
+	const exemptHits = countAdKeywordHits(quoted, AD_EXEMPT_KEYWORDS);
+	const tradeHits = countAdKeywordHits(quoted, AD_TRADE_VERBS);
+	if (exemptHits.length && !tradeHits.length) {
+		return {
+			guilty: false,
+			channel: 'quoted',
+			form: '',
+			reasons: ['（引用体命中广告构词，但含技术豁免词 ' + exemptHits.slice(0, 3).join('/')
+				+ ' 且无强交易动词，放行）']
+		};
+	}
+
+	// reasons 里带上引用体片段：主人拿 /pending 复核时要能直接看到「他引的到底是什么」，
+	// 否则封禁通知里只有一个字母 `c`，完全无法判断封得对不对。
+	return {
+		...verdict,
+		reasons: [
+			...verdict.reasons,
+			'引用体查杀：本人正文仅 ' + (own.length ? '「' + own + '」' : '空')
+				+ '，广告词全在引用的那条消息里 —— 「' + quoted.slice(0, 60).replace(/\s+/g, ' ') + '」'
+		]
+	};
+}
+
+function scoreAdProfile(profile, options = {}) {
+	const whitelistSet = options.whitelist instanceof Set ? options.whitelist : new Set(AD_DOMAIN_WHITELIST_SEED);
+	const firstName = String(profile?.firstName ?? profile?.first_name ?? '');
+	const lastName = String(profile?.lastName ?? profile?.last_name ?? '');
+	const username = String(profile?.username ?? '').replace(/^@/, '');
+	const bio = String(profile?.bio ?? '');
+	const status = String(profile?.status ?? '');
+	const displayName = (firstName + ' ' + lastName).trim();
+	const combined = (displayName + '\n' + bio).trim();
+
+	let score = 0;
+	const reasons = [];
+	const add = (delta, label) => { score += delta; reasons.push((delta >= 0 ? '+' : '') + delta + ' ' + label); };
+
+	if (displayName && AD_SYMMETRIC_EMOJI_RE.test(displayName)) add(3, '名称首尾对称 emoji');
+	if (displayName && AD_NUMERIC_PREFIX_RE.test(displayName)) add(1, '名称数字+emoji 前缀');
+
+	// ===== 关键词计分：两类词同现才给分，单类命中一律 0 分 =====
+	// 规则与理由见 AD_KEYWORD_COMBO_SCORE。命中仍然全部写进 reasons ——
+	// 主人拿 /pending 快照做人工判断时，「命中了什么词但没计分」是最有用的信息，
+	// 不计分不等于不记录。
+	const tradeHits = countAdKeywordHits(combined, AD_TRADE_VERBS);
+	const weakTradeHits = countAdKeywordHits(combined, AD_WEAK_TRADE_VERBS);
+	const businessHits = countAdKeywordHits(combined, AD_BUSINESS_KEYWORDS);
+
+	if (tradeHits.length && businessHits.length) {
+		add(AD_KEYWORD_COMBO_SCORE, '交易动词 + 业务关键词同现：'
+			+ tradeHits.slice(0, 2).join('/') + ' × ' + businessHits.slice(0, 2).join('/'));
+	} else {
+		if (tradeHits.length) reasons.push('（仅交易动词，单类词不计分：' + tradeHits.slice(0, 3).join('/') + '）');
+		if (businessHits.length) reasons.push('（仅业务关键词，单类词不计分：' + businessHits.slice(0, 3).join('/') + '）');
+	}
+	// 弱动词【永不计分、永不参与同现判定】，只留记录 —— 详见 AD_WEAK_TRADE_VERBS 的误封复盘。
+	if (weakTradeHits.length) {
+		if (AD_WEAK_TRADE_VERB_SCORE > 0) add(AD_WEAK_TRADE_VERB_SCORE, '弱交易动词：' + weakTradeHits.slice(0, 3).join('/'));
+		else reasons.push('（弱交易动词，不计分：' + weakTradeHits.slice(0, 3).join('/') + '）');
+	}
+
+	if (hasAdSuspiciousLink(combined, whitelistSet, { businessHit: businessHits.length > 0 })) add(2, '含非白名单引流链接');
+	if (username && AD_RANDOM_USERNAME_RE.test(username) && /[0-9]/.test(username)) {
+		if (AD_RANDOM_USERNAME_SCORE > 0) add(AD_RANDOM_USERNAME_SCORE, '随机字母数字 username');
+		else reasons.push('（随机字母数字 username，不计分：长相不构成广告证据）');
+	}
+	if (hasAdRepeatedSegment(bio)) add(1, 'Bio 重复段落');
+	// 结构判据：机器生成型昵称。两条判据互斥（一条查拉丁全名、一条查非常用书写系统），
+	// 命中任一只加一次分，避免同一形态被重复计价。
+	if (displayName && isAdGeneratedWesternName(displayName)) {
+		add(AD_GENERATED_NAME_SCORE, '昵称为机器生成型西方全名');
+	} else if (displayName && isAdRandomExoticName(displayName)) {
+		add(AD_GENERATED_NAME_SCORE, '昵称为非常用书写系统短随机串');
+	}
+	// restricted 只记录、不计分。
+	// 语义是「在本群被禁言 / 限权」，而禁言他的往往就是 bot 自己（muteChatMember 走
+	// restrictChatMember）—— 拿这个自己造成的状态反过来给用户加分，就是 2026-09
+	// 误封正常用户的根因（当时 +5，与弱动词 +2 凑成 7 分恰好撞封禁线）。
+	// 预筛门槛取消后（每条消息都拉资料），任何正分都会作用到全群每个
+	// 被禁言过的人的每一条消息上，因此彻底降为 0：保留供人工判断的记录，
+	// 不参与任何自动定罪。真广告不靠这条认定，删分不影响召回率。
+	if (status === 'restricted') {
+		if (AD_RESTRICTED_STATUS_SCORE > 0) add(AD_RESTRICTED_STATUS_SCORE, '该用户在本群处于受限状态（可能被管理员禁言）');
+		else reasons.push('（本群受限状态，不计分：可能由 bot 自己禁言造成）');
+	}
+
+	// ===== 私有群一次性邀请链接（2026-09-09 方案 C）=====
+	// 加分判据与豁免剔除【刻意挨着写】：剔除的前提就是「这次确实命中了私有形态」，
+	// 拆到两处早晚只改一半 —— 那时会出现「加了 5 分但豁免还照减 3 分」的半吊子状态。
+	// 形态分档、分值取 5 的完整推演、以及为什么它不会滚成累积误封，见 AD_PRIVATE_INVITE_SCORE。
+	//
+	// 【只管资料卡、不管正文】主人这次说的是「资料卡昵称 + 广告简介」。正文里发群链接
+	// （「这个群不错 t.me/+xxx」）在正常群聊里远比写进个人简介常见，所以 scoreAdMessageText
+	// 一个字都不动 —— 要扩到正文得另开一轮，不在本次授权范围内。
+	const privateInvite = hasAdPrivateInviteLink(combined);
+	if (privateInvite) add(AD_PRIVATE_INVITE_SCORE, '资料卡含私有群一次性邀请链接（t.me/+ 或 joinchat）');
+
+	let exemptHits = countAdKeywordHits(combined, AD_EXEMPT_KEYWORDS);
+	// 私有邀请链接不吃 t.me 豁免 —— 但【只在全文没有公开 telegram 链接时】才剔。
+	// 同时写了 t.me/mychannel（公开频道）和 t.me/+xxx（私有群）的人，公开那条仍是正常用法，
+	// 豁免照给：这是留给技术群群主的缓冲，宁可放过一个也不误封他。
+	//
+	// 【已知边界，刻意不补】countAdKeywordHits 命中满 6 个词就 break，而 't.me' 排在
+	// AD_EXEMPT_KEYWORDS 的最末尾 —— 简介里塞了 6 个以上技术豁免词时，'t.me' 根本不在
+	// hits 里，剔不掉，豁免仍吃满 -3（净 +2，pass）。那种简介（六个代理／TLS 术语 + 私有群链接）
+	// 几乎必然是真的技术群群主，放过他正是要的结果，不为此去动 countAdKeywordHits 的上限。
+	if (privateInvite && exemptHits.length && !hasAdPublicTelegramLink(combined)) {
+		const isTelegramExempt = (word) => AD_TELEGRAM_LINK_EXEMPT_WORDS.has(String(word).toLowerCase());
+		const dropped = exemptHits.filter(isTelegramExempt);
+		if (dropped.length) {
+			exemptHits = exemptHits.filter((word) => !isTelegramExempt(word));
+			reasons.push('（私有群邀请链接不吃 ' + dropped.join('/') + ' 豁免：该豁免只保护公开账号链接）');
+		}
+	}
+	if (exemptHits.length) {
+		const penalty = tradeHits.length ? AD_EXEMPT_PENALTY_WITH_TRADE : AD_EXEMPT_PENALTY;
+		add(penalty, '命中豁免词：' + exemptHits.slice(0, 3).join('/') + (tradeHits.length ? '（含交易动词，减免打折）' : ''));
+	}
+	// 「无 emoji 且无 Bio」这条减分项建立在【确实查过 bio 且确实为空】之上。
+	// 双轨方案里存在「本次没查 bio」的路径（轨一冷却期内、闸一零成本判定），
+	// 那时 bio 变量是空字符串，但它的含义是「未知」而不是「为空」——
+	// 拿未知当空来减分是拿假前提做判据，会把真广告的分数压下去（实测
+	// 「收U秒结」从 +2 被压到 1 分、「【出租账号】」被压到 0 分）。
+	// 故未查 bio 时必须显式跳过，由调用方传 skipMissingBioPenalty。
+	if (displayName && !AD_HAS_EMOJI_RE.test(displayName) && !bio && !options.skipMissingBioPenalty) add(-1, '名称无 emoji 且无 Bio');
+
+	// 下限 AD_SCORE_FLOOR（-3）而非 0：夹到 0 会让豁免词减分完全失效，详见该常量说明。
+	return { score: Math.max(AD_SCORE_FLOOR, score), rawScore: score, reasons, tradeHits, businessHits };
+}
+
+// 评分消息正文：入群后首条消息的兜底判定。
+function scoreAdMessageText(text, options = {}) {
+	const whitelistSet = options.whitelist instanceof Set ? options.whitelist : new Set(AD_DOMAIN_WHITELIST_SEED);
+	const source = String(text ?? '').trim();
+	if (!source) return { score: 0, rawScore: 0, reasons: [], tradeHits: [], businessHits: [] };
+
+	let score = 0;
+	const reasons = [];
+	const add = (delta, label) => { score += delta; reasons.push((delta >= 0 ? '+' : '') + delta + ' ' + label); };
+
+	// 关键词计分口径与 scoreAdProfile 完全一致：两类词同现才给分，单类命中只记录。
+	const tradeHits = countAdKeywordHits(source, AD_TRADE_VERBS);
+	const weakTradeHits = countAdKeywordHits(source, AD_WEAK_TRADE_VERBS);
+	const businessHits = countAdKeywordHits(source, AD_BUSINESS_KEYWORDS);
+
+	if (tradeHits.length && businessHits.length) {
+		add(AD_KEYWORD_COMBO_SCORE, '正文交易动词 + 业务关键词同现：'
+			+ tradeHits.slice(0, 2).join('/') + ' × ' + businessHits.slice(0, 2).join('/'));
+	} else {
+		if (tradeHits.length) reasons.push('（正文仅交易动词，单类词不计分：' + tradeHits.slice(0, 3).join('/') + '）');
+		if (businessHits.length) reasons.push('（正文仅业务关键词，单类词不计分：' + businessHits.slice(0, 3).join('/') + '）');
+	}
+	if (weakTradeHits.length) {
+		if (AD_WEAK_TRADE_VERB_SCORE > 0) add(AD_WEAK_TRADE_VERB_SCORE, '正文弱交易动词：' + weakTradeHits.slice(0, 3).join('/'));
+		else reasons.push('（正文弱交易动词，不计分：' + weakTradeHits.slice(0, 3).join('/') + '）');
+	}
+
+	if (hasAdSuspiciousLink(source, whitelistSet, { businessHit: businessHits.length > 0 })) add(2, '正文含非白名单引流链接');
+	if (AD_SYMMETRIC_EMOJI_RE.test(source)) add(3, '正文首尾对称 emoji');
+	if (hasAdRepeatedSegment(source)) add(1, '正文重复段落');
+
+	const exemptHits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
+	if (exemptHits.length) {
+		const penalty = tradeHits.length ? AD_EXEMPT_PENALTY_WITH_TRADE : AD_EXEMPT_PENALTY;
+		add(penalty, '正文命中豁免词：' + exemptHits.slice(0, 3).join('/') + (tradeHits.length ? '（含交易动词，减免打折）' : ''));
+	}
+
+	// 与 scoreAdProfile 同一个下限，理由见 AD_SCORE_FLOOR。
+	return { score: Math.max(AD_SCORE_FLOOR, score), rawScore: score, reasons, tradeHits, businessHits };
+}
+
+// 评分转发来源频道 / 群组。
+// 【2026-09-08 起整条判据由 AD_FORWARD_JUDGE_ENABLED 关闭】——
+// 主人要求去除频道 / 群组判定，理由是「有的用户喜欢用频道私聊」，误伤面太大。
+// 函数本体保留：判据本身描述的形态（广告号转发自家马甲频道）是真的，
+// 只是不能再拿它自动定罪。开关打开即恢复原行为，无需改动本函数。
+function scoreAdForwardChat(chat) {
+	const title = String(chat?.title ?? '').trim();
+	const username = String(chat?.username ?? '').replace(/^@/, '');
+	if (!title && !username) return { score: 0, reasons: [], isAd: false };
+	if (!AD_FORWARD_JUDGE_ENABLED) {
+		return { score: 0, reasons: ['（转发来源判定已按主人要求关闭，不计分）'], isAd: false, disabled: true };
+	}
+
+	let score = 0;
+	const reasons = [];
+	const add = (delta, label) => { score += delta; reasons.push('+' + delta + ' ' + label); };
+
+	if (title && AD_SYMMETRIC_EMOJI_RE.test(title)) add(3, '来源频道对称 emoji');
+	if (title && AD_NUMERIC_PREFIX_RE.test(title)) add(1, '来源频道数字前缀');
+	const businessHits = countAdKeywordHits(title + '\n' + username, AD_BUSINESS_KEYWORDS);
+	if (businessHits.length) add(3, '来源频道业务词：' + businessHits.slice(0, 3).join('/'));
+	const tradeHits = countAdKeywordHits(title + '\n' + username, AD_TRADE_VERBS);
+	if (tradeHits.length) add(2, '来源频道交易动词：' + tradeHits.slice(0, 3).join('/'));
+	// 随机字母串频道名：线上那批广告全部转发自 bxbd / hjff 这类 4~6 位纯小写字母频道，
+	// 上面四条判据一条都不命中（实测 score=0 isAd=false），最强的信号反而被完全放过。
+	// 这类名字是批量注册的马甲频道特征：没有元音结构、不成词、长度极短。
+	// 权重给到 AD_RANDOM_CHANNEL_SCORE（4）= isAd 门槛：此前给 2 分达不到门槛，
+	// 而 evaluateAdSuspect 只在 isAd 为真时才累加来源分，等于这 2 分永远是废分。
+	// 判据本身足够严（4~6 位纯小写字母且零元音），正常频道极难命中，可以单独定来源。
+	if (isAdRandomChannelName(title) || isAdRandomChannelName(username)) {
+		add(AD_RANDOM_CHANNEL_SCORE, '来源频道名为随机字母串');
+	}
+
+	return { score, reasons, isAd: score >= 4 };
+}
+
+// 是否像批量注册的马甲频道名：3~6 位纯小写英文字母、且元音占比过低（不成词）。
+// 正常频道极少用这种名字；广告团伙为规避封禁会大量注册 bxbd / hjff 这类无意义短名。
+// 判据刻意保守：含数字、下划线、大写、中文、长度 >6 的一律不算，避免误伤缩写型正常频道
+// （如 cfnews、v2ex 含数字或长度超限，bbc / cnn 含元音或长度不足 4 时同样放过）。
+function isAdRandomChannelName(value) {
+	const name = String(value ?? '').trim();
+	if (!/^[a-z]{3,6}$/.test(name)) return false;
+	const vowels = (name.match(/[aeiou]/g) || []).length;
+	// 4 位以上且完全无元音（bxbd、hjff）→ 判随机串；
+	// 3 位太容易撞正常缩写（abc、xyz、bbc），一律放过。
+	return name.length >= 4 && vowels === 0;
+}
+
+// 是否像 Faker / 批量生成器造出来的西方全名。
+// 线上截图那批号：`Savanah Wuckert Jr.`、`Marilou Emard`、`Mr. Amos Batz` ——
+// 特征是「纯拉丁字母的两三段式姓名 + 每段首字母大写 + 常带 Jr./Sr./Mr. 等称谓」，
+// 完全不含中文、emoji、数字、下划线。这是 faker 类库的默认输出形态。
+//
+// 真实外国用户也可能叫 `John Smith`，所以本判据只给 AD_GENERATED_NAME_SCORE（+2），
+// 单独绝不足以定罪，必须与其它信号叠加才可能过线。
+function isAdGeneratedWesternName(value) {
+	const name = String(value ?? '').trim();
+	if (!name || name.length > 40) return false;
+	// 含中日文 / 数字 / 下划线的一律不算：那些形态走别的判据。
+	if (/[一-龥぀-ヿ0-9_]/.test(name)) return false;
+	if (AD_HAS_EMOJI_RE.test(name)) return false;
+	const parts = name.split(/\s+/).filter(Boolean);
+	if (parts.length < 2 || parts.length > 4) return false;
+	// 每段必须是「大写开头 + 纯小写字母」，或带尾点的称谓（Jr. / Sr. / Mr. / Mrs. / Dr.）。
+	const honorific = /^(?:Jr|Sr|Mr|Mrs|Ms|Dr|Prof|II|III|IV)\.?$/;
+	let wordCount = 0;
+	for (const part of parts) {
+		if (honorific.test(part)) continue;
+		if (!/^[A-Z][a-z]{1,15}$/.test(part)) return false;
+		wordCount += 1;
+	}
+	return wordCount >= 2;
+}
+
+// 是否为「非常用书写系统的短随机昵称」。
+// 线上截图：天城文 3 字昵称 —— 批量注册器随机取码位拼出来的，不成词、极短。
+// 只覆盖几个明确的非拉丁非中日文区段，且长度 <= 6、不含空格，
+// 避免误伤真实的印地语 / 孟加拉语用户（他们的名字通常更长且带空格分段）。
+// 同样只给 AD_GENERATED_NAME_SCORE（+2），单独不定罪。
+function isAdRandomExoticName(value) {
+	const name = String(value ?? '').trim();
+	if (!name || name.length > 6) return false;
+	if (/\s/.test(name)) return false;			// 带空格的多段名不算，真实用户更可能这样
+	// 天城文 / 孟加拉文 / 泰米尔文 / 泰卢固文 / 古加拉特文 / 埃塞俄比亚文 / 高棉文 / 缅甸文
+	return /^[ऀ-ॿঀ-৿஀-௿ఀ-౿઀-૿ሀ-፿ក-៿က-႟]+$/.test(name);
+}
+
+// 是否为「极短正文」。线上那批号的正文全是单个字母（v / z / n / x / c / f / k），
+// 广告词本体在转发体里，顶层 text 只是个占位符 —— 这是最稳定的投放模式特征。
+// 阈值取 AD_MINIMAL_TEXT_MAX_LENGTH（4）：这批号把正文改成 `vvv`、`abcd` 的变异成本极低，
+// 留出余量。正常人也会发「顶」「+1」「收到」，所以本判据【必须与转发来源叠加】才计分，
+// 见 scoreAdMessageContext。
+function isAdMinimalText(text) {
+	const value = String(text ?? '').replace(/\s+/g, '');
+	return value.length > 0 && value.length <= AD_MINIMAL_TEXT_MAX_LENGTH;
+}
+
+// 上下文判据：正文与转发来源【组合】起来才成立的信号，单看任何一边都不够。
+// 目前只有一条：极短正文 + 转发来源同现 -> AD_MINIMAL_TEXT_FORWARD_SCORE（+4）。
+//
+// 为什么必须组合：只发一个字母不算广告（可能是「顶」「1」），只转发频道也不算广告
+// （技术群天天转发文章）。但「转发一个频道 + 自己只回一个字母」这个组合，
+// 正常人几乎不会做 —— 它是自动化投放脚本的产物：脚本转发广告频道消息，
+// 再随机附一个字母绕过「纯转发」类过滤。
+//
+// 必须与 detectAdOnMessage 的零成本预筛用同一个函数，否则预筛把消息挡在门外，
+// 这条判据在 evaluateAdSuspect 里永远跑不到。
+function scoreAdMessageContext(text, forwardChat) {
+	const reasons = [];
+	let score = 0;
+	// 本判据的构成要素之一就是「有转发来源」，属于被主人关闭的频道 / 群组维度，
+	// 故随 AD_FORWARD_JUDGE_ENABLED 一并停用。见该常量说明。
+	if (!AD_FORWARD_JUDGE_ENABLED) return { score: 0, reasons: [], disabled: true };
+	const hasForward = Boolean(forwardChat && (forwardChat.title || forwardChat.username));
+	if (hasForward && isAdMinimalText(text)) {
+		score += AD_MINIMAL_TEXT_FORWARD_SCORE;
+		reasons.push('+' + AD_MINIMAL_TEXT_FORWARD_SCORE + ' 转发来源 + 正文仅 '
+			+ String(text ?? '').replace(/\s+/g, '').length + ' 字（自动投放特征）');
+	}
+	return { score, reasons };
+}
+
+// === 第二层：D1 指纹库 ===
+// 测试沙箱不注入 crypto，所以哈希必须是纯 JS。这里用双 32 位 FNV-1a 变体拼成 64 位十六进制，
+// 只做去重键用途，不承担任何安全属性。
+function adTextHash(text) {
+	const source = String(text ?? '');
+	let h1 = 0x811c9dc5;
+	let h2 = 0x01000193;
+	for (let i = 0; i < source.length; i++) {
+		const c = source.charCodeAt(i);
+		h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+		h2 = (Math.imul(h2 ^ c, 0x85ebca6b) + i + 1) >>> 0;
+	}
+	return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
+}
+
+// 指纹值归一化：折叠空白、去零宽字符、小写化，让 `高价 收 号` 与 `高价收号` 命中同一条。
+function normalizeAdFingerprintValue(value) {
+	return String(value ?? '')
+		.replace(/[\u200B-\u200D\uFEFF]/g, '')
+		.replace(/\s+/g, ' ')
+		.trim()
+		.toLowerCase()
+		.slice(0, 200);
+}
+
+// \u3010\u5355\u4E1A\u52A1\u8BCD\u6307\u7EB9\u5224\u5B9A\uFF082026-09-09 \u4E3B\u4EBA\u4E0B\u4EE4\uFF0CP1 \u5355\u8BCD\u4E0D\u5C01\uFF09\u3011
+// \u5224\u5B9A\u6807\u51C6\uFF1Anormalized \u6070\u7B49\u4E8E AD_BUSINESS_KEYWORDS \u4E2D\u67D0\u4E00\u4E2A\u8BCD\u7684\u5F52\u4E00\u5316\u7ED3\u679C\u3002
+// \u4F8B\uFF1A\u6307\u7EB9 value='usdt' / '\u4EF7\u683C\u8868' / '\u4EE3\u7EC3' \u2014\u2014 \u8FD9\u7C7B\u8BCD\u5355\u4E2A\u51FA\u73B0\u65E0\u6CD5\u533A\u5206\u6B63\u5E38\u804A\u5929\u4E0E\u5E7F\u544A
+// \uFF08\u6B63\u5E38\u7528\u6237\u4E5F\u4F1A\u8BF4\u300CUSDT \u4ECA\u5929\u4EF7\u683C\u4E0D\u9519\u300D\u300C\u4EE3\u7EC3\u4E0A\u5206\u300D\uFF09\uFF0C\u547D\u4E2D\u53EA\u8BA1\u5206\u3001\u4E0D\u6784\u6210\u5C01\u7981\u3002
+// \u5FC5\u987B\u5728\u300C\u62DB\u63FD\u52A8\u8BCD \u2227 \u4E1A\u52A1\u8BCD\u300D\u7EC4\u5408\uFF08\u7ED3\u6784\u901A\u9053\uFF09\u6216\u4F5C\u4E3A\u5B8C\u6574\u77ED\u8BED\u4E00\u90E8\u5206\u65F6\u624D\u5B9A\u7F6A\u3002
+// \u5B8C\u6574\u77ED\u8BED / \u79CD\u5B50\u6307\u7EB9\uFF08\u5982\u300C\u4E13\u4E1A\u5316\u6536\u8D2D\u6E38\u620F\u53F7\u300D\u300C\u79D2\u7ED3\u4E0D\u62D6\u6B20\u300D\uFF09\u4E0D\u7B49\u4E8E\u4EFB\u4F55\u5355\u4E2A\u4E1A\u52A1\u8BCD\uFF0C
+// singleWord=false\uFF0C\u4FDD\u6301\u539F\u5C01\u7981\u529B\uFF0C\u4E0D\u53D7\u672C\u89C4\u5219\u5F71\u54CD\u3002
+//
+// \u7F13\u5B58\u4E00\u6B21\u6784\u5EFA\uFF1A\u8BCD\u8868\u56FA\u5B9A\uFF0C\u65E0\u9700\u6BCF\u6B21\u8C03\u7528\u91CD\u5EFA\u3002\u653E\u6A21\u5757\u7EA7\u95ED\u5305\uFF0CnormalizeAdFingerprintValue
+// \u5728\u51FD\u6570\u8FD0\u884C\u671F\u5DF2\u5B9A\u4E49\uFF08\u6B64\u5904\u53EA\u5728\u51FD\u6570\u5185\u90E8\u8C03\u7528\uFF0C\u4E0D\u4F9D\u8D56\u6A21\u5757\u521D\u59CB\u5316\u987A\u5E8F\uFF09\u3002
+let _singleBusinessWordSet = null;
+function isSingleBusinessWordFingerprint(normalized) {
+	if (!normalized) return false;
+	if (!_singleBusinessWordSet) {
+		_singleBusinessWordSet = new Set(
+			AD_BUSINESS_KEYWORDS.map((w) => normalizeAdFingerprintValue(w)).filter(Boolean)
+		);
+	}
+	return _singleBusinessWordSet.has(normalized);
+}
+
+function adFingerprintKey(type, value) {
+	return adTextHash(String(type || 'keyword') + ':' + normalizeAdFingerprintValue(value));
+}
+
+function computeAdFingerprintConfidence(matchCount, falsePositiveCount) {
+	const hits = Math.max(0, Number(matchCount) || 0);
+	const misses = Math.max(0, Number(falsePositiveCount) || 0);
+	if (hits + misses === 0) return 1;
+	return hits / (hits + misses);
+}
+
+// 读取全部指纹（60 秒缓存）。条数上限 500，防止指纹库被刷爆后每条消息都全表扫描。
+async function loadAdFingerprints(env) {
+	if (!env?.DB) return [];
+	try {
+		const value = await loadAdCachedValue(AD_FINGERPRINT_CACHE, env.DB, AD_FINGERPRINT_CACHE_TTL_MS, async () => {
+			if (!(await adDetectionReady(env))) return [];
+			const { results } = await env.DB.prepare(
+				'SELECT fingerprint, type, value, weight, match_count, false_positive_count, confidence, source FROM ad_fingerprints ORDER BY confidence DESC, match_count DESC LIMIT 500'
+			).all();
+			return (results || []).map((row) => ({
+				fingerprint: String(row.fingerprint || ''),
+				type: String(row.type || 'keyword'),
+				value: String(row.value || ''),
+				normalized: normalizeAdFingerprintValue(row.value),
+				weight: Number(row.weight) || 1,
+				matchCount: Number(row.match_count) || 0,
+				falsePositiveCount: Number(row.false_positive_count) || 0,
+				confidence: Number.isFinite(Number(row.confidence)) ? Number(row.confidence) : 1,
+				source: String(row.source || ''),
+				// 【P1 单词不封】归一化后恰等于单个业务关键词的指纹标记为单业务词，
+				// 命中只计分、不单独构成封禁（见 evaluateAdSuspect 的 fingerprintBan）。
+				singleWord: isSingleBusinessWordFingerprint(normalizeAdFingerprintValue(row.value))
+			})).filter((row) => row.normalized);
+		});
+		return Array.isArray(value) ? value : [];
+	} catch (error) {
+		console.error('[广告检测] 读取指纹库失败:', error);
+		return [];
+	}
+}
+
+// 指纹匹配。domain 型走白名单同源判定，其余型做子串包含。
+// 命中后异步累加 match_count，不阻塞判定链路。
+async function matchAdFingerprints(env, payload, options = {}) {
+	const config = options.config || loadAdDetectionConfig(env);
+	const fingerprints = await loadAdFingerprints(env);
+	if (!fingerprints.length) return { score: 0, hits: [], maxWeight: 0, nonSingleMaxWeight: 0 };
+
+	// 【方案 A】haystack 去掉 payload.username —— 资料卡只看昵称 + 简介 + 正文。
+	// 用户名不参与任何指纹匹配，从匹配端也断掉这一维度。
+	const haystack = normalizeAdFingerprintValue([
+		payload?.name, payload?.bio, payload?.text
+	].filter(Boolean).join(' '));
+	const domains = new Set((payload?.domains || []).map((d) => normalizeAdDomain(d)).filter(Boolean));
+
+	const hits = [];
+	let maxWeight = 0;
+	let nonSingleMaxWeight = 0; // 非单业务词命中的最大权重 —— P1：只有它才能构成指纹级封禁
+	for (const row of fingerprints) {
+		if (row.confidence < config.fingerprintMinConfidence) continue;
+		// username 型指纹只比对账号自身 handle，不扫 haystack（昵称/简介/正文）。
+		// 广告号自己命中 → 封；正常人文字里艾特广告号 → 不命中、不误封。
+		if (row.type === 'username') {
+			const selfHandle = normalizeAdFingerprintValue('@' + (payload?.username || ''));
+			if (selfHandle.length <= 1 || selfHandle !== row.normalized) continue;
+			hits.push(row);
+			if (row.weight > maxWeight) maxWeight = row.weight;
+			if (!row.singleWord && row.weight > nonSingleMaxWeight) nonSingleMaxWeight = row.weight;
+			if (hits.length >= 8) break;
+			continue;
+		}
+		let matched = false;
+		if (row.type === 'domain') {
+			for (const domain of domains) {
+				if (domain === row.normalized || domain.endsWith('.' + row.normalized)) { matched = true; break; }
+			}
+		} else {
+			matched = haystack.includes(row.normalized);
+		}
+		if (!matched) continue;
+		hits.push(row);
+		if (row.weight > maxWeight) maxWeight = row.weight;
+		// 单业务词命中（如 value='usdt'、'价格表'）只计分，不参与封禁权重判定。
+		if (!row.singleWord && row.weight > nonSingleMaxWeight) nonSingleMaxWeight = row.weight;
+		if (hits.length >= 8) break;
+	}
+	if (!hits.length) return { score: 0, hits: [], maxWeight: 0, nonSingleMaxWeight: 0 };
+
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		await env.DB.batch(hits.map((row) => env.DB
+			.prepare('UPDATE ad_fingerprints SET match_count = match_count + 1, confidence = CAST(match_count + 1 AS REAL) / (match_count + 1 + false_positive_count), updated_at = ? WHERE fingerprint = ?')
+			.bind(now, row.fingerprint)));
+		AD_FINGERPRINT_CACHE.delete(env.DB);
+	} catch (error) {
+		console.error('[广告检测] 指纹命中计数失败:', error);
+	}
+	return { score: AD_FINGERPRINT_HIT_SCORE * Math.min(2, hits.length), hits, maxWeight, nonSingleMaxWeight };
+}
+
+// 从判定载荷里抽取可入库的指纹候选。
+// 只抽「结构上稳定」的片段：带对称 emoji 的整名、交易动词短语、非白名单域名、被提及的引流账号。
+function extractAdFingerprintCandidates(payload, whitelistSet) {
+	const candidates = [];
+	// 按 type 分配配额，而不是先到先得抢同一个 12 条池子。
+	// 起因：长简介广告号（如「长期收购…老账号优先加价…进群联系 @x 或 evil-shop.top」）
+	// 会在交易动词 / 业务词周边截出十几条 keyword 短语，把配额吃干，
+	// 排在后面抽取的 domain 与 username 一条都进不去 —— 而这两类恰恰是最稳定的强指纹
+	//（权重 1 / 0.8，单条即可定罪；广告团伙换名换简介，但域名和 @handle 常年复用）。
+	// keyword 数量最多、单条最弱（24 字截断短语），理应让位。
+	// 原注释「放在提及扫描之前入库，避免被文本里的引流账号把上限占满」防的是
+	// username 内部互相挤占，没防到 keyword 跨类挤占，这里一并解决。
+	// username 配额恢复为 2：只学账号自身 handle，@提及扫描路径保持删除（#143 根因，永不恢复）。
+	const AD_FINGERPRINT_QUOTA = { keyword: 6, bio: 1, domain: 3, username: 2 };
+	const push = (type, value, weight) => {
+		const normalized = normalizeAdFingerprintValue(value);
+		if (!normalized || normalized.length < 2) return;
+		// 【权限人 username 永不学习】放在 push 最前面，覆盖【全部类型、全部抽取路径】
+		// —— keyword 短语、整段正文兜底、bio、domain 一个都不漏。
+		// 拦在这里而不是拦在 learnAdFingerprints：那里只对 source='auto' 生效，
+		// 而 /spam 人工提交（source='spam'）恰恰是绕过豁免词闸门的那条路，必须一并堵住。
+		// 原值与归一化值都查一遍：归一化可能改写大小写或剥符号，两边都比对才不留缝。
+		if (containsAdProtectedUsername(value) || containsAdProtectedUsername(normalized)) return;
+		// 同 type 同值去重：【取较高权重】而不是丢弃后来者。
+		// 【2026-09-10 修正】原实现直接 return，配合 keyword 短语降权(1→0.5)后出了个新缺陷：
+		// 短语路径截 24 字，短正文（≤24 字）会截出与「整段正文兜底」完全相同的串，
+		// 而短语先跑一步以 0.5 占位 → 后面权重 1 的整段兜底被静默丢弃。
+		// 净效果是「同一段广告文案第二次出现即秒杀」这条能力被降权连带废掉
+		// —— 整段兜底是归一化后精确相等才命中、误伤面极小，恰恰是最该保住权重 1 的一条。
+		// 取 max 后：短正文拿回权重 1（精确匹配定罪），长正文的短语片段仍是 0.5（只计分）。
+		const dup = candidates.find((c) => c.type === type && normalizeAdFingerprintValue(c.value) === normalized);
+		if (dup) {
+			if (Number(weight) > Number(dup.weight)) dup.weight = Number(weight);
+			return;
+		}
+		// 未列入配额表的 type 不设限（当前 AD_FINGERPRINT_TYPES 四类已全覆盖，
+		// 此处为将来新增 type 时的安全默认：宁可放进去，不要静默丢弃）。
+		const quota = AD_FINGERPRINT_QUOTA[type];
+		if (quota != null && candidates.filter((c) => c.type === type).length >= quota) return;
+		candidates.push({ type, value: String(value).slice(0, 200), weight });
+	};
+
+	const name = String(payload?.name ?? '').trim();
+	if (name && (AD_SYMMETRIC_EMOJI_RE.test(name) || AD_NUMERIC_PREFIX_RE.test(name))) push('keyword', name, 1);
+
+	const combined = [payload?.name, payload?.bio, payload?.text].filter(Boolean).join('\n');
+	// 交易动词与业务关键词【两类】周边都截短语。
+	// 此前只截交易动词周边，于是「操逼赚钱，招探花9000一单，提供设备」这种一个交易动词都不命中的
+	// 正文抽不出任何候选，learnAdFingerprints 直接返回 no_candidate —— 线上表现为「指纹 +0」，
+	// 连 /spam 人工提交也救不回来，同款文案会无限次重放。
+	for (const word of [
+		...countAdKeywordHits(combined, AD_TRADE_VERBS),
+		...countAdKeywordHits(combined, AD_BUSINESS_KEYWORDS)
+	]) {
+		const index = combined.toLowerCase().indexOf(String(word).toLowerCase());
+		if (index === -1) continue;
+		const phrase = combined.slice(index, index + 24).split(/[\n\r]/)[0].trim();
+		// 【2026-09-10 权重 1 → 0.5】按词截取的 24 字短语是【机器切出来的片段】，
+		// 起点由词表命中位置决定、终点是硬截断，语义完整性没有任何保证。
+		// 线上 #69 学出 `[keyword] 月入怀来` 就是这么来的 —— 「月入」命中业务词，
+		// 往后截 24 字碰上「怀来」（河北县名），拼成一条既非广告、又会命中
+		// 任何提到该地名的正常发言的指纹。权重 1 让它【单条即定罪】。
+		// 降到 0.5（< AD_FINGERPRINT_BAN_WEIGHT 0.8）后这类片段只计分不定罪，
+		// 真广告仍可由「整段正文精确匹配」（下面那条，权重保持 1）秒杀，
+		// 或由结构查杀「招揽 ∧ 行业」合取兜住 —— 召回没丢，误伤面砍掉。
+		if (phrase.length >= 4) push('keyword', phrase, 0.5);
+	}
+
+	// 兜底：正文足够长时把整段（截 60 字）作为一条 keyword 指纹。
+	// 前面按词截取的短语依赖词表命中，词表永远追不上新话术；整段正文是精确匹配
+	// （normalizeAdFingerprintValue 归一化后完全相等才算命中），只会命中复制同一文案的号，
+	// 误伤面极小，但能让「同一段广告文案第二次出现即被秒杀」成立。
+	// 长度下限 12 是为了避开「有需要私聊」这类过短的通用句式。
+	const text = String(payload?.text ?? '').trim().replace(/\s+/g, ' ');
+	if (text.length >= 12) push('keyword', text.slice(0, 60), 1);
+
+	const bio = String(payload?.bio ?? '').trim();
+	if (bio.length >= 6) push('bio', bio.slice(0, 60), 0.8);
+
+	for (const domain of extractAdDomains(combined)) {
+		// 平台自身域名绝不学习：t.me 之类一旦入库，任何人分享 Telegram 链接都会命中，
+		// 且它权重给满 1（单条即可定罪）。这道判断独立于用户白名单，不可被误删绕过。
+		if (isAdPlatformDomain(domain)) continue;
+		if (!isAdDomainWhitelisted(domain, whitelistSet)) push('domain', domain, 1);
+	}
+
+	// 账号自身 handle 学习：只学 payload.username，不扫正文 @提及（那是 #143 根因，永不恢复）。
+	// matchAdFingerprints 侧只比对 payload.username 字段，正文里艾特同一 handle 不会命中，
+	// 解决「正常人艾特广告号/管理员被误封」问题，同时保留广告号自身 handle 的召回。
+	// Telegram handle 规则：5-32 字符、只含 [a-zA-Z0-9_]，不符合的不是合法账号名，跳过。
+	const selfUsername = String(payload?.username ?? '').replace(/^@+/, '').trim();
+	if (selfUsername.length >= 5 && /^[a-zA-Z0-9_]+$/.test(selfUsername)) {
+		push('username', '@' + selfUsername, 0.8);
+	}
+
+	// 配额之和恰为 12，slice 只是防御性兜底。
+	return candidates.slice(0, 12);
+}
+
+// 自动学习指纹。
+//
+// 【2026-09-08 拆掉「必须含强交易动词」闸门】主人定的口径：
+// 「已经确定并执行封禁的是自动学习指纹广告类型特征的，除非说误判了，我就可以通过指定的
+//   指令执行全群解封并给指纹记误报 + 删除记录的指纹。」
+//
+// 原实现在 source='auto' 时要求载荷含 AD_TRADE_VERBS 里的强动词，否则直接返回
+// reason: 'no_trade_verb' 一条也不学。这道闸门造成一个逻辑死结：
+//   · source='auto' 的唯一调用点是 enforceAdDetection，而那里【只在已定罪时才调用】；
+//   · 第三层 AI 定罪时 structure.guilty 为 false，闸门生效；
+//   · 可 AI 层的价值恰恰在于抓词表外的新变体 —— 新变体几乎必然不含词表里的强动词。
+// 净效果是「AI 越有用，指纹库学到的越少」，与主人「AI 通过 spam 自我学习、
+// 学到的特征沉淀成指纹」的设计完全相反。
+//
+// 拆掉闸门后仍有三层纠错兜底，不是无脑放开：
+//   1) 下面的豁免词闸门仍然只对 source='auto' 生效，坑词（「代理 官方中文」那类）进不来；
+//   2) 学进来的是 source='auto'，受 markAdFingerprintFalsePositive 的误报退役机制约束
+//      —— manual 才享有退役豁免；
+//   3) /ignore 一次即删该号带来的全部指纹（同批改动的项 4）。
+// 手动来源（/addword、/spam、/unban 回滚）本来就不走这段逻辑。
+async function learnAdFingerprints(env, payload, options = {}) {
+	if (!(await adDetectionReady(env))) return { ok: false, learned: 0, reason: 'unavailable' };
+	const source = String(options.source || 'auto');
+	const whitelistSet = options.whitelist instanceof Set ? options.whitelist : await loadAdDomainWhitelist(env);
+
+	const candidates = extractAdFingerprintCandidates(payload, whitelistSet);
+	if (!candidates.length) return { ok: true, learned: 0, reason: 'no_candidate' };
+
+	// ===== 豁免词闸门（2026-09-08 新增）=====
+	// 线上自动学习学出了 `[keyword] 代理 官方中文` 这条坑词。指纹层是【命中即封】、
+	// 不走豁免词减分，所以把词加进 AD_EXEMPT_KEYWORDS 治不了它 —— 唯一的治法是
+	// 一开始就不许学进去，否则 /delword 删掉之后下一次自动学习又会原样学回来。
+	//
+	// 闸门刻意开得很窄，三重限制，为的是不伤召回（主人的硬要求：不要放过任何一个真广告）：
+	//   1) 只作用于 source='auto' —— /spam、/addword、/unban 回滚这些【人工判定】路径一律不拦，
+	//      主人说过「全部交给有权限的人来判定」，人工确认的东西不该被自动规则否决；
+	//   2) 只作用于 keyword 类候选 —— bio / domain / username 三类是最稳定的强指纹，
+	//      线上命中最多的那条 `[bio] https://t.me/... 加群看项目 一天赚8千!` 正是 bio 类，
+	//      而 t.me 现已是豁免词，若一并过滤等于把最有效的指纹废掉；
+	//   3) 短语里只要同时含强交易动词或业务关键词就放行 —— 那是「真广告夹带技术术语」，
+	//      不是坑词（例：「收购 vless 账号」含豁免词 vless，但必须学）。
+	const isExemptOnlyKeyword = (c) => {
+		if (c.type !== 'keyword') return false;
+		const value = String(c.value || '');
+		if (!countAdKeywordHits(value, AD_EXEMPT_KEYWORDS).length) return false;
+		if (countAdKeywordHits(value, AD_TRADE_VERBS).length) return false;
+		if (countAdKeywordHits(value, AD_BUSINESS_KEYWORDS).length) return false;
+		return true;
+	};
+	const learnable = source === 'auto' ? candidates.filter((c) => !isExemptOnlyKeyword(c)) : candidates;
+	if (!learnable.length) return { ok: true, learned: 0, reason: 'exempt_only' };
+
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		const statements = learnable.map((c) => env.DB.prepare(
+			'INSERT INTO ad_fingerprints (fingerprint, type, value, weight, match_count, false_positive_count, confidence, source, created_by, created_at, updated_at) '
+			+ 'VALUES (?, ?, ?, ?, 0, 0, 1, ?, ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET '
+			+ 'match_count = match_count + 1, updated_at = excluded.updated_at, '
+			+ 'confidence = CAST(match_count + 1 AS REAL) / (match_count + 1 + false_positive_count), '
+			// 只提权不降权：/spam 以 manual 再学一遍，已 auto 入库的指纹才能真正拿到
+			// 退役豁免（markAdFingerprintFalsePositive 默认档的 DELETE 带 source != 'manual'；
+			// /ignore 的即删档不认这道豁免，那是主人明确表态的误判，见该函数说明）；
+			// 反向的 auto 覆盖 manual 必须禁止，否则主人手工确认的指纹会被自动学习悄悄降级。
+			+ "source = CASE WHEN excluded.source = 'manual' THEN 'manual' ELSE source END"
+		).bind(
+			adFingerprintKey(c.type, c.value), c.type, c.value, c.weight,
+			source, String(options.createdBy ?? ''), now, now
+		));
+		await env.DB.batch(statements);
+		AD_FINGERPRINT_CACHE.delete(env.DB);
+		return { ok: true, learned: learnable.length, candidates: learnable };
+	} catch (error) {
+		console.error('[广告检测] 学习指纹失败:', error);
+		return { ok: false, learned: 0, reason: 'error' };
+	}
+}
+
+// /addword 底层：手动加一条指纹。type 缺省按值形态推断。
+async function addAdFingerprint(env, rawValue, options = {}) {
+	const value = String(rawValue ?? '').trim();
+	if (value.length < 2) return { ok: false, reason: 'too_short' };
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+
+	let type = String(options.type || '').trim().toLowerCase();
+	if (!AD_FINGERPRINT_TYPES.includes(type)) {
+		// 【方案 A】以 @ 开头不再推断为 username 型 —— username 维度已整体下线，
+		// 推断出来也不会被 matchAdFingerprints 匹配，等于静默写入一条死数据。
+		// 落到 keyword：@handle 作为普通子串参与昵称/简介/正文匹配，
+		// 权重由下面统一给 1，仍能定罪，但主人是显式手工添加、心里有数。
+		if (normalizeAdDomain(value)) type = 'domain';
+		else type = 'keyword';
+	}
+	const storedValue = type === 'domain' ? normalizeAdDomain(value) : value.slice(0, 200);
+	if (!storedValue) return { ok: false, reason: 'invalid' };
+
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		const fingerprint = adFingerprintKey(type, storedValue);
+		const existing = await env.DB.prepare('SELECT fingerprint FROM ad_fingerprints WHERE fingerprint = ?').bind(fingerprint).first();
+		await env.DB.prepare(
+			'INSERT INTO ad_fingerprints (fingerprint, type, value, weight, match_count, false_positive_count, confidence, source, created_by, created_at, updated_at) '
+			+ 'VALUES (?, ?, ?, ?, 0, 0, 1, ?, ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET '
+			+ 'weight = excluded.weight, false_positive_count = 0, confidence = 1, source = excluded.source, updated_at = excluded.updated_at'
+		).bind(fingerprint, type, storedValue, 1, 'manual', String(options.createdBy ?? ''), now, now).run();
+		AD_FINGERPRINT_CACHE.delete(env.DB);
+		return { ok: true, type, value: storedValue, existed: Boolean(existing) };
+	} catch (error) {
+		console.error('[广告检测] 添加指纹失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+// /delword 底层：按原文或归一化值删除，跨 type 一并清掉。
+async function removeAdFingerprint(env, rawValue) {
+	const value = String(rawValue ?? '').trim();
+	if (!value) return { ok: false, reason: 'invalid' };
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const normalized = normalizeAdFingerprintValue(value);
+		const result = await env.DB
+			.prepare('DELETE FROM ad_fingerprints WHERE value = ? OR LOWER(TRIM(value)) = ?')
+			.bind(value.slice(0, 200), normalized).run();
+		AD_FINGERPRINT_CACHE.delete(env.DB);
+		return { ok: true, removed: Number(result?.meta?.changes || 0) };
+	} catch (error) {
+		console.error('[广告检测] 删除指纹失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+// /delword 的批量筛选口径（2026-09-08 新增）。
+//
+// 主人的原话：「我觉得指令可以支持批量删除，可以通过现有的指令库来执行批量删除号。」
+// 线上的实际需求来自 /words 三页 58 条的现状：大量 `[username] @xxx` 单账号指纹命中 0 次
+// —— 换个号就失效，纯占位噪声，一条条 /delword 打 40 多次不现实。
+//
+// 刻意只给「按元数据删」这两种，不做按值模糊匹配：
+//   · noise —— 命中 0 次的，也就是学进来之后从没再抓到过谁的；
+//   · type:username / type:keyword / type:domain / type:bio —— 整类清掉。
+// 模糊匹配（比如 /delword *赚钱*）看着方便，但一个手滑的通配符能把高命中的核心指纹
+// 连带删掉，而指纹库没有回收站。要删特定值就老老实实单条删。
+//
+// 【一律排除 source='seed'】那些是主人亲手定的中心特征，补灌判空条件是「数 source='seed'
+// 的条数」（seedAdDetectionData）—— 只要库里还剩一条种子，被删掉的那条重新部署也不会补回来，
+// 一次批量操作就能永久削掉中心特征。要删种子请用 /delword <原值> 单条删。
+function buildAdFingerprintBulkFilter(rawArg) {
+	const arg = String(rawArg ?? '').trim();
+	const lower = arg.toLowerCase();
+	if (lower === 'noise' || arg === '噪声' || arg === '噪音') {
+		return {
+			ok: true,
+			key: 'noise',
+			label: '命中 0 次的噪声指纹',
+			where: "match_count = 0 AND COALESCE(source, '') != 'seed'",
+			binds: []
+		};
+	}
+	const typeMatch = arg.match(/^type[:：]\s*([A-Za-z_]{1,20})$/i);
+	if (typeMatch) {
+		const type = typeMatch[1].toLowerCase();
+		if (!AD_FINGERPRINT_TYPES.includes(type)) return { ok: false, reason: 'bad_type', type };
+		return {
+			ok: true,
+			key: 'type:' + type,
+			label: '类型为 ' + type + ' 的指纹',
+			where: "type = ? AND COALESCE(source, '') != 'seed'",
+			binds: [type]
+		};
+	}
+	// 不是批量写法 → 交回给「按值删单条」的原路径，行为一个字都没变。
+	return null;
+}
+
+// 批量删除前的预览：数出条数并取样几条给主人过目。
+// 破坏性操作必须先让主人看见【将要删什么】，再签令牌 —— 只报个数字他无从判断。
+async function previewAdFingerprintBulkDelete(env, filter) {
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const countRow = await env.DB
+			.prepare('SELECT COUNT(*) AS c FROM ad_fingerprints WHERE ' + filter.where)
+			.bind(...filter.binds).first();
+		const { results } = await env.DB
+			.prepare('SELECT type, value, match_count, source FROM ad_fingerprints WHERE ' + filter.where
+				+ ' ORDER BY match_count DESC, id ASC LIMIT 10')
+			.bind(...filter.binds).all();
+		return { ok: true, total: Number(countRow?.c) || 0, rows: results || [] };
+	} catch (error) {
+		console.error('[广告检测] 预览批量删除指纹失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+// 执行批量删除。where 由 buildAdFingerprintBulkFilter 生成、绝不来自主人输入的拼接，
+// 令牌里也只存筛选 key（consume 后重新 build），SQL 片段不进 D1 的 payload。
+async function bulkDeleteAdFingerprints(env, filter) {
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const result = await env.DB
+			.prepare('DELETE FROM ad_fingerprints WHERE ' + filter.where)
+			.bind(...filter.binds).run();
+		AD_FINGERPRINT_CACHE.delete(env.DB);
+		return { ok: true, removed: Number(result?.meta?.changes || 0) };
+	} catch (error) {
+		console.error('[广告检测] 批量删除指纹失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+// 误判纠错：把命中该载荷的指纹逐条累加 false_positive_count 并重算置信度。
+//
+// 两种档位：
+//   · 默认（options.purge 不为 true）：只累加误报，置信度跌破 0.2 且累计 3 次误判才退役，
+//     且 source='manual' 豁免退役。这是被动噪声清理，用于没有主人明确表态的场合。
+//   · options.purge === true（/ignore 走这一档）：主人已经明确说「这是误判」，
+//     命中的指纹【当次即删】，不再攒 3 次，manual 也不豁免。
+//     主人原话：「除非说误判了，我就可以通过指定的指令执行全群解封并给指纹记误报 +
+//     删除记录的指纹。」同批改动拆掉了自动学习的强动词闸门，指纹库写入变宽，
+//     纠错端必须同步变快 —— 只开闸不加强纠错是净损失。
+//
+// ⚠️ 即删档【刻意保留 source='seed' 的例外】：那 33 条是主人亲手定的中心特征，
+// 判空条件是「数 source='seed' 的条数」（seedAdDetectionData），只要库里还剩一条种子，
+// 被删掉的那条重新部署也不会补回来 —— 一次手滑就永久丢一条中心特征。
+// 种子仍然照旧累加误报，走原来的「置信度 < 0.2 且误报 ≥ 3 次」自动退役通道，
+// 也就是说选词失手的种子最终还是会被清掉，只是需要三次而不是一次。
+async function markAdFingerprintFalsePositive(env, payload, options = {}) {
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	const purge = options.purge === true;
+	const fingerprints = await loadAdFingerprints(env);
+	if (!fingerprints.length) return { ok: true, affected: 0, retired: 0 };
+
+	const haystack = normalizeAdFingerprintValue([
+		payload?.name, payload?.username, payload?.bio, payload?.text
+	].filter(Boolean).join(' '));
+	const domains = new Set((payload?.domains || []).map((d) => normalizeAdDomain(d)).filter(Boolean));
+
+	const affected = fingerprints.filter((row) => {
+		if (row.type === 'domain') {
+			for (const domain of domains) {
+				if (domain === row.normalized || domain.endsWith('.' + row.normalized)) return true;
+			}
+			return false;
+		}
+		if (row.type === 'username') {
+			const target = row.normalized.replace(/^@/, '');
+			return Boolean(target) && haystack.includes('@' + target);
+		}
+		return haystack.includes(row.normalized);
+	});
+	if (!affected.length) return { ok: true, affected: 0, retired: 0 };
+
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		// 误报计数一律先累加（含种子）—— 即删档下这一步对被删的行是白做，
+		// 但对留下来的种子是它未来自动退役的唯一凭据，不能跳。
+		await env.DB.batch(affected.map((row) => env.DB
+			.prepare('UPDATE ad_fingerprints SET false_positive_count = false_positive_count + 1, confidence = CAST(match_count AS REAL) / (match_count + false_positive_count + 1), updated_at = ? WHERE fingerprint = ?')
+			.bind(now, row.fingerprint)));
+		let retiredCount = 0;
+		if (purge) {
+			const purgeable = affected.filter((row) => String(row.source || '') !== 'seed');
+			if (purgeable.length) {
+				const results = await env.DB.batch(purgeable.map((row) => env.DB
+					.prepare('DELETE FROM ad_fingerprints WHERE fingerprint = ?').bind(row.fingerprint)));
+				for (const r of results || []) retiredCount += Number(r?.meta?.changes || 0);
+			}
+			// 种子不即删，但仍要给它们跑一次原退役条件：三次误报攒满的那一刻在这里生效。
+			const seedRetired = await env.DB
+				.prepare("DELETE FROM ad_fingerprints WHERE confidence < 0.2 AND false_positive_count >= 3 AND source = 'seed'")
+				.run();
+			retiredCount += Number(seedRetired?.meta?.changes || 0);
+		} else {
+			const retired = await env.DB
+				.prepare('DELETE FROM ad_fingerprints WHERE confidence < 0.2 AND false_positive_count >= 3 AND source != ?')
+				.bind('manual').run();
+			retiredCount = Number(retired?.meta?.changes || 0);
+		}
+		AD_FINGERPRINT_CACHE.delete(env.DB);
+		return { ok: true, affected: affected.length, retired: retiredCount, purged: purge, rows: affected };
+	} catch (error) {
+		console.error('[广告检测] 标记误判失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+// /words 底层：分页列出指纹库。
+async function listAdFingerprints(env, options = {}) {
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable', rows: [], total: 0 };
+	const limit = Math.min(50, Math.max(1, Number(options.limit) || 20));
+	const offset = Math.max(0, Number(options.offset) || 0);
+	// keyword：【只匹配 value 一列】。主人明确定的口径 —— source 不参与匹配。
+	// 理由：source 只有 seed / auto / manual 三个值，拿它做模糊匹配等于把整类指纹一次性捞出来，
+	// 而这个功能的用途是「找出某个词相关的指纹并挑掉误封的那条」，按来源筛没有意义。
+	const keyword = String(options.keyword || '').trim();
+	// LIKE 通配符必须转义成字面量，否则搜「50%」会被 SQLite 读成「50 + 任意字符」，
+	// 搜「_」更是匹配全库任意单字符 —— 主人是拿它筛误封指纹的，多捞出来就等于误删。
+	const likeArg = keyword ? '%' + keyword.replace(/[\\%_]/g, '\\$&') + '%' : null;
+	const where = keyword ? " WHERE value LIKE ? ESCAPE '\\'" : '';
+	try {
+		const totalStmt = env.DB.prepare('SELECT COUNT(*) AS c FROM ad_fingerprints' + where);
+		const totalRow = await (keyword ? totalStmt.bind(likeArg) : totalStmt).first();
+		const listStmt = env.DB.prepare(
+			'SELECT type, value, weight, match_count, false_positive_count, confidence, source, created_at FROM ad_fingerprints'
+			+ where + ' ORDER BY match_count DESC, created_at DESC LIMIT ? OFFSET ?'
+		);
+		const { results } = await (keyword ? listStmt.bind(likeArg, limit, offset) : listStmt.bind(limit, offset)).all();
+		return {
+			ok: true,
+			keyword,
+			total: Number(totalRow?.c) || 0,
+			rows: (results || []).map((row) => ({
+				type: String(row.type || ''),
+				value: String(row.value || ''),
+				weight: Number(row.weight) || 1,
+				matchCount: Number(row.match_count) || 0,
+				falsePositiveCount: Number(row.false_positive_count) || 0,
+				confidence: Number.isFinite(Number(row.confidence)) ? Number(row.confidence) : 1,
+				source: String(row.source || ''),
+				createdAt: Number(row.created_at) || 0
+			}))
+		};
+	} catch (error) {
+		console.error('[广告检测] 列出指纹失败:', error);
+		return { ok: false, reason: 'error', rows: [], total: 0 };
+	}
+}
+
+// === 第三层：Workers AI 语义相似度 ===
+// AI 未绑定时整层跳过，检测自动降级为「评分 + 指纹」两层。
+
+function cosineSimilarity(a, b) {
+	if (!Array.isArray(a) || !Array.isArray(b)) return 0;
+	const length = Math.min(a.length, b.length);
+	if (!length) return 0;
+	let dot = 0;
+	let normA = 0;
+	let normB = 0;
+	for (let i = 0; i < length; i++) {
+		const x = Number(a[i]) || 0;
+		const y = Number(b[i]) || 0;
+		dot += x * y;
+		normA += x * x;
+		normB += y * y;
+	}
+	if (normA <= 0 || normB <= 0) return 0;
+	const value = dot / (Math.sqrt(normA) * Math.sqrt(normB));
+	return Number.isFinite(value) ? value : 0;
+}
+
+// 取文本向量。失败一律返回 null 交由上层跳过，绝不抛到检测主链路。
+async function embedAdText(env, text) {
+	const source = String(text ?? '').trim().slice(0, 512);
+	if (!source) return null;
+	if (!(env?.AI && typeof env.AI.run === 'function')) return null;
+	try {
+		const response = await env.AI.run(AD_EMBEDDING_MODEL, { text: [source] });
+		const vector = response?.data?.[0];
+		if (!Array.isArray(vector) || !vector.length) return null;
+		return vector.map((v) => Number(v) || 0);
+	} catch (error) {
+		// 必须打出 name + message：Workers AI 的 Ai._parseError 抛出的 Error 往往 message 为空，
+		// 只 console.error(error) 时日志里只有一串栈、看不到「模型不存在」这类真实原因，
+		// 曾因此把「模型 ID 写错」误判为「AI 限流」。model 也一并打出便于对照目录。
+		console.error('[广告检测] 生成文本向量失败'
+			+ ' model=' + AD_EMBEDDING_MODEL
+			+ ' name=' + (error?.name || '未知')
+			+ ' message=' + (error?.message || '（空）')
+			+ ' textLen=' + source.length);
+		return null;
+	}
+}
+
+// 样本向量懒加载：每次检测最多补 AD_SAMPLE_LAZY_BATCH（8）条待生成向量的样本，
+// 分摊到多次请求，避免首次部署时一口气跑几十次 AI 推理把单请求预算打爆。
+//
+// 【2026-09-08 去掉 30 条硬上限】原实现开头是
+//     if (readyCount >= AD_SAMPLE_TARGET_COUNT) return 0;
+// 一旦库内带向量的样本够 30 条就永久停止补齐，而 loadAdSampleEmbeddings 只读
+// WHERE embedding IS NOT NULL —— 于是第 30 条之后 /spam 学到的每一条新样本
+// embedding 永远是 NULL，【永不参与 AI 判定】。离线实测：灌 50 条样本反复补齐停在
+// 32 条，剩 18 条永久为 NULL，之后新学的样本 embedding 仍是 null。
+// 主人的口径是「AI 是通过 spam 执行自我学习的」，这个上限恰好把那条学习链切断了：
+// /spam 举报越多，指纹层越强，而 AI 的概念永远冻结在最早那 32 条上。
+// 现在改成「库里还有 NULL 就继续补」，每次仍只补 8 条，单请求成本不变。
+async function topUpAdSampleEmbeddings(env) {
+	if (!(env?.AI && typeof env.AI.run === 'function')) return 0;
+	try {
+		const { results } = await env.DB.prepare(
+			'SELECT id, sample_text FROM ad_sample_embeddings WHERE embedding IS NULL ORDER BY id ASC LIMIT ?'
+		).bind(AD_SAMPLE_LAZY_BATCH).all();
+		if (!results?.length) return 0;
+
+		let filled = 0;
+		for (const row of results) {
+			const vector = await embedAdText(env, row.sample_text);
+			if (!vector) continue;
+			await env.DB.prepare('UPDATE ad_sample_embeddings SET embedding = ?, dimension = ? WHERE id = ?')
+				.bind(JSON.stringify(vector), vector.length, row.id).run();
+			filled += 1;
+		}
+		if (filled) AD_SAMPLE_EMBEDDING_CACHE.delete(env.DB);
+		return filled;
+	} catch (error) {
+		console.error('[广告检测] 补齐样本向量失败:', error);
+		return 0;
+	}
+}
+
+// 读取样本向量（60 秒缓存）。JSON 解析失败的行直接跳过，不让脏数据阻断整层。
+async function loadAdSampleEmbeddings(env) {
+	if (!env?.DB) return [];
+	try {
+		const value = await loadAdCachedValue(AD_SAMPLE_EMBEDDING_CACHE, env.DB, AD_FINGERPRINT_CACHE_TTL_MS, async () => {
+			if (!(await adDetectionReady(env))) return [];
+			// 【2026-09-08 拆成「种子全量 + 最新学习样本」两段】
+			// 旧实现是 ORDER BY id ASC LIMIT AD_SAMPLE_TARGET_COUNT * 2（= 60 条）。
+			// 配合去掉向量补齐上限之后，这个 60 条会变成新的天花板：种子 + 中心特征已占约 34 条，
+			// /spam 学到第 27 条新样本之后，再学的样本【即使有向量也读不进来】—— 而且因为
+			// ORDER BY id ASC，被丢掉的恰好是最新、最贴近当前广告形态的那批。
+			//
+			// 新口径分两段：
+			//   1) source = seed / seed-core 的中心特征全部载入，不受条数限制；
+			//   2) 其余（spam / confirm / addsample 等学习来的）取 id 最大的 N 条，也就是最新的。
+			// COALESCE 是因为建表时 source 允许 NULL，老数据可能没写 source，
+			// 直接用 source NOT IN (...) 会因 NULL 比较返回 NULL 而把这些行整条漏掉。
+			const { results } = await env.DB.prepare(
+				"SELECT sample_text, embedding FROM ad_sample_embeddings "
+				+ "WHERE embedding IS NOT NULL AND COALESCE(source, '') IN ('seed', 'seed-core') "
+				+ "UNION ALL "
+				+ "SELECT sample_text, embedding FROM ("
+				+ "SELECT sample_text, embedding, id FROM ad_sample_embeddings "
+				+ "WHERE embedding IS NOT NULL AND COALESCE(source, '') NOT IN ('seed', 'seed-core') "
+				+ "ORDER BY id DESC LIMIT ?"
+				+ ")"
+			).bind(AD_SAMPLE_LEARNED_QUERY_LIMIT).all();
+			const rows = [];
+			for (const row of results || []) {
+				try {
+					const vector = JSON.parse(String(row.embedding));
+					if (Array.isArray(vector) && vector.length) rows.push({ text: String(row.sample_text || ''), vector });
+				} catch { /* 脏样本跳过 */ }
+			}
+			return rows;
+		});
+		return Array.isArray(value) ? value : [];
+	} catch (error) {
+		console.error('[广告检测] 读取样本向量失败:', error);
+		return [];
+	}
+}
+
+// 语义相似度判定。返回最高相似度与命中的样本原文，供通知展示判定依据。
+async function checkAdAiSimilarity(env, text, options = {}) {
+	const config = options.config || loadAdDetectionConfig(env);
+	if (!config.aiEnabled) return { available: false, similarity: 0, sample: null };
+	const source = String(text ?? '').trim();
+	if (source.length < 4) return { available: true, similarity: 0, sample: null };
+
+	await topUpAdSampleEmbeddings(env);
+	const samples = await loadAdSampleEmbeddings(env);
+	if (!samples.length) return { available: true, similarity: 0, sample: null };
+
+	const vector = await embedAdText(env, source);
+	if (!vector) return { available: true, similarity: 0, sample: null };
+
+	let best = 0;
+	let bestSample = null;
+	let skippedDim = 0;
+	for (const sample of samples) {
+		// 维度守卫：cosineSimilarity 用 Math.min(a.length, b.length) 截断，维度不一致时会
+		// 静默算出一个无意义的相似度，可能随机越过阈值造成误封。换模型后库里必然残留旧维度向量
+		// （本项目就从 768 维换到 1024 维），所以这里必须显式跳过而不是让它算。
+		if (sample.vector.length !== vector.length) { skippedDim += 1; continue; }
+		const similarity = cosineSimilarity(vector, sample.vector);
+		if (similarity > best) { best = similarity; bestSample = sample.text; }
+	}
+	if (skippedDim > 0) {
+		// 提示运维：换过模型且未清空样本库。/clearsamples 后重新 /warmup 即可恢复第三层。
+		console.warn('[广告检测] 跳过 ' + skippedDim + ' 条维度不匹配的样本向量'
+			+ '（当前模型 ' + AD_EMBEDDING_MODEL + ' 输出 ' + vector.length + ' 维）'
+			+ '，请用 /clearsamples 清空后重新 /warmup 生成。');
+	}
+	return {
+		available: true,
+		similarity: best,
+		sample: bestSample,
+		isMatch: best >= config.aiSimilarityThreshold,
+		isSoft: best >= AD_AI_SOFT_BONUS_FLOOR && best < config.aiSimilarityThreshold
+	};
+}
+
+// ===== 链接归一化（2026-09-09 方案 A）=====
+//
+// 【要治的病】主人原话：「我要的 AI 自动识别 一键识别 是自己能够自我学习新的广告 不同广告
+// 不同类型广告 不同特征广告 AI 是更加优秀 而不是降智。」而现状是学一条杀一条 —— 因为
+// 送进嵌入模型的文本里【原样带着 URL】，而 URL 是这条广告身上最独一无二、最不可迁移的部分。
+//
+// 离线实测的两张资料卡（一张漏封、一张侥幸封住），链接占比：
+//   漏封那张：`此号不回复！！！24h做单入口: https://t.me/+XFOCZC0tZxUyODg9 💎`
+//            链接 30 字 / 全文 53 字 = 56.6%，剥掉链接后真正的话术只剩 20 字。
+//   封住那张：`lj来米快，急需钱的兄弟来找我带，不头不按，链接进群：https://t.me/+ieMc-5jAwVcxZjA0 HE`
+//            链接 30 字 / 全文 67 字 = 44.8%，剥掉后 34 字。
+// 这是两张卡在【结构查杀四通道全放行、评分层都是 -3】之后唯一的量化差异 —— 一半以上的
+// 向量维度被一串一次性随机邀请码占着，真正能迁移的广告话术被稀释到不足一半权重。
+// 换个邀请码，同一套话术的向量就跟着漂移，学过的样本对它就不再相似。
+//
+// 【怎么治】把 URL 换成语义占位符：形态信息（这是私有群邀请链接／这是 telegram 链接／
+// 这是外站链接）保留下来进向量，随机码扔掉。于是「做单入口 + 私有群邀请链接」这个骨架
+// 才是被学进样本库的东西，换一百个邀请码它都还在。
+//
+// 【三档的分界为什么这么定】
+//   t.me/+xxx、t.me/joinchat/xxx → 私有群一次性邀请链接。正常人几乎不会把它写进【个人简介】，
+//     这是拉群广告的标志形态（方案 C 就是拿它单独计分的）。
+//   t.me/username、telegram.me、telegram.dog → 公开账号／频道链接。主人明确说过
+//     「正常用户大部分都会使用这个」，所以它只归一化成中性的 telegram链接，不带贬义。
+//   其余 http(s) → 外部链接。再细分（按域名）就等于把域名塞回向量，又回到不可迁移的老路，
+//     域名该由第二层的 domain 指纹去管，不是 AI 层的活。
+//
+// 【幂等】占位符本身不含 URL，重复调用结果不变 —— 所以写入端（addAdSample）与
+// 拼装端（buildAdSampleText）可以都套一层，不必担心谁先谁后。
+const AD_SEMANTIC_PLACEHOLDER_PRIVATE_INVITE = '私有群邀请链接';
+const AD_SEMANTIC_PLACEHOLDER_TELEGRAM = 'telegram链接';
+const AD_SEMANTIC_PLACEHOLDER_EXTERNAL = '外部链接';
+
+// 归一化替换用的正则。【必须与下面 hasAdPrivateInviteLink 用的那条分开定义】——
+// 带 g 标志的正则对象自带 lastIndex 状态，同一个对象既 replace 又 test 会漏判。
+const AD_SEMANTIC_PRIVATE_INVITE_RE_G = /(?:https?:\/\/)?(?:www\.)?(?:t|telegram)\.(?:me|dog)\/(?:joinchat\/|\+)[^\s]*/gi;
+const AD_SEMANTIC_TELEGRAM_RE_G = /(?:https?:\/\/)?(?:www\.)?(?:t|telegram)\.(?:me|dog)\/[^\s]*/gi;
+const AD_SEMANTIC_EXTERNAL_RE_G = /https?:\/\/[^\s]+/gi;
+
+// 把文本里的链接换成语义占位符。替换顺序【必须先私有后公开】：私有形态
+// t.me/+xxx 本身也匹配公开形态的 t.me/xxx，先跑公开那条会把它一并吃掉、分档失效。
+function normalizeAdSemanticText(text) {
+	const source = String(text ?? '');
+	if (!source) return '';
+	return source
+		.replace(AD_SEMANTIC_PRIVATE_INVITE_RE_G, ' ' + AD_SEMANTIC_PLACEHOLDER_PRIVATE_INVITE + ' ')
+		.replace(AD_SEMANTIC_TELEGRAM_RE_G, ' ' + AD_SEMANTIC_PLACEHOLDER_TELEGRAM + ' ')
+		.replace(AD_SEMANTIC_EXTERNAL_RE_G, ' ' + AD_SEMANTIC_PLACEHOLDER_EXTERNAL + ' ')
+		.replace(/\s+/g, ' ')
+		.trim();
+}
+
+// 归一化之后剩下多少「真正的话术」（把三个占位符全剥掉再量长度）。
+//
+// 【为什么非要有这道闸】归一化本身带来一个新的、比原病更凶的风险：一条只有链接没有话术的
+// 广告（bio 就写 `https://t.me/+abc123`），归一化后样本文本变成纯占位符「私有群邀请链接」。
+// 这条样本一旦进库，任何含私有邀请链接的文本对它的余弦相似度都会爆表 —— 而 AI 层是
+// 【硬命中即封、不看豁免词也不看总分】的，等于给全群每个分享过群链接的人挂了一颗雷。
+// 所以写入端必须卡住：剥掉占位符后不足 AD_SAMPLE_MIN_CORE_LENGTH 字符的，一律不进样本库。
+// 这类号本来也不靠 AI 抓 —— 域名进 domain 指纹（权重 1，单条即定罪），形态进方案 C 的计分。
+function adSemanticCoreLength(text) {
+	const source = String(text ?? '');
+	if (!source) return 0;
+	return source
+		.split(AD_SEMANTIC_PLACEHOLDER_PRIVATE_INVITE).join(' ')
+		.split(AD_SEMANTIC_PLACEHOLDER_TELEGRAM).join(' ')
+		.split(AD_SEMANTIC_PLACEHOLDER_EXTERNAL).join(' ')
+		.replace(/\s+/g, '')
+		.length;
+}
+
+// 归一化后仍需保留的最小话术长度。取 6 与 addAdSample 原有的 text.length < 4 是两道不同的闸：
+// 那道管「整条太短」，这道管「除了链接什么都没有」。实测两张卡剥链接后是 20 字与 34 字，
+// 都远在门槛之上，这道闸只拦纯链接样本。
+const AD_SAMPLE_MIN_CORE_LENGTH = 6;
+
+// ===== 私有群一次性邀请链接：单独计分（2026-09-09 方案 C）=====
+//
+// 【物理放在这里的原因】下面这条正则必须与上面 AD_SEMANTIC_PRIVATE_INVITE_RE_G 认同一种形态 ——
+// 归一化把哪些链接判成「私有群邀请链接」，计分就得对哪些链接计分。两条正则分散在文件两头，
+// 早晚会一改一漏，那时归一化说是私有链接、计分说不是（或反过来），排查起来是噩梦。
+//
+// 【要治的病】主人明确指定过 't.me' 进 AD_EXEMPT_KEYWORDS，原话：「t.me 不该成为封禁词，
+// 也加豁免。因为正常用户大部分都会使用这个。」这条判断本身是对的，本次改动【一个字都不动它】。
+// 问题在于它【不区分形态】，于是 t.me 从「不算证据」变成了「-3 分护身符」：
+//   t.me/username        公开账号／频道链接。正常用户天天用，该豁免。
+//   t.me/+xxx            私有群一次性邀请码。
+//   t.me/joinchat/xxx    同上（旧版客户端生成的形态）。
+// 后两种是【拉群广告的标志形态】—— 它只能用一次、无法搜索、点进去直接进群，正常人几乎不会
+// 把它写进【个人简介】（要留联系方式会留 @username，要推荐群会在聊天里发而不是刻在资料卡上）。
+// 离线实测的两张卡都属这一形态，而它们在结构查杀四通道全放行之后，评分层唯一的分项就是
+// 「-3 命中豁免词：t.me」—— 广告号拿主人给正常用户的护身符把自己从 0 分压到了 -3 分。
+//
+// 【分值取 7 的推演】这两张卡除豁免外其余分项全是 0，所以分值直接决定结局：
+//   取消豁免不计分 → 0 分，仍然 pass，白改。
+//   +3            → 3 分，仍然 pass（观察线 5、封禁线 7），白改。
+//   +5            → 5 分，只进观察窗口：不封任何人，推快照等主人人工复核。
+//   +7            → 撞封禁线，直接封。
+//
+// 【2026-09-09 第二轮：5 改 7】主人定的，原话：「可以缩小范围。检测私有群邀请链接。
+// 因为正常用户是不会放私有群在用户简介上的。」以及「豁免的是非广告 不豁免的是广告 广告无所遁形！」
+//
+// 后一句点破的正是下面那套豁免剔除规则真正的作用 —— 它不只是「少减 3 分」，它是一道分流器：
+//   真广告的简介除了那条链接没别的内容，豁免命中【只有 't.me' 一个词】，被剔光 → 净 +7 → 封。
+//   技术群主的简介里有 cdn / vless / reality 撑着豁免 → 仍吃 -3 → 净 +4 → PASS。
+//   同时放了公开频道链接的人（t.me/mychannel + t.me/+xxx）→ 豁免整条照给 → 净 +4 → PASS。
+// 分流不需要任何新逻辑，已落地的剔除规则自己就做到了。这是分值敢从 5 提到 7 的全部依据。
+//
+// 【订正上一轮的一处错判】第一轮注释在这里写过「+7 → 技术群群主 / 社群运营会被直接误封」，
+// 对技术群主那半句是错的 —— 当时漏算了他们的技术豁免词仍在生效（7 - 3 = 4，够不到封禁线）。
+// 实测：`CDN 技术交流，进群 t.me/+abcdefghij` = 4 分 PASS。上一轮推荐 5 分的理由有一部分
+// 建立在这个错判之上，留此备忘，别再按那句话去推演。
+//
+// 【7 分下真实存在的误封面】只放私有邀请链接、简介里又没有任何技术词的人 —— 社群运营、
+// 读书会、拼团群主。他们会被直接封。主人已明确接受：「E 虽然会误封。但是可以判断
+// 误封之后我再修改。」误封后 /ignore 回滚，样本与指纹都删得掉（双 hash 试删已覆盖）。
+//
+// 【为什么不会滚成累积误封】评分加在 scoreAdProfile（静态资料分）里，而观察窗口留存的是
+// retainScore = Math.max(0, behaviorScore)，behaviorScore【只含正文 / 上下文 / 转发分，
+// 不含资料分】。所以这 7 分不进历史分，不会出现「第一条 observe、第二条再叠一份成倍数分」
+// 的恶性循环 —— 那正是 @MiLov1900 两次被误封的机制，已于 2026-09-08 根治，这里不能把它请回来。
+const AD_PRIVATE_INVITE_SCORE = 7;
+
+// 只做 test、不做 replace，所以【不带 g 标志】（带 g 的正则对象自带 lastIndex，
+// 反复 test 同一个对象会时真时假）。邀请码下限 5 字符：Telegram 实际生成的是 16 位上下，
+// 卡 5 是为了不把 `t.me/+` 这种半截链接或纯手打的 `t.me/+86` 电话号误认成邀请码。
+const AD_PRIVATE_INVITE_RE = /(?:https?:\/\/)?(?:www\.)?(?:t|telegram)\.(?:me|dog)\/(?:joinchat\/|\+)[A-Za-z0-9_-]{5,}/i;
+
+// 公开 telegram 链接（t.me/username 形态）。判定前【先把私有形态整段剥掉】——
+// 私有链接 t.me/+abc123 本身也长得像 t.me/xxx，不剥就永远返回 true，豁免剔除逻辑会全程失效。
+const AD_PUBLIC_TELEGRAM_RE = /(?:t|telegram)\.(?:me|dog)\/[A-Za-z0-9_]{3,}/i;
+
+function hasAdPrivateInviteLink(text) {
+	return AD_PRIVATE_INVITE_RE.test(String(text ?? ''));
+}
+
+function hasAdPublicTelegramLink(text) {
+	return AD_PUBLIC_TELEGRAM_RE.test(String(text ?? '').replace(AD_SEMANTIC_PRIVATE_INVITE_RE_G, ' '));
+}
+
+// 私有邀请链接命中时要从豁免命中里剔掉的词。
+// 目前只有 't.me' 一个（AD_EXEMPT_KEYWORDS 里没有 'telegram.me' / 'telegram.dog'，
+// 且 'telegram.me' 这个串本身不含子串 't.me'，所以不会被 countAdKeywordHits 命中）。
+// 做成 Set 是留给以后往豁免表里加 telegram 域名变体时不必再改剔除逻辑。
+const AD_TELEGRAM_LINK_EXEMPT_WORDS = new Set(['t.me', 'telegram.me', 'telegram.dog']);
+
+// 从判定载荷拼出 AI 语义样本文本。
+//
+// 【必须只有这一个拼法】自动学习（enforceAdDetection）与误判回滚（/ignore、/unban）
+// 是一对逆操作：写入时按什么拼，删除时就得按什么拼 —— addAdSample 用 adTextHash(text)
+// 作唯一键，拼法差一个空格 hash 就完全不同，回滚会静默删不掉，样本库里留下永久污染。
+// 所以两端一律走这个函数，不许在调用点手写 join。
+//
+// 【刻意不含 username】@xxx 是账号名不是广告话术，嵌入向量里没有可迁移的语义，
+// 反而会把「任何 @字母数字串」推向广告特征 —— 正常用户 @ 好友就会开始往高相似度靠。
+// 同理，引用体（quoted）那段话是别人写的，也不进这里，理由见 judgeAdQuotedKill 的注释。
+//
+// 【2026-09-09 起返回值已链接归一化】理由见 normalizeAdSemanticText。这是「一处归一化、
+// 三端自动对称」的收敛点 —— 学习端（enforceAdDetection / /spam）、删除端（/ignore / /unban）、
+// 检测端（evaluateAdSuspect 的 semanticText）现在全都经过这一个函数，拼法永不可能对不上。
+// 副作用：归一化顺带把换行折叠成空格，所以多行 bio 的 hash 与改动前不同 ——
+// 存量样本的兼容由 removeAdSampleByText 的双 hash 试删兜住，见那边的注释。
+function buildAdSampleText(payload) {
+	return normalizeAdSemanticText([payload?.name, payload?.bio, payload?.text].filter(Boolean).join(' ').trim());
+}
+
+// /addsample 底层：新增语义样本，向量留空由懒加载补齐。
+//
+// 【入口统一归一化】这里再套一次 normalizeAdSemanticText 不是多余：/addsample 是主人手打的
+// 路径（12814 那处直接传 arg，不走 buildAdSampleText），只在拼装端归一化会漏掉它，
+// 于是手打样本存原文、自动样本存归一化文本，两套 hash 混在一张表里，纠错端就又对不上了。
+// 函数幂等，走过 buildAdSampleText 的文本再过一遍结果不变。
+async function addAdSample(env, rawText, options = {}) {
+	const text = normalizeAdSemanticText(rawText);
+	if (text.length < 4) return { ok: false, reason: 'too_short' };
+	// 剥掉链接占位符后没有实质话术的，一律拒收 —— 理由见 adSemanticCoreLength 的注释
+	// （纯占位符样本会让 AI 层把每个分享群链接的人都判成高相似）。
+	if (adSemanticCoreLength(text) < AD_SAMPLE_MIN_CORE_LENGTH) return { ok: false, reason: 'no_core' };
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const hash = adTextHash(text);
+		const existing = await env.DB.prepare('SELECT id FROM ad_sample_embeddings WHERE text_hash = ?').bind(hash).first();
+		if (existing) return { ok: true, added: false, text };
+		await env.DB.prepare(
+			'INSERT INTO ad_sample_embeddings (text_hash, sample_text, embedding, dimension, source, created_at) VALUES (?, ?, NULL, NULL, ?, ?)'
+		).bind(hash, text.slice(0, 500), String(options.source || 'manual'), Math.floor(Date.now() / 1000)).run();
+		AD_SAMPLE_EMBEDDING_CACHE.delete(env.DB);
+		return { ok: true, added: true, text };
+	} catch (error) {
+		console.error('[广告检测] 添加语义样本失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+// ===== 短语自我泛化（方案 E · AI 自我学习闭环）=====
+//
+// 【解决什么】AI 语义层的样本库在 /spam 之前只能靠中心特征 + 手工 /addsample 喂。主人
+// 的原话是「AI 是通过 spam 执行自我学习的」—— 但 /spam 只喂样本、不提炼规则，样本库
+// 永远停留在「已见过的广告」，新变体的广告（同词根、同黑话、同招揽句式）照样漏。
+// 方案 A 已把样本正文归一化（链接→占位符），方案 E 在此基础上做第二步：从新样本里
+// 提炼【跨样本共现的 4~8 字短语】，升级成 keyword 指纹。指纹层是命中即封、代价最高，
+// 所以提炼端的三重闸刻得非常紧，宁可不提炼也不许把正常词学成指纹。
+//
+// 【为什么误面小】提炼素材只来自 /spam 引用分支 —— 那是主人或有权限管理员人工判定
+// 过的广告（source='spam'/'spam-quoted'），不是自动封禁路径的路过文本。对比 old-code
+// 自动学习（见 learnAdFingerprints 里那套三重限制的注释）：那条路是「任何消息都可能被
+// 学成指纹」，误面大得多；这条路把「学什么」的判断交给真人，AI 只负责把重复出现的
+// 短语聚出来。
+//
+// 【三重闸】四个条件【全部】满足才入库，任何一个不满足就丢弃：
+//   1)豁免词闸 —— 短语不含任何 AD_EXEMPT_KEYWORDS。这条必须排最前：豁免词是主人反复
+//     确认过的「正常用户会写」的词（私聊 / 代理 / t.me / 各种协议名），一旦命中直接丢。
+//   2)强动词·业务词闸 —— 短语必须含其中一个强交易动词或业务关键词。这是唯一一道「广告
+//     语义」闸：没有它，「欢迎进群」「联系我」这类跨样本共现的高频碎片会被学成指纹，
+//     之后所有这么说话的正常用户一律误杀。有它，提炼结果天然带着广告指向。
+//   3)形态闸 —— 纯数字、纯符号、含 emoji 的丢弃。emoji/数字组合的「文案」极常见
+//     （🔞秒到、1OO%），学进去等于给整类带 emoji 的正常消息挂雷。
+//   4)长度闸 —— 4~8 字（码点计），低于 4 字噪音大、高于 8 字太像整句。这道闸要量【两次】：
+//     切词端量窗口原文，入库端再量 normalizeAdFingerprintValue 之后的值 —— 后者会 trim
+//     空白使短语变短，只量前者会漏出 3 字指纹（详见入库前那段注释）。
+//
+// 【检查点】省内存 + 免重扫：ad_scan_state 里存最后一次处理的样本 id（AD_ENRICH_CHECKPOINT_KEY），
+// 每次只扫 id 大于它的新样本。提炼完成后推进到已处理批的最大 id —— 无论那次有没有提炼出
+// 东西，都必须推进，否则重复共现会永远在同一批样本上打转。
+//
+// 【与 learnAdFingerprints 的分工】本函数只负责把「已存在样本库里的短语」升级成指纹，
+// 不做抽取候选（那是 learnAdFingerprints 用 extractAdFingerprintCandidates 干的事）。
+// 两者写的是同一张 ad_fingerprints 表，靠 adFingerprintKey 去重 —— 同一短语若先从 /spam
+// 以 source='spam' 学进来、之后又被 E 提炼，upsert 只会 +1 match_count 并把来源提成千
+// 工级，不会重复入库，也不会降权。
+async function enrichAdCommonPhrases(env, config, options = {}) {
+	if (!env?.DB) return { ok: false, learned: 0, reason: 'no_db' };
+	if (!(await adDetectionReady(env))) return { ok: false, learned: 0, reason: 'unavailable' };
+	// 【0 必须真能关掉】这里【不能】写 `Number(x) || 默认值` —— 0 既是合法值又是假值，
+	// 会被 || 直接吃掉回退成默认 5，于是 AD_ENRICH_EVERY=0 这个降级开关是死的
+	// （离线实测：设 0 之后照样提炼，reason 连 'disabled' 都返回不出来）。
+	// 正确顺序是：先取数 → 判有限性 → 判 >0 决定开关 → 最后才 Math.max(1,…) 兜下界。
+	const rawEvery = Number(config?.enrichEvery ?? AD_ENRICH_EVERY);
+	const everyValue = Number.isFinite(rawEvery) ? rawEvery : AD_ENRICH_EVERY;
+	if (!(everyValue > 0)) return { ok: true, learned: 0, reason: 'disabled' };
+	const every = Math.max(1, everyValue);
+	const minOccurrence = Math.max(2, Number(config?.enrichMinOccurrence ?? AD_ENRICH_MIN_OCCURRENCE) || AD_ENRICH_MIN_OCCURRENCE);
+	const maxResults = Math.max(1, Number(config?.enrichMaxResults ?? AD_ENRICH_MAX_RESULTS) || AD_ENRICH_MAX_RESULTS);
+	const minLen = Math.max(4, Number(options.phraseMin) || AD_ENRICH_PHRASE_MIN);
+	const maxLen = Math.min(12, Math.max(minLen, Number(options.phraseMax) || AD_ENRICH_PHRASE_MAX));
+
+	try {
+		// 读取检查点。首次为 '0'（全表都是新样本）。
+		const checkpointRaw = await readAdScanState(env, AD_ENRICH_CHECKPOINT_KEY, '0');
+		const checkpoint = Math.max(0, Number(checkpointRaw) || 0);
+
+		// 取严格大于检查点的新样本，最多取 every 条一池，只按 id 升序（先到先炼）。
+		//
+		// 【source 过滤是必需的，不是优化】seedAdDetectionData 会给【每个新库】灌 31 条种子
+		// 样本：10 条 AD_SAMPLE_SEED_TEXTS（source='seed'）+ 21 条 AD_FINGERPRINT_SEED 里
+		// 长度≥4 的 keyword 下潜（source='seed-core'）。它们的 id 全部 > 0，不过滤的话首次
+		// 部署时 checkpoint=0 会把这批中心特征【互相共现】—— 离线实测：一条 /spam 样本都没有
+		// 时就能炼出 10 条候选、入库 7 条 auto 指纹（"高价收网" "收购网" …）。后果有两层：
+		//   ① 违背本函数的立身前提「素材只来自人工判定」，学出来的东西没人审过；
+		//   ② 种子文本带空格（"长期收购网 du 商宝账号"），切出的窗口归一化后会缩短，
+		//      "收购网 " → "收购网"，3 个字、weight 0.8 命中即封 —— 「收购网站」直接误封。
+		// 所以这里只认 /spam 引用分支写进来的两种 source，与函数顶部注释的设计口径一致。
+		const { results: rows } = await env.DB.prepare(
+			"SELECT id, sample_text, source FROM ad_sample_embeddings WHERE id > ? AND source IN ('spam', 'spam-quoted') ORDER BY id ASC LIMIT ?"
+		).bind(checkpoint, every).all();
+		const samples = (rows || []).filter((r) => r && String(r.sample_text || '').length >= minLen);
+		// 样本还不够一池就先不动，也【不推进检查点】——推进了就会跳过这批，等 next spawn 再凑。
+		// 注意：这里不把「累积不足」当失败，只是还没到触发线。
+		if (samples.length < every) return { ok: true, learned: 0, reason: 'pending', checkpoint };
+
+		const now = Math.floor(Date.now() / 1000);
+		// created_by 固定写 'enrich'，【不写操作人 id】—— 这是本方案唯一的审计与回滚抓手：
+		// /words 一眼能认出哪些指纹是机器自己炼的，误封时按 created_by='enrich' 就能整批
+		// 回滚，而不必逐条辨认。操作人信息不会丢：同一次 /spam 里 learnAdFingerprints 学到的
+		// 那批指纹已经记了 operatorId，两者对同一时刻的操作可以互相印证。
+		const createdBy = String(options.createdBy || 'enrich');
+
+		// ===== 共现统计：每条样本切成 N 个码点窗口（len in [minLen,maxLen]），跨样本去重计数 =====
+		const sampleBucket = new Map(); // phrase -> Set(sampleId)
+		for (const row of samples) {
+			const sid = Number(row.id);
+			const text = String(row.sample_text || '');
+			// 归一化后剥掉占位符再切 —— 占位符（私有群邀请链接/telegram链接/外部链接）是
+			// 所有广告共享的词，不剥就会成为「每样本都出现」的假共现，最终被学成指纹。
+			const core = text
+				.split(AD_SEMANTIC_PLACEHOLDER_PRIVATE_INVITE).join(' ')
+				.split(AD_SEMANTIC_PLACEHOLDER_TELEGRAM).join(' ')
+				.split(AD_SEMANTIC_PLACEHOLDER_EXTERNAL).join(' ')
+				.replace(/\s+/g, ' ');
+			// 【emoji 整条不学（F2 决策）】含 emoji 的文本本身无法判定是正常聊天还是广告，
+			// 且单窗口的 emoji 闸管不住相邻窗口 —— 「收购🔞USDT」能切出干净的 4 字
+			// 窗口「USDT」（不含 emoji，照过闸3，但 USDT 又命中业务词照学不误）。
+			// 所以这里不是拦窗口，而是整条跳过：样本里出现 emoji，这条就完全不参与提炼。
+			if (/\p{Extended_Pictographic}/u.test(core)) continue;
+			// 按 Unicode 码点切，中文安全（Array.from 走 fromCodePoint，不会把代理对拆破）。
+			const chars = Array.from(core);
+			if (chars.length < minLen) continue;
+			const seenThisSample = new Set();
+			for (let start = 0; start < chars.length; start++) {
+				for (let len = minLen; len <= maxLen && start + len <= chars.length; len++) {
+					const phrase = chars.slice(start, start + len).join('');
+					if (seenThisSample.has(phrase)) continue; // 同一样本内去重，避免重复计数
+					seenThisSample.add(phrase);
+					// 这里只先累计「出现过的样本数」，真正裁决在三重闸之后。
+					if (!sampleBucket.has(phrase)) sampleBucket.set(phrase, new Set());
+					sampleBucket.get(phrase).add(sid);
+				}
+			}
+		}
+
+		// ===== 逐短语过三重闸，count>=minOccurrence 才入库 =====
+		// 注意与 learnAdFingerprints 的 isExemptOnlyKeyword 保持同一口径：
+		// 「豁免词 + 强动词/业务词共存」放行（那是真广告夹带技术术语，例「收购 vless 账号」），
+		// 只有【纯豁免词】的碎片才丢弃。
+		const gate = (phrase) => {
+			const exemptHits = countAdKeywordHits(phrase, AD_EXEMPT_KEYWORDS).length;
+			const tradeHits = countAdKeywordHits(phrase, AD_TRADE_VERBS).length;
+			const businessHits = countAdKeywordHits(phrase, AD_BUSINESS_KEYWORDS).length;
+			// 闸1：仅豁免词闸 —— 既命中豁免词、又无任何强动词/业务词 → 丢弃
+			if (exemptHits && !tradeHits && !businessHits) return false;
+			// 闸2：强动词·业务词闸 —— 必须含其中一个强交易动词或业务关键词
+			if (!tradeHits && !businessHits) return false;
+			// 闸3：形态闸（纯数字 / 纯符号 / 含 emoji 丢弃）
+			if (/^[\d\s]+$/.test(phrase)) return false;          // 纯数字或空白
+			if (/^[^\p{L}\p{N}]+$/u.test(phrase)) return false;  // 纯符号/标点
+			if (/\p{Extended_Pictographic}/u.test(phrase)) return false; // 含 emoji
+			return true;
+		};
+
+		const chosen = [];
+		const seenValue = new Set();
+		for (const [phrase, set] of sampleBucket.entries()) {
+			if (set.size < minOccurrence) continue;
+			if (!gate(phrase)) continue;
+			// 【长度闸必须拿归一化【之后】的值再量一次】切词端量的是窗口原文，而真正落库的是
+			// normalizeAdFingerprintValue(phrase) —— 它会 trim 首尾空白并折叠连续空白。于是
+			// "收购网 "（4 码点，过得了切词端的 4 字闸）落库缩成 3 字的 "收购网"，而
+			// AD_ENRICH_WEIGHT(0.8) 正好等于 AD_FINGERPRINT_BAN_WEIGHT，是命中即封 ——
+			// 「我在收购网站上买的」「二手收购网点」这类正常发言会被子串匹配直接封禁。
+			// 这不是「判错广告」，是把一个正常三字词做成了永久地雷，纠错端也难发现。
+			// 切词端的闸拦不住它（那时空格还在），只有在这里堵。
+			const value = normalizeAdFingerprintValue(phrase);
+			if (Array.from(value).length < minLen) continue;
+			// 归一化会让不同窗口撞成同一个值（"收购网 d" 与 "收购网  d"），去重免得
+			// 同一条 fingerprint 在一个 batch 里 upsert 两次，把 match_count 平白刷高。
+			if (seenValue.has(value)) continue;
+			seenValue.add(value);
+			chosen.push({ phrase, value, occurrence: set.size });
+			if (chosen.length >= maxResults) break; // 单次提炼封顶，防指纹库被刷爆
+		}
+		if (!chosen.length) {
+			// 一池样本没提炼出任何东西 —— 也要推进检查点，否则每来一条新样本都重扫同一池。
+			await writeAdScanState(env, AD_ENRICH_CHECKPOINT_KEY, String(samples[samples.length - 1].id), now);
+			return { ok: true, learned: 0, reason: 'no_candidate', checkpoint: Number(samples[samples.length - 1].id) };
+		}
+
+		// ===== 入库 =====
+		// value 在上面的长度复查里已经算过且去过重，这里直接用，不再 normalize 第二次。
+		const statements = chosen.map(({ value }) => env.DB.prepare(
+			'INSERT INTO ad_fingerprints (fingerprint, type, value, weight, match_count, false_positive_count, confidence, source, created_by, created_at, updated_at) '
+			+ 'VALUES (?, ?, ?, ?, 0, 0, 1, ?, ?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET '
+			+ 'match_count = match_count + 1, updated_at = excluded.updated_at, '
+			+ 'confidence = CAST(match_count + 1 AS REAL) / (match_count + 1 + false_positive_count), '
+			+ "source = CASE WHEN excluded.source = 'manual' THEN 'manual' ELSE source END"
+		).bind(
+			adFingerprintKey('keyword', value), 'keyword', value, AD_ENRICH_WEIGHT,
+			'auto', createdBy, now, now
+		));
+		await env.DB.batch(statements);
+		AD_FINGERPRINT_CACHE.delete(env.DB);
+
+		// 推检查点到本池最大 id —— 这批已经提炼过，下次从下一条开始。
+		await writeAdScanState(env, AD_ENRICH_CHECKPOINT_KEY, String(samples[samples.length - 1].id), now);
+		return { ok: true, learned: chosen.length, checkpoint: Number(samples[samples.length - 1].id), candidates: chosen };
+	} catch (error) {
+		console.error('[广告检测] 短语自我泛化失败:', error);
+		return { ok: false, learned: 0, reason: 'error' };
+	}
+}
+
+// 误判回滚用：按原文删掉一条语义样本。
+//
+// 【为什么必须有这个】在这批改动之前，删样本只有 clearAdSamples（清空全表，含种子）
+// 一个选择，而 /ignore 碰都没碰样本库 —— 于是「自动封禁 → 自动学进 AI 样本库 → 主人
+// 发现是误判 → /ignore 回滚」这条链上，指纹删掉了、黑名单清了、全群解封了，
+// 唯独那条错样本永久留在 AI 样本库里，继续把相似的正常用户往高相似度上拉。
+// AI 层是硬命中即封、不看豁免词也不看总分的（离线实测过：-4 分的技术用户照样 verdict=ban），
+// 一条错样本的杀伤力比一条错指纹更大，纠错端不能缺这一环。
+//
+// 【种子样本一律不删】source = seed / seed-core 是主人定的中心特征与内置种子，
+// 补灌判空条件是「数对应 source 的条数」，删一条就永不回来 —— 和指纹种子同一个道理。
+async function removeAdSampleByText(env, rawText) {
+	const raw = String(rawText ?? '').trim();
+	// 门槛仍按【原文】长度判，与改动前逐字等价：归一化会把长链接压成 7 字占位符，
+	// 拿归一化后的长度卡门槛会让「纯链接样本」删不掉，纠错端反而更弱。
+	if (raw.length < 4) return { ok: false, reason: 'too_short' };
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		// 【双 hash 试删 · 存量兼容的关键一环】2026-09-09 起写入端做了链接归一化
+		// （见 normalizeAdSemanticText），于是库里同时存在两代样本：
+		//   改动【前】自动学进去的 —— text_hash 按未归一化原文算；
+		//   改动【后】自动学进去的 —— text_hash 按归一化文本算。
+		// 只算一种 hash 就会有一代删不掉。而 /ignore 删不掉样本的后果是最重的：
+		// AI 层硬命中即封、不看豁免词也不看总分，一条错样本比一条错指纹更危险，
+		// 主人「误封之后我再修改」这条路就断了。所以两个 hash 都试，去重后一次 IN 删完。
+		// hash 一律用未截断文本算，与 addAdSample 保持一致（那边只在存 sample_text 时才 slice(0,500)）。
+		const hashes = [...new Set([adTextHash(normalizeAdSemanticText(raw)), adTextHash(raw)])];
+		const result = await env.DB
+			.prepare('DELETE FROM ad_sample_embeddings WHERE text_hash IN ('
+				+ hashes.map(() => '?').join(', ')
+				+ ") AND COALESCE(source, '') NOT IN ('seed', 'seed-core')")
+			.bind(...hashes).run();
+		const removed = Number(result?.meta?.changes || 0);
+		if (removed > 0) AD_SAMPLE_EMBEDDING_CACHE.delete(env.DB);
+		return { ok: true, removed };
+	} catch (error) {
+		console.error('[广告检测] 删除语义样本失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+// /clearsamples 底层：清空全部样本（含种子）。调用方负责二次确认。
+async function clearAdSamples(env) {
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const result = await env.DB.prepare('DELETE FROM ad_sample_embeddings').run();
+		AD_SAMPLE_EMBEDDING_CACHE.delete(env.DB);
+		return { ok: true, removed: Number(result?.meta?.changes || 0) };
+	} catch (error) {
+		console.error('[广告检测] 清空语义样本失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+async function countAdSamples(env) {
+	if (!(await adDetectionReady(env))) return { total: 0, ready: 0, stale: 0 };
+	try {
+		const total = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_sample_embeddings').first();
+		const ready = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL').first();
+		// stale = 已生成但维度与当前模型不符的向量。换模型后这些向量在判定时会被跳过，
+		// 光看 ready 数会以为第三层没问题，实际可用样本是 ready - stale。
+		const stale = await env.DB.prepare(
+			'SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE embedding IS NOT NULL AND dimension IS NOT NULL AND dimension != ?'
+		).bind(AD_EMBEDDING_DIMENSION).first();
+		return {
+			total: Number(total?.c) || 0,
+			ready: Number(ready?.c) || 0,
+			stale: Number(stale?.c) || 0
+		};
+	} catch (error) {
+		console.error('[广告检测] 统计语义样本失败:', error);
+		return { total: 0, ready: 0, stale: 0 };
+	}
+}
+
+// === 第四层设施：用户资料抓取与观察窗口 ===
+// getChat 对用户 ID 会返回 bio，是识别「交易动词 Bio」的唯一来源；
+// 失败一律降级为只用消息里带的 first_name / username，绝不阻断。
+// getChat 结果的进程内缓存，5 分钟过期。
+// 预筛门槛取消后，每条群消息都要拉一次 bio；刷屏 / 连续对话时同一个人可能在几秒内
+// 发十几条，逐条调用会毫无必要地逼近 Telegram 的 429（约 30 req/s）。
+// 只缓存 getChat 的返回（昵称 / 用户名 / bio），【不缓存 status】——
+// status 是 per-chat 的，同一人在不同群状态不同，混用会串号。
+// 边界：Worker 实例随时被回收，缓存是尽力而为的优化，不是一致性保证；
+// 冷启动就是缓存全空，行为退化成「每条都拉」，与不加缓存等价，因此不影响正确性。
+// 代价是 bio 改动最多 5 分钟后才被看到 —— 广告号改简介后有一个短窗口按旧资料判定，
+// 但观察窗口与定时全量扫描都会再覆盖到他，不构成永久漏放。
+const AD_PROFILE_CACHE = new Map();
+const AD_PROFILE_CACHE_TTL_MS = 5 * 60 * 1000;
+const AD_PROFILE_CACHE_MAX = 2000;
+
+function readAdProfileCache(userId) {
+	const hit = AD_PROFILE_CACHE.get(String(userId));
+	if (!hit) return null;
+	if (Date.now() > hit.expiresAt) {
+		AD_PROFILE_CACHE.delete(String(userId));
+		return null;
+	}
+	// 返回副本：调用方会往 profile 上写 status，直接返回同一对象会把
+	// A 群的 status 泄漏给 B 群的下一次命中。
+	return { ...hit.profile };
+}
+
+// 清空资料缓存。测试里模拟「用户改了 bio」时必须调用 —— 否则拿到的是 5 分钟前的旧 bio，
+// 整个「事后改简介」的场景就测不出来。生产里不需要主动调：TTL 到期自然刷新，
+// 而闸三扫描的时间跨度（3 天起）远大于 5 分钟，不存在读到陈旧 bio 的实际风险。
+function invalidateAdProfileCache(userId = null) {
+	if (userId == null || userId === '') {
+		AD_PROFILE_CACHE.clear();
+		return;
+	}
+	AD_PROFILE_CACHE.delete(String(userId));
+}
+
+function writeAdProfileCache(userId, profile) {
+	// 上限保护：Map 无界增长会在长生命周期实例里吃内存。命中即刷新，
+	// 满了就丢最老的一个（Map 保持插入序），够用且无需额外结构。
+	if (AD_PROFILE_CACHE.size >= AD_PROFILE_CACHE_MAX) {
+		const oldest = AD_PROFILE_CACHE.keys().next();
+		if (!oldest.done) AD_PROFILE_CACHE.delete(oldest.value);
+	}
+	AD_PROFILE_CACHE.set(String(userId), {
+		profile: { firstName: profile.firstName, lastName: profile.lastName, username: profile.username, bio: profile.bio },
+		expiresAt: Date.now() + AD_PROFILE_CACHE_TTL_MS
+	});
+}
+
+async function fetchAdUserProfile(userId, fallback = {}) {
+	const profile = {
+		firstName: String(fallback.firstName ?? fallback.first_name ?? ''),
+		lastName: String(fallback.lastName ?? fallback.last_name ?? ''),
+		username: String(fallback.username ?? ''),
+		bio: '',
+		status: '',
+		// bioFetched：这次到底有没有真的从 Telegram 拿到资料。
+		// 调用方靠它决定要不要施加「无 emoji 且无 Bio」的减分 ——
+		// 抓取失败时 bio 是空串，但含义是「不知道」，拿它减分会把真广告的分压下去。
+		bioFetched: false
+	};
+	if (!BOT_TOKEN || !userId) return profile;
+	const cached = readAdProfileCache(userId);
+	// 缓存只在抓取成功时写入（见下方 writeAdProfileCache 的位置），
+	// 所以命中缓存等价于「近 5 分钟内成功查过」，bioFetched 置真。
+	if (cached) {
+		cached.status = '';
+		cached.bioFetched = true;
+		return cached;
+	}
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: String(userId) })
+		});
+		const result = await response.json();
+		const data = result?.result;
+		if (result?.ok && data) {
+			profile.firstName = String(data.first_name ?? profile.firstName);
+			profile.lastName = String(data.last_name ?? profile.lastName);
+			profile.username = String(data.username ?? profile.username);
+			profile.bio = String(data.bio ?? data.description ?? '');
+			profile.bioFetched = true;
+			// 【写缓存必须在这个 if 内】。原先它在外面，于是 API 返回 ok:false
+			// （最常见的就是 429 Too Many Requests）也会把一个空 bio 缓存 5 分钟 ——
+			// 与上一行注释宣称的「失败不写缓存」自相矛盾，实际效果是撞限流之后
+			// 整整 5 分钟按「此人没有简介」判定，正好放走那批只在 bio 里写广告的号。
+			// 现在只有确实拿到资料才缓存，失败即刻可重试。
+			writeAdProfileCache(userId, profile);
+		} else if (!result?.ok) {
+			console.log('[广告检测] getChat 失败 user=' + userId + ' : ' + (result?.description || 'unknown'));
+		}
+	} catch (error) {
+		// 失败不写缓存：宁可下一条消息再试一次，也不要把空 bio 钉住 5 分钟。
+		console.error('[广告检测] 抓取用户资料失败:', error);
+	}
+	return profile;
+}
+
+// 顺带取群内成员状态：restricted 是强信号（+5）。
+async function fetchAdMemberStatus(chatId, userId) {
+	if (!BOT_TOKEN || !chatId || !userId) return '';
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: String(chatId), user_id: String(userId) })
+		});
+		const result = await response.json();
+		return result?.ok ? String(result.result?.status || '') : '';
+	} catch (error) {
+		console.error('[广告检测] 查询成员状态失败:', error);
+		return '';
+	}
+}
+
+// 写入 / 更新观察窗口。达到观察分但未达封禁分的用户在此登记，
+// 窗口期内再发广告消息即累加复判，窗口过期自动剪枝。
+async function upsertAdScreening(env, userId, payload, config) {
+	if (!(await adDetectionReady(env))) return false;
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		const expiresAt = now + config.observationHours * 3600;
+		await env.DB.prepare(
+			'INSERT INTO ad_user_screening (user_id, chat_id, score, reasons, snapshot, layer, joined_at, expires_at, updated_at) '
+			+ 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET '
+			+ 'chat_id = excluded.chat_id, score = MAX(ad_user_screening.score, excluded.score), '
+			+ 'reasons = excluded.reasons, snapshot = excluded.snapshot, layer = excluded.layer, '
+			+ 'expires_at = excluded.expires_at, updated_at = excluded.updated_at'
+		).bind(
+			String(userId), String(payload?.chatId ?? ''), Math.max(0, Number(payload?.score) || 0),
+			JSON.stringify(payload?.reasons || []).slice(0, 2000),
+			JSON.stringify(payload?.snapshot || {}).slice(0, 2000),
+			String(payload?.layer || 'score'), now, expiresAt, now
+		).run();
+		return true;
+	} catch (error) {
+		console.error('[广告检测] 写入观察记录失败:', error);
+		return false;
+	}
+}
+
+async function readAdScreening(env, userId) {
+	if (!(await adDetectionReady(env))) return null;
+	try {
+		const row = await env.DB.prepare(
+			'SELECT user_id, chat_id, score, reasons, snapshot, layer, joined_at, expires_at FROM ad_user_screening WHERE user_id = ? AND expires_at > ?'
+		).bind(String(userId), Math.floor(Date.now() / 1000)).first();
+		if (!row) return null;
+		let reasons = [];
+		let snapshot = {};
+		try { reasons = JSON.parse(String(row.reasons || '[]')); } catch { reasons = []; }
+		try { snapshot = JSON.parse(String(row.snapshot || '{}')); } catch { snapshot = {}; }
+		return {
+			userId: String(row.user_id),
+			chatId: String(row.chat_id || ''),
+			score: Number(row.score) || 0,
+			reasons: Array.isArray(reasons) ? reasons : [],
+			snapshot: snapshot && typeof snapshot === 'object' ? snapshot : {},
+			layer: String(row.layer || ''),
+			joinedAt: Number(row.joined_at) || 0,
+			expiresAt: Number(row.expires_at) || 0
+		};
+	} catch (error) {
+		console.error('[广告检测] 读取观察记录失败:', error);
+		return null;
+	}
+}
+
+async function deleteAdScreening(env, userId) {
+	if (!env?.DB) return;
+	try {
+		await env.DB.prepare('DELETE FROM ad_user_screening WHERE user_id = ?').bind(String(userId)).run();
+	} catch (error) {
+		console.error('[广告检测] 删除观察记录失败:', error);
+	}
+}
+
+// 纯 D1 的过期数据剪枝：观察窗口、待确认快照、确认令牌三张表一起清。
+// 没有 KV 的 TTL 能用，只能靠每次检测顺带清一次。
+// === 发言者名册（方案 6 的两条轨道共用）===
+// 每条群消息都会 upsert 一行。看似「每条消息一次 D1 写」很贵，但 D1 写在付费 Workers
+// 上不是瓶颈（与 Telegram 的 429 相比可忽略），而这一行换来的是：
+//   ① 消息路径能判断「这个人查过 bio 没有」，从而把 getChat 从「每条一次」压到「3 天一次」；
+//   ② cron 有一份可枚举的名单 —— Bot API 【没有】列出群全部成员的方法，
+//      getChatAdministrators 只给管理员，getChatMemberCount 只给人数，
+//      所以想批量复查 bio，名单只能自己攒。
+// upsert 里刻意【不覆盖 bio_checked_at】：那是轨一的冷却计时器，
+// 发言本身不代表查过 bio，覆盖它会让冷却永远无法到期或反复重置。
+// 同时顺手更新 first_name / last_name / username —— cron 扫描时要用它们做零成本预判，
+// 而 cron 拿到的 getChat 结果本来也会带上，这里存一份是为了在 getChat 失败时仍有昵称可判。
+async function upsertAdGroupMember(env, userId, chatId, from = null, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return;
+	const uid = String(userId || '');
+	if (!uid) return;
+	try {
+		const now = Number(nowSeconds) || 0;
+		await env.DB.prepare(
+			'INSERT INTO ad_group_members (user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0) '
+			+ 'ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id, first_name = excluded.first_name, last_name = excluded.last_name, username = excluded.username, last_seen = excluded.last_seen'
+		).bind(
+			uid,
+			chatId != null ? String(chatId) : '',
+			from?.first_name ? String(from.first_name) : '',
+			from?.last_name ? String(from.last_name) : '',
+			from?.username ? String(from.username) : '',
+			now,
+			now
+		).run();
+	} catch (error) {
+		console.error('[广告检测] 更新发言者名册失败:', error);
+	}
+}
+
+// 读一行名册。返回 null 有两种含义（首次发言 / D1 出错），调用方【一律按「该查 bio」处理】：
+// 宁可多花一次 getChat，也不要因为读不到台账就跳过 bio 检测 —— 那正是漏放的来源。
+async function readAdGroupMember(env, userId) {
+	if (!env?.DB) return null;
+	const uid = String(userId || '');
+	if (!uid) return null;
+	try {
+		const row = await env.DB.prepare('SELECT user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at FROM ad_group_members WHERE user_id = ?').bind(uid).first();
+		return row || null;
+	} catch (error) {
+		console.error('[广告检测] 读取发言者名册失败:', error);
+		return null;
+	}
+}
+
+// 标记「刚查过 bio」。轨一与轨二都调用它，共用同一个冷却计时器 ——
+// 这样 cron 昨天刚扫过的人，今天发言不会再被查一次，两轨的配额互相抵扣而不是叠加。
+async function markAdBioChecked(env, userId, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return;
+	const uid = String(userId || '');
+	if (!uid) return;
+	try {
+		await env.DB.prepare('UPDATE ad_group_members SET bio_checked_at = ? WHERE user_id = ?').bind(Number(nowSeconds) || 0, uid).run();
+	} catch (error) {
+		console.error('[广告检测] 标记 bio 检查时间失败:', error);
+	}
+}
+
+// 是否需要为这个人拉一次 bio。三种情况都要查：
+//   ① 名册里没有他（首次发言，或 D1 读失败 —— 见 readAdGroupMember 的 fail-open 说明）；
+//   ② bio_checked_at 为 0（从没查过）；
+//   ③ 距上次查超过 AD_BIO_RECHECK_DAYS 天。
+// 时间倒流（时钟回拨或数据被手改到未来）时 now - checked 为负，也判定为不查 —— 无所谓，
+// cron 那一轨仍会按 bio_checked_at ASC 把他排到队首。
+function shouldCheckAdBio(member, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!member) return true;
+	const checked = Number(member.bio_checked_at) || 0;
+	if (checked <= 0) return true;
+	return (Number(nowSeconds) || 0) - checked >= AD_BIO_RECHECK_SECONDS;
+}
+
+// === 管理员列表缓存（仅供广告检测豁免使用）===
+// 【为什么不直接给 checkIfUserIsAdminInGroup 加缓存】：那个函数同时是 /ban、/spam 的
+// 鉴权入口。给它加 5 分钟缓存，等于让一个刚被撤职的管理员在 5 分钟内继续封人 ——
+// 用性能优化换来一个提权窗口，不可接受。
+// 所以缓存只做在广告检测这一侧：这里缓存过期的后果是「新任管理员被送去判定」，
+// 而管理员资料干净、分数远低于观察线，判定结果仍是放行，最坏情况只是白算一次。
+// 方向上是安全的（fail-safe 而非 fail-open），与鉴权路径的要求正好相反，故必须分开。
+const AD_ADMIN_CACHE = new Map();
+
+// 主动失效。【这不是可选的优化，是缓存能否成立的前提】：
+// 测试暴露了一个真实缺口 —— 「刚被提为管理员的人在 5 分钟内失去豁免」。
+// 我原先判断这个代价可以接受，理由是「管理员资料干净不会被封」，但那是错的：
+// 管理员恰恰是最可能在群里【转发广告样本做说明】、贴可疑链接讲解的人，
+// 那种消息的评分本来就高，豁免一失效就会把管理员自己封掉。
+// 所以必须让缓存能被事件驱动地清掉 —— handleChatMemberUpdate 收到
+// 管理员身份变更时立即调用，使新任/撤职都即时生效，而不是等 TTL 自然过期。
+// 不传 chatId 时清空全部（供测试隔离场景，以及将来批量刷新场景使用）。
+function invalidateAdAdminCache(chatId = null) {
+	if (chatId == null || chatId === '') {
+		AD_ADMIN_CACHE.clear();
+		return;
+	}
+	AD_ADMIN_CACHE.delete(String(chatId));
+}
+
+async function isAdminForAdDetection(chatId, userId) {
+	const chatKey = String(chatId || '');
+	const uid = String(userId || '');
+	if (!chatKey || !uid) return false;
+	const hit = AD_ADMIN_CACHE.get(chatKey);
+	if (hit && Date.now() <= hit.expiresAt) return hit.ids.has(uid);
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: chatKey }),
+		});
+		const result = await response.json();
+		if (!response.ok || !result.ok || !Array.isArray(result.result)) {
+			// 【失败时不写缓存、且沿用旧缓存（哪怕已过期）】。
+			// 撞 429 时如果直接返回 false，全群管理员的豁免会同时失效，
+			// 他们发的每条消息都要走完整判定 —— 而管理员本来最可能在群里
+			// 转发广告样本、贴可疑链接做说明，这些内容评分很高。
+			// 宁可多信一份陈旧的管理员名单，也不要在 API 抖动时批量误伤管理员。
+			console.log(`[广告检测] 群 ${chatKey} 管理员列表查询失败: ${result.description || `HTTP ${response.status}`}`);
+			if (hit) return hit.ids.has(uid);
+			return false;
+		}
+		const ids = new Set(result.result.map((member) => String(member?.user?.id || '')).filter(Boolean));
+		AD_ADMIN_CACHE.set(chatKey, { ids, expiresAt: Date.now() + AD_ADMIN_CACHE_TTL_MS });
+		return ids.has(uid);
+	} catch (error) {
+		console.error(`[广告检测] 群 ${chatKey} 管理员列表查询异常:`, error);
+		if (hit) return hit.ids.has(uid);
+		return false;
+	}
+}
+
+// === 闸三 · 定时滚动复查（cron）===
+// 存在的理由只有一个：闸一闸二都发生在【发言的那一刻】，而广告号的标准玩法是
+// 先用干净资料混进来、发几句正常话过检，事后再把 bio 改成广告 —— 从此不再发言，
+// 消息路径永远不会被触发，他就永久隐身。这一闸把「曾经发言过的人」按
+// bio_checked_at 升序滚动重查，把那个时间差补掉。
+//
+// 【为什么名单只能来自自建表】：Bot API 没有列出群全部成员的方法。
+// getChatAdministrators 只返回管理员，getChatMemberCount 只返回一个数字。
+// 因此「部署后从未发过一句话的潜伏号」任何方案都枚举不到 —— 这是 API 的边界，
+// 不是本方案的缺口，换任何实现都一样。名册覆盖的是「发言过的所有人」。
+
+async function readAdScanState(env, key, fallback = '') {
+	if (!env?.DB) return fallback;
+	try {
+		const row = await env.DB.prepare('SELECT value FROM ad_scan_state WHERE key = ?').bind(String(key)).first();
+		return row?.value != null ? String(row.value) : fallback;
+	} catch (error) {
+		console.error('[广告检测] 读取扫描状态失败:', error);
+		return fallback;
+	}
+}
+
+async function writeAdScanState(env, key, value, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return;
+	try {
+		await env.DB.prepare(
+			'INSERT INTO ad_scan_state (key, value, updated_at) VALUES (?, ?, ?) '
+			+ 'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
+		).bind(String(key), String(value), Number(nowSeconds) || 0).run();
+	} catch (error) {
+		console.error('[广告检测] 写入扫描状态失败:', error);
+	}
+}
+
+// 取下一批待复查的人。排序键是 bio_checked_at ASC —— 「最久没查过的排最前」。
+// 【这就是游标本身，不需要另存偏移量】：查完就把 bio_checked_at 推到现在，
+// 他自动落到队尾，下一批自然取到别人。这个自平衡的性质意味着增删行、
+// 跨天中断、Worker 重启都不会让扫描错位或重复，比显式 offset 游标健壮得多。
+// 排除已在黑名单里的人：已经封掉了，再查 bio 纯属浪费配额。
+async function loadAdRescanBatch(env, limit, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return [];
+	try {
+		const rows = await env.DB.prepare(
+			'SELECT m.user_id, m.chat_id, m.first_name, m.last_name, m.username, m.bio_checked_at '
+			+ 'FROM ad_group_members m LEFT JOIN blacklist b ON b.id = m.user_id '
+			+ 'WHERE b.id IS NULL AND m.bio_checked_at <= ? '
+			+ 'ORDER BY m.bio_checked_at ASC LIMIT ?'
+		).bind((Number(nowSeconds) || 0) - AD_BIO_RECHECK_SECONDS, Math.max(1, Number(limit) || 1)).all();
+		return Array.isArray(rows?.results) ? rows.results : [];
+	} catch (error) {
+		console.error('[广告检测] 读取待复查名单失败:', error);
+		return [];
+	}
+}
+
+// 复查一个人。与消息路径共用【同一个】evaluateAdSuspect 和【同一套】阈值 ——
+// 刻意不为定时扫描另设更松或更严的标准：两条路径判出不同结果会让 /ignore 的
+// 白名单效果只在一条路径上生效，是维护噩梦。
+// 差别只在输入：这里没有消息正文和转发来源（他没在发言），所以判据是昵称 + 用户名 + bio
+// 加上指纹库与 AI 语义。这正好对准「改了 bio 的潜伏号」。
+async function rescanAdMember(env, row, options = {}) {
+	const userId = String(row?.user_id || '');
+	if (!userId) return { scanned: false, banned: false };
+	const chatId = String(row?.chat_id || '');
+	const nowSeconds = Math.floor(Date.now() / 1000);
+
+	// 主人/副主人/超管永不判定，与消息路径一致。
+	if (isPrivilegedManager(userId)) {
+		await markAdBioChecked(env, userId, nowSeconds);
+		return { scanned: false, banned: false, reason: 'privileged' };
+	}
+	// 管理员兜底豁免。消息路径在豁免后就不写名册，所以名册里的管理员只能来自
+	// 「先以普通成员发言、之后才被提为管理员」。缓存命中时这一步接近零成本。
+	if (chatId && await isAdminForAdDetection(chatId, userId)) {
+		await markAdBioChecked(env, userId, nowSeconds);
+		return { scanned: false, banned: false, reason: 'admin' };
+	}
+
+	const profile = await fetchAdUserProfile(userId, {
+		first_name: row?.first_name || '',
+		last_name: row?.last_name || '',
+		username: row?.username || ''
+	});
+	// 无论成功失败都记时间戳：失败多半是 429，卡在同一个人身上重试会拖垮整批，
+	// 而他只是排到队尾，下一轮还会被取到，不会永久漏掉。
+	await markAdBioChecked(env, userId, nowSeconds);
+	if (!profile.bioFetched) return { scanned: true, banned: false, reason: 'fetch_failed' };
+
+	const evaluation = await evaluateAdSuspect(
+		env,
+		{ profile, text: '', forwardChat: null },
+		{ config: options.config, whitelist: options.whitelist, skipMissingBioPenalty: false }
+	);
+	if (evaluation.verdict !== 'ban') {
+		// 【不写观察记录】。观察窗口的语义是「短期内再有动作就合并裁决」，
+		// 而这一轨扫的正是不发言的人 —— 给他们写观察记录只会让 ad_user_screening
+		// 被 300 条/天的扫描结果灌满，把真正需要盯的新入群用户挤掉。
+		return { scanned: true, banned: false };
+	}
+
+	const result = await enforceAdDetection(env, {
+		userId,
+		chatId,
+		chatTitle: '',
+		messageId: null
+	}, evaluation, { config: options.config, whitelist: options.whitelist });
+	console.log('[广告检测·扫描] 封禁 user=' + userId + ' score=' + evaluation.score + '/' + evaluation.threshold);
+	return { scanned: true, banned: result?.banned !== false, seq: result?.seq ?? null };
+}
+
+// 一次 cron 触发扫多少：AD_SCAN_DAILY_LIMIT 个，切成 AD_SCAN_BATCH_SIZE 一批，
+// 批间隔 AD_SCAN_BATCH_INTERVAL_MS。
+// 分批 + 间隔的唯一目的是【不撞 Telegram 的 429】：300 次 getChat 一口气发出去
+// 必然限流，摊到 30 秒里约 10 req/s，离全局约 30 req/s 有足够余量，
+// 也给同一时刻正常收发消息的路径留出配额。
+// 当日计数存 D1 并按日期戳跨天重置，这样即便 cron 配成一天多次，总量也不会超。
+async function runAdBioRescan(env, options = {}) {
+	if (!env?.DB) return { scanned: 0, banned: 0, skipped: 'no_db' };
+	if (!(await adDetectionReady(env))) return { scanned: 0, banned: 0, skipped: 'not_ready' };
+
+	const config = loadAdDetectionConfig(env);
+	if (config.enabled === false) return { scanned: 0, banned: 0, skipped: 'disabled' };
+	const whitelist = await loadAdDomainWhitelist(env);
+
+	const nowSeconds = Math.floor(Date.now() / 1000);
+	// 日期戳用 UTC 日期字符串，不用「除以 86400」—— 后者在跨月上也没错，
+	// 但排障时看不出是哪一天；YYYY-MM-DD 可以直接对着日志读。
+	const today = new Date(nowSeconds * 1000).toISOString().slice(0, 10);
+	const savedDay = await readAdScanState(env, 'scan_day', '');
+	const done = savedDay === today ? (Number(await readAdScanState(env, 'scan_count', '0')) || 0) : 0;
+	if (savedDay !== today) await writeAdScanState(env, 'scan_day', today, nowSeconds);
+
+	const dailyLimit = Number(options.dailyLimit) > 0 ? Number(options.dailyLimit) : AD_SCAN_DAILY_LIMIT;
+	const batchSize = Number(options.batchSize) > 0 ? Number(options.batchSize) : AD_SCAN_BATCH_SIZE;
+	const intervalMs = Number(options.intervalMs) >= 0 ? Number(options.intervalMs) : AD_SCAN_BATCH_INTERVAL_MS;
+	let remaining = dailyLimit - done;
+	if (remaining <= 0) return { scanned: 0, banned: 0, skipped: 'daily_limit_reached', done };
+
+	let scanned = 0;
+	let banned = 0;
+	let batches = 0;
+	while (remaining > 0) {
+		const take = Math.min(batchSize, remaining);
+		const rows = await loadAdRescanBatch(env, take, Math.floor(Date.now() / 1000));
+		// 名单取空说明【所有人都在冷却期内】—— 不是出错，是已经全部查过了。
+		// 直接收工，剩余配额不结转（明天会有新的），也不空转浪费 CPU。
+		if (!rows.length) break;
+		batches += 1;
+		for (const row of rows) {
+			try {
+				const outcome = await rescanAdMember(env, row, { config, whitelist });
+				if (outcome.scanned) scanned += 1;
+				if (outcome.banned) banned += 1;
+			} catch (error) {
+				// 单个人出错不能中断整批：否则一个坏数据就能让扫描永久停在同一位置。
+				// markAdBioChecked 已在 rescanAdMember 内先行执行，他仍会排到队尾。
+				console.error('[广告检测·扫描] 处理 user=' + row?.user_id + ' 失败:', error);
+			}
+			remaining -= 1;
+			if (remaining <= 0) break;
+		}
+		await writeAdScanState(env, 'scan_count', String(done + scanned), Math.floor(Date.now() / 1000));
+		// 最后一批之后不必再等 —— 那 3 秒纯粹浪费 cron 的运行时长。
+		if (remaining > 0 && intervalMs > 0) await new Promise((resolve) => setTimeout(resolve, intervalMs));
+	}
+
+	await writeAdScanState(env, 'scan_count', String(done + scanned), Math.floor(Date.now() / 1000));
+	console.log('[广告检测·扫描] 本轮完成 批次=' + batches + ' 复查=' + scanned + ' 封禁=' + banned + ' 当日累计=' + (done + scanned) + '/' + dailyLimit);
+	return { scanned, banned, batches, done: done + scanned, dailyLimit };
+}
+
+async function pruneAdDetectionData(env, nowSeconds = Math.floor(Date.now() / 1000)) {
+	if (!env?.DB) return;
+	try {
+		if (!(await adDetectionReady(env))) return;
+		const now = Number(nowSeconds) || 0;
+		await env.DB.batch([
+			env.DB.prepare('DELETE FROM ad_user_screening WHERE expires_at < ?').bind(now),
+			env.DB.prepare('DELETE FROM ad_user_screening WHERE joined_at < ?').bind(now - AD_SCREENING_RETENTION_SECONDS),
+			// 【ad_pending_snapshots 刻意不剪枝】（2026-09-08）主人要求快照长期保留，
+			// 而且这些行还承担「占住序号防止复用」的职责 —— 删掉任何一行都会让
+			// MAX(seq) 回退，下一个新快照重发旧序号，主人照旧通知回滚就解封错人。
+			// 行数不是问题：一天 50 个号、单条 4~5 KB，一年约 90 MB。
+			// 详见 allocateAdPendingSnapshot 与 deleteAdPendingSnapshot 的说明。
+			env.DB.prepare('DELETE FROM ad_confirm_tokens WHERE expires_at < ?').bind(now),
+			// 名册按「最后发言时间」剪枝，不按 first_seen —— 老成员只要还在说话就该留着。
+			// 超期的大概率已退群，删掉是为了不让他们白占每天 300 个的扫描配额。
+			// 误删的代价极小：本人下次发言会立刻重新 upsert，并因 bio_checked_at 归零而被查一次 bio。
+			env.DB.prepare('DELETE FROM ad_group_members WHERE last_seen < ?').bind(now - AD_MEMBER_RETENTION_SECONDS)
+		]);
+	} catch (error) {
+		console.error('[广告检测] 清理过期数据失败:', error);
+	}
+}
+
+// === 待确认快照（纯 D1 替代 KV）===
+// 广告判定命中后把现场快照按序号写入 D1，推私聊给第一主人；主人用 /ignore <序号> 标误判回滚。
+//
+// 【2026-09-08 序号改成单调递增、永不复用】原实现是 seq = MAX(seq) + 1，超过
+// AD_PENDING_MAX_LIMIT（50）回绕到 1 并 DELETE 掉旧的同序号行。那套机制有一个会
+// 【解封错人】的隐患：MAX(seq) 会随着行被删除而回退 —— 过期剪枝删掉高序号、
+// 或者 /ignore 刚好处理掉当前最大序号，下一个新快照就会拿到一个主人手上还留着的旧序号，
+// 主人照着旧通知发 /ignore 就解封了另一个人。1 小时 TTL 让这个窗口很窄，
+// 一旦按主人要求改成长期保留就立刻暴露，所以这两件事必须一起改。
+//
+// 新机制靠「行永不物理删除」保证 MAX(seq) 单调：
+//   · 新快照 expires_at = now + 100 年；
+//   · 复核完毕（/ignore、/unban）把 expires_at 置 0，行留着占住序号；
+//   · pruneAdDetectionData 不再 DELETE 这张表。
+async function allocateAdPendingSnapshot(env, ownerId, payload) {
+	if (!(await adDetectionReady(env))) return null;
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		const owner = String(ownerId);
+		// 不带 expires_at 条件：已复核的行（expires_at = 0）也要参与取最大值，
+		// 否则它们占住的序号会被重新发出去，等于没改。
+		const maxRow = await env.DB.prepare('SELECT MAX(seq) AS m FROM ad_pending_snapshots WHERE owner_id = ?').bind(owner).first();
+		const seq = (Number(maxRow?.m) || 0) + 1;
+		await env.DB.prepare(
+			'INSERT INTO ad_pending_snapshots (owner_id, seq, user_id, chat_id, score, reasons, snapshot, created_at, expires_at) '
+			+ 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+		).bind(
+			owner, seq, String(payload?.userId ?? ''), String(payload?.chatId ?? ''),
+			Math.max(0, Number(payload?.score) || 0),
+			JSON.stringify(payload?.reasons || []).slice(0, 2000),
+			JSON.stringify(payload?.snapshot || {}).slice(0, 2000),
+			now, now + AD_PENDING_SNAPSHOT_TTL_SECONDS
+		).run();
+		return seq;
+	} catch (error) {
+		console.error('[广告检测] 写入待确认快照失败:', error);
+		return null;
+	}
+}
+
+async function readAdPendingSnapshot(env, ownerId, seq) {
+	if (!(await adDetectionReady(env))) return null;
+	try {
+		const row = await env.DB.prepare(
+			'SELECT seq, user_id, chat_id, score, reasons, snapshot, created_at FROM ad_pending_snapshots WHERE owner_id = ? AND seq = ? AND expires_at > ?'
+		).bind(String(ownerId), Number(seq) || 0, Math.floor(Date.now() / 1000)).first();
+		if (!row) return null;
+		let reasons = [];
+		let snapshot = {};
+		try { reasons = JSON.parse(String(row.reasons || '[]')); } catch { reasons = []; }
+		try { snapshot = JSON.parse(String(row.snapshot || '{}')); } catch { snapshot = {}; }
+		return {
+			seq: Number(row.seq) || 0,
+			userId: String(row.user_id || ''),
+			chatId: String(row.chat_id || ''),
+			score: Number(row.score) || 0,
+			reasons: Array.isArray(reasons) ? reasons : [],
+			snapshot: snapshot && typeof snapshot === 'object' ? snapshot : {},
+			createdAt: Number(row.created_at) || 0
+		};
+	} catch (error) {
+		console.error('[广告检测] 读取待确认快照失败:', error);
+		return null;
+	}
+}
+
+async function listAdPendingSnapshots(env, ownerId, limit = AD_PENDING_DEFAULT_LIMIT) {
+	if (!(await adDetectionReady(env))) return { ok: false, rows: [], total: 0 };
+	const capped = Math.min(AD_PENDING_MAX_LIMIT, Math.max(1, Number(limit) || AD_PENDING_DEFAULT_LIMIT));
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		const totalRow = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE owner_id = ? AND expires_at > ?')
+			.bind(String(ownerId), now).first();
+		const { results } = await env.DB.prepare(
+			'SELECT seq, user_id, chat_id, score, reasons, snapshot, created_at FROM ad_pending_snapshots '
+			// 【2026-09-08 从 seq ASC 改成 seq DESC】配套快照长期保留：
+			// 序号现在单调递增不回绕，ASC + LIMIT 会让 /pending 永远停在最早那批，
+			// 新封的号根本翻不到 —— 而主人要复核的恰恰是刚封的。改成最新在前。
+			+ 'WHERE owner_id = ? AND expires_at > ? ORDER BY seq DESC LIMIT ?'
+		).bind(String(ownerId), now, capped).all();
+		const rows = (results || []).map((row) => {
+			let reasons = [];
+			let snapshot = {};
+			try { reasons = JSON.parse(String(row.reasons || '[]')); } catch { reasons = []; }
+			try { snapshot = JSON.parse(String(row.snapshot || '{}')); } catch { snapshot = {}; }
+			return {
+				seq: Number(row.seq) || 0,
+				userId: String(row.user_id || ''),
+				chatId: String(row.chat_id || ''),
+				score: Number(row.score) || 0,
+				reasons: Array.isArray(reasons) ? reasons : [],
+				snapshot: snapshot && typeof snapshot === 'object' ? snapshot : {},
+				createdAt: Number(row.created_at) || 0
+			};
+		});
+		return { ok: true, rows, total: Number(totalRow?.c) || 0 };
+	} catch (error) {
+		console.error('[广告检测] 列出待确认快照失败:', error);
+		return { ok: false, rows: [], total: 0 };
+	}
+}
+
+// 复核完毕后把快照标记为已处理（不物理删除）。
+//
+// 【为什么不 DELETE】seq 是 MAX(seq) + 1 推出来的，行一删 MAX 就回退，
+// 下一个新快照会重发一个主人手上还留着的旧序号 —— 主人照旧通知发 /ignore 会解封错人。
+// 置 expires_at = 0 之后：行留在表里继续占住序号，而 readAdPendingSnapshot 与
+// listAdPendingSnapshots 的既有 expires_at > now 条件天然把它排除，
+// 对外表现和删掉完全一样。详见 allocateAdPendingSnapshot 的说明。
+async function deleteAdPendingSnapshot(env, ownerId, seq) {
+	if (!env?.DB) return false;
+	try {
+		const result = await env.DB.prepare('UPDATE ad_pending_snapshots SET expires_at = 0 WHERE owner_id = ? AND seq = ? AND expires_at > 0')
+			.bind(String(ownerId), Number(seq) || 0).run();
+		return Number(result?.meta?.changes || 0) > 0;
+	} catch (error) {
+		console.error('[广告检测] 标记待确认快照已处理失败:', error);
+		return false;
+	}
+}
+
+// === 二次确认令牌（纯 D1 替代 KV，60 秒有效）===
+async function issueAdConfirmToken(env, action, userId, payloadObject) {
+	if (!(await adDetectionReady(env))) return null;
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		const token = adTextHash(String(action) + ':' + String(userId) + ':' + now + ':' + Math.random());
+		await env.DB.prepare(
+			'INSERT INTO ad_confirm_tokens (token, action, payload, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)'
+		).bind(
+			token, String(action), JSON.stringify(payloadObject || {}).slice(0, 1000),
+			String(userId), now, now + AD_CONFIRM_TOKEN_TTL_SECONDS
+		).run();
+		return token;
+	} catch (error) {
+		console.error('[广告检测] 签发确认令牌失败:', error);
+		return null;
+	}
+}
+
+// 消费令牌：一次性，读取即删除，避免重复执行破坏性操作。
+async function consumeAdConfirmToken(env, token, action, userId) {
+	if (!(await adDetectionReady(env))) return null;
+	try {
+		const row = await env.DB.prepare(
+			'SELECT token, action, payload, user_id, expires_at FROM ad_confirm_tokens WHERE token = ?'
+		).bind(String(token)).first();
+		if (!row) return null;
+		await env.DB.prepare('DELETE FROM ad_confirm_tokens WHERE token = ?').bind(String(token)).run();
+		if (String(row.action) !== String(action)) return null;
+		if (String(row.user_id) !== String(userId)) return null;
+		if ((Number(row.expires_at) || 0) <= Math.floor(Date.now() / 1000)) return null;
+		let payload = {};
+		try { payload = JSON.parse(String(row.payload || '{}')); } catch { payload = {}; }
+		return { action: String(row.action), payload };
+	} catch (error) {
+		console.error('[广告检测] 校验确认令牌失败:', error);
+		return null;
+	}
+}
+
+// === 三层合并判定 ===
+// 判定顺序：结构化评分 → 指纹库 → AI 语义。任一层给出硬命中即判广告；
+// AI 软命中（0.65 ≤ 相似度 < 阈值）只加 2 分，交给总分裁决，避免语义层单独误杀。
+async function evaluateAdSuspect(env, input, options = {}) {
+	const config = options.config || loadAdDetectionConfig(env);
+	const whitelist = options.whitelist instanceof Set ? options.whitelist : await loadAdDomainWhitelist(env);
+
+	const profile = input?.profile || {};
+	const displayName = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
+	const text = String(input?.text ?? '').trim();
+	// 引用体正文。调用方不传就是空串 —— cron 那一轨没有消息上下文，天然没有引用体。
+	const quotedText = String(input?.quotedText ?? '').trim();
+
+	// skipMissingBioPenalty 透传：调用方明确知道「这次没查 bio」时置真，
+	// 避免把「未知的 bio」当成「空的 bio」拿去减分。详见 scoreAdProfile 内该项的说明。
+	const profileResult = scoreAdProfile(profile, { whitelist, skipMissingBioPenalty: options.skipMissingBioPenalty === true });
+	const textResult = text ? scoreAdMessageText(text, { whitelist }) : { score: 0, reasons: [], tradeHits: [], businessHits: [] };
+	const forwardResult = input?.forwardChat ? scoreAdForwardChat(input.forwardChat) : { score: 0, reasons: [], isAd: false };
+	// 上下文判据（极短正文 + 转发来源同现）。
+	// 【2026-09-08 起这两条恒为 0 分】—— AD_FORWARD_JUDGE_ENABLED 已按主人要求关闭整个
+	// 频道 / 群组维度。调用保留是为了让开关能一处生效、不必再改本函数。
+	const contextResult = scoreAdMessageContext(text, input?.forwardChat || null);
+
+	// behaviorScore：本次这条消息【自身】贡献的分数（正文 + 上下文判据 + 转发来源）。
+	// 严格排除静态资料分（昵称 / username / bio）、指纹分与 AI 语义分 ——
+	// 后三者都可能完全来自资料卡，而资料卡是恒定的：同一份 bio 会在这个人发的
+	// 每一条消息上被重算一遍，用它当「新证据」等于把一份证据用到无限次。
+	// 两处用途：① 观察窗口历史分是否参与裁决（detectAdOnMessage 的 applyHistory）；
+	//          ② 观察记录里【只存这一份】（retainScore），根治 double counting。
+	const behaviorScore = textResult.score + contextResult.score
+		+ (forwardResult.isAd ? forwardResult.score : 0);
+
+	let score = profileResult.score + textResult.score + contextResult.score
+		+ (forwardResult.isAd ? forwardResult.score : 0);
+	const reasons = [...profileResult.reasons, ...textResult.reasons, ...contextResult.reasons];
+	if (forwardResult.isAd) reasons.push(...forwardResult.reasons);
+	let layer = 'score';
+
+	const payload = {
+		name: displayName,
+		username: profile.username ? '@' + String(profile.username).replace(/^@/, '') : '',
+		bio: profile.bio || '',
+		text,
+		// 引用体正文（他引用/回复的那条别人的消息）。只喂给 quoted 通道做布尔判定，
+		// 【刻意不进 domains、不进 semanticText、不进指纹学习】—— 那段文字不是他写的，
+		// 拿它去学指纹等于把别人的话记成他的特征，也会污染 AI 语义样本库。
+		quoted: quotedText,
+		domains: extractAdDomains([displayName, profile.bio, text].filter(Boolean).join('\n'))
+	};
+
+	const fingerprint = await matchAdFingerprints(env, payload, { config });
+	if (fingerprint.hits.length) {
+		score += fingerprint.score;
+		layer = 'fingerprint';
+		reasons.push('+' + fingerprint.score + ' 指纹库命中：' + fingerprint.hits.slice(0, 3).map((h) => h.value).join(' / '));
+	}
+	// 【P1 单词不封（2026-09-09 主人下令）】USDT 单个出现无法区分正常聊天与广告，
+	// 正常用户也会聊「USDT 今天价格不错」。所以指纹级封禁必须由【非单业务词】命中构成：
+	// 裸业务词指纹（usdt / 价格表 / 代练…）命中只加分，不单独定罪。
+	// 组合广告词（如「收购 USDT 秒结」）由结构通道「招揽∧行业」兜底封禁，不依赖这才这里放。
+	const fingerprintBan = fingerprint.hits.length > 0
+		&& fingerprint.nonSingleMaxWeight >= AD_FINGERPRINT_BAN_WEIGHT;
+
+	let ai = { available: false, similarity: 0, sample: null, isMatch: false, isSoft: false };
+	// 【检测端与学习端共用同一个拼装函数】原来这里手写 join，与 buildAdSampleText 拼法碰巧一致
+	// 靠的是两处各自维护 —— 一改就会分叉。2026-09-09 加链接归一化时正式收敛到一处：
+	// payload 的 name / bio / text 与 buildAdSampleText 取的三个字段完全对应，
+	// 换成函数调用后行为与改动前唯一的差别就是「URL 被换成语义占位符」，
+	// 这也正是要的效果 —— 比对时剥链接、学习时也剥链接，两边看到的是同一种文本。
+	const semanticText = buildAdSampleText(payload);
+	if (config.aiEnabled && semanticText.length >= 6) {
+		ai = await checkAdAiSimilarity(env, semanticText, { config });
+		if (ai.isMatch) {
+			layer = 'ai';
+			reasons.push('AI 语义相似度 ' + ai.similarity.toFixed(3) + ' ≥ 阈值 ' + config.aiSimilarityThreshold);
+		} else if (ai.isSoft) {
+			score += AD_AI_SOFT_BONUS_SCORE;
+			reasons.push('+' + AD_AI_SOFT_BONUS_SCORE + ' AI 语义弱相似 ' + ai.similarity.toFixed(3));
+		}
+	}
+
+	// ===== 四通道结构查杀 =====
+	// 放在最后：前面几层的 reasons 已采集完，这里只叠加「是否直接定罪」。
+	// 刻意【不加分】—— 结构查杀是布尔判定，不是评分项。给它加分会污染 behaviorScore
+	// 与观察窗口历史分的语义（那两处衡量的都是「本次消息贡献了多少新证据」）。
+	// 四条通道短路求值，命中即止，定罪结论一样：
+	//   card     昵称 + @handle + 简介，两类同现（证据最全，优先）
+	//   identity 昵称 + 简介，单类命中即封（2026-09-08 主人新增，只认强构词模式）
+	//   body     简介 + 本条正文，两类同现（资料卡侥幸过关的在这里收网）
+	//   quoted   引用体正文，两类同现 + 本人正文近乎为空且非举报语义（2026-09-08 新增）
+	// identity 排在 card 之后：两者判定域重叠，card 命中时 reasons 更具体（带形态 A/B），
+	// 没必要再跑一遍单类判据；card 不中才轮到 identity 用更宽的门槛兜。
+	// quoted 排在最后：它的判定域（别人写的那段话）与前三条完全不重叠，是纯增量的一路，
+	// 而且门槛最特殊（要求本人正文近乎为空），前三条任一命中就没必要再看引用体。
+	let structure = { guilty: false, channel: '', form: '', reasons: [] };
+	if (config.structureKill !== 'off') {
+		const card = judgeAdProfileCard(payload);
+		if (card.guilty) {
+			structure = card;
+		} else {
+			const identity = judgeAdIdentityKill(payload);
+			if (identity.guilty) {
+				structure = identity;
+			} else {
+				const body = judgeAdBodyWithBio(payload);
+				structure = body.guilty ? body : judgeAdQuotedKill(payload);
+				// 引用体查杀被门槛二 / 豁免词放行时留一行记录 —— 主人复核时要能看出
+				// 「引用的确实是广告，但本人是在举报」，否则这条放行路径完全不可观测。
+				if (!structure.guilty && structure.reasons.length) reasons.push(...structure.reasons);
+			}
+			// 身份查杀被豁免词放行时也留一行记录 —— 主人复核误封/漏放时要能看出
+			// 「命中过、被豁免词赦免了」，否则这条路径完全不可观测。
+			if (!structure.guilty && identity.reasons.length) reasons.push(...identity.reasons);
+		}
+		if (structure.guilty) reasons.push(...structure.reasons);
+	}
+	const structureBan = structure.guilty && config.structureKill === 'ban';
+
+	const hardHit = fingerprintBan || Boolean(ai.isMatch) || structureBan;
+	const verdict = (score >= config.scoreThreshold || hardHit)
+		? 'ban'
+		// observe 模式下的结构命中不封，但必须留观察记录 + 推快照给主人人工过目，
+		// 否则这个模式就只是「静默放过」，起不到看误伤面的作用。
+		: ((structure.guilty || score >= config.observationScore) ? 'observe' : 'pass');
+
+	return {
+		verdict,
+		score,
+		layer: structureBan ? structure.channel
+			: (hardHit ? (ai.isMatch ? 'ai' : 'fingerprint')
+				: (structure.guilty ? structure.channel : layer)),
+		reasons,
+		threshold: config.scoreThreshold,
+		fingerprintHits: fingerprint.hits,
+		// 结构查杀结论透传给处置端。用途：命中即自动学指纹 ——
+		// 这类号是批量注册的，昵称与 bio 高度雷同，学一次之后同款走指纹层直接命中，
+		// 不必每条消息都重跑结构判定。
+		structure,
+		behaviorScore,
+		// retainScore：写进 ad_user_screening.score 的值，【只含行为分，不含静态资料分】。
+		// 这是 double counting 的根治点：旧代码存的是 evaluation.score（总分，含 bio / username /
+		// 昵称这些恒定项），下次评分又把同一份资料从头算一遍，等于一份证据算两次；
+		// 再叠上 score = MAX(旧, 新) 与每次 upsert 都刷新 expires_at，一个人被判过一次 observe
+		// 就几乎不可能再降下来 —— @MiLov1900 两次被误封的根本原因。
+		// 夹到 >= 0：负分没有留存意义（观察记录只表达「累积了多少可疑行为」）。
+		retainScore: Math.max(0, behaviorScore),
+		aiSimilarity: ai.similarity,
+		aiSample: ai.sample,
+		payload,
+		// bioChecked 区分「查过 bio 且为空」与「本次没查 bio」。
+		// 这两者在 snapshot.bio 里长得一模一样（都是空串），但对人的意义完全不同：
+		// 主人拿到通知要决定「放着不动」还是 /ignore 回滚，看到「简介为空」会以为已经核过了。
+		// 通知渲染据此写明「未查询」，避免误导。
+		bioChecked: options.skipMissingBioPenalty !== true,
+		snapshot: {
+			name: displayName.slice(0, 120),
+			username: payload.username.slice(0, 40),
+			bio: String(profile.bio || '').slice(0, 200),
+			text: text.slice(0, 300),
+			status: String(profile.status || ''),
+			forwardTitle: String(input?.forwardChat?.title || '').slice(0, 120)
+		}
+	};
+}
+
+const AD_LAYER_LABELS = {
+	score: '结构化评分', fingerprint: '指纹库', ai: 'AI 语义',
+	card: '资料卡查杀（用户名+简介）', body: '正文查杀（简介+正文）'
+};
+
+// 渲染推送给第一主人的判定通知。序号是 /ignore 的唯一入口。
+function renderAdDetectionNotice(evaluation, context) {
+	const lines = [];
+	lines.push('<b>🚫 广告号自动封禁</b>');
+	if (context?.seq) lines.push('快照序号：<b>#' + context.seq + '</b>');
+	lines.push('用户：<code>' + escapeHtml(String(context?.userId || '')) + '</code>');
+	if (evaluation.snapshot.name) lines.push('名称：' + escapeHtml(evaluation.snapshot.name));
+	if (evaluation.snapshot.username) lines.push('用户名：' + escapeHtml(evaluation.snapshot.username));
+	// 简介三态，缺一不可：有内容 / 查过但为空 / 本次没查。
+	// 旧写法只在有内容时显示，后两种都渲染成「没有这一行」—— 主人无法判断
+	// 「这个号确实没写简介」还是「简介根本没看过」，而这直接影响他要不要发 /ignore 回滚。
+	if (evaluation.snapshot.bio) lines.push('简介：' + escapeHtml(evaluation.snapshot.bio));
+	else if (evaluation.bioChecked === false) lines.push('简介：（本次未查询 —— 昵称/正文/转发已够封禁线，无需再拉资料）');
+	else lines.push('简介：（空）');
+	if (evaluation.snapshot.text) lines.push('消息：' + escapeHtml(evaluation.snapshot.text));
+	if (evaluation.snapshot.forwardTitle) lines.push('转发来源：' + escapeHtml(evaluation.snapshot.forwardTitle));
+	// 群内身份同理。热路径已不查 getChatMember（restricted 归零后它不再影响判定），
+	// 空值一律是「未查询」而不是「查不到」，写明白以免被当成账号异常的证据。
+	lines.push('群内身份：' + (evaluation.snapshot.status ? escapeHtml(String(evaluation.snapshot.status)) : '未查询（不影响判定：受限状态已不计分）'));
+	if (context?.chatTitle) lines.push('来源群组：' + escapeHtml(String(context.chatTitle)));
+	lines.push('判定层：' + (AD_LAYER_LABELS[evaluation.layer] || evaluation.layer));
+	lines.push('得分：<b>' + evaluation.score + '</b> / 阈值 ' + evaluation.threshold);
+	if (evaluation.aiSimilarity > 0) lines.push('语义相似度：' + evaluation.aiSimilarity.toFixed(3));
+	if (evaluation.reasons.length) {
+		lines.push('判定依据：');
+		for (const reason of evaluation.reasons.slice(0, 10)) lines.push('· ' + escapeHtml(String(reason)));
+	}
+	if (context?.banSummary) lines.push('封禁结果：' + escapeHtml(String(context.banSummary)));
+	if (context?.seq) {
+		lines.push('');
+		// 判定正确不给出口：指纹与 AI 样本已在 enforceAdDetection 里自动学入，
+		// 主人【什么都不用做】。/confirm 已于 2026-09-08 删除。
+		lines.push('判定正确：无需任何操作（已自动学入指纹与 AI 样本）');
+		lines.push('判定错误并解封：/ignore ' + context.seq);
+	}
+	return lines.join('\n');
+}
+
+// === 处置执行 ===
+// 判定为广告后的统一处置链：加黑 → 全群封禁 → 删触发消息 → 自动学指纹 → 存快照 → 推私聊 → 清观察记录。
+// 每一步独立容错：加黑失败仍继续封禁，封禁部分失败仍推送通知，
+// 保证主人一定能看到现场快照并可用 /ignore <序号> 一键回滚。
+async function enforceAdDetection(env, input, evaluation, options = {}) {
+	const userId = String(input?.userId ?? '');
+	const chatId = input?.chatId != null ? String(input.chatId) : '';
+	if (!userId) return { banned: false, seq: null, reason: 'no_user' };
+
+	const noteParts = [
+		'广告自动判定',
+		AD_LAYER_LABELS[evaluation.layer] || evaluation.layer,
+		'得分 ' + evaluation.score + '/' + evaluation.threshold
+	];
+	if (evaluation.aiSimilarity > 0) noteParts.push('相似度 ' + evaluation.aiSimilarity.toFixed(3));
+	const note = noteParts.join(' | ').slice(0, 200);
+
+	let blacklistCode = 'SKIPPED';
+	try {
+		const added = await addToBlacklist(userId, env, { reason: 'ad_auto', by: 'system', note });
+		blacklistCode = String(added?.code || (added?.success ? 'ADDED' : 'ERROR'));
+	} catch (error) {
+		console.error('[广告检测] 加入黑名单失败:', error);
+		blacklistCode = 'ERROR';
+	}
+
+	let banResults = [];
+	try {
+		banResults = await banUserFromAllGroups(userId, { probeMembership: true, revokeMessages: true });
+	} catch (error) {
+		console.error('[广告检测] 全群封禁失败:', error);
+	}
+	const okCount = banResults.filter((r) => r.ok).length;
+	const failedBans = banResults.filter((r) => !r.ok);
+	let banSummary = okCount + '/' + banResults.length + ' 个群成功';
+	if (failedBans.length) {
+		banSummary += '；失败群：' + failedBans.slice(0, 3)
+			.map((r) => r.groupId + '(' + (r.error || '未知') + ')')
+			.join('、');
+	}
+
+	// 触发消息再单独删一次：revoke_messages 只对该群自己生效，服务消息也偶发残留。
+	if (chatId && input?.messageId) {
+		try {
+			await deleteMessage(chatId, input.messageId);
+		} catch (error) {
+			console.error('[广告检测] 删除触发消息失败:', error);
+		}
+	}
+
+	let learned = 0;
+	try {
+		// structureConfirmed 传参已随「强动词闸门」一起去掉（2026-09-08）：
+		// 那道闸门是 source='auto' 唯一的前置条件，而本函数是 source='auto' 的唯一调用点，
+		// 且只在已定罪时走到这里 —— 主人的口径是「已经确定并执行封禁的就自动学习指纹」，
+		// 定罪本身就是学习凭据，不需要再问一遍「结构层同不同意」。
+		const learn = await learnAdFingerprints(env, evaluation.payload, {
+			source: 'auto',
+			createdBy: 'system',
+			whitelist: options.whitelist
+		});
+		learned = Number(learn?.learned) || 0;
+	} catch (error) {
+		console.error('[广告检测] 自动学习指纹失败:', error);
+	}
+
+	// ===== 自动学进 AI 语义样本库（2026-09-08 新增）=====
+	// 主人的口径：「AI 是通过 spam 执行自我学习的」「AI 必须学习原有的中心指纹以及 spam
+	// 的变体，然后它会自我优化更多的广告类型变体特征」。
+	//
+	// 在这批改动之前，addAdSample 全文件只有三个调用点：/confirm、/addsample、/spam ——
+	// 全是【人工触发】。也就是说自动封禁（评分层撞阈值、指纹层命中、AI 层硬命中、
+	// 四通道结构查杀）抓到的号，一条都不会进 AI 样本库，AI 的「广告概念」只能靠主人手工喂。
+	// 加上这一段之后，四层里任何一层定罪都会把现场语义沉淀进样本库，
+	// 下一个换了词但语义相同的变体就能被第三层直接认出来。
+	//
+	// 【失败绝不影响主流程】黑名单、全群封禁、消息删除都已经做完了，
+	// 样本写不进去最多是少学一条，不能因此让回执报错或中断通知。
+	let sampleAdded = false;
+	try {
+		// options.sampleText 让调用方覆盖取材口径。目前唯一的覆盖方是 /spam 的回复学习：
+		// 那条路径碰到「本人正文一个字母 + 广告全在引用块里」时会拿引用体当样本，
+		// 比这里默认的 name + bio + text 准得多。有覆盖就用覆盖，避免同一次处置写两条样本
+		// （其中一条还是「英文人名 + 单字母」那种纯噪声）。
+		const sampleText = options.sampleText != null
+			? String(options.sampleText).trim()
+			: buildAdSampleText(evaluation.payload);
+		// 长度门槛与 addAdSample 内部一致（< 4 字符直接拒），这里先判一次是为了少一次 D1 往返。
+		// 引用体形态的号（本人正文只有一个字母）在这里拼出来的通常只有昵称，
+		// 短到 4 字符以下就跳过 —— 那种样本语义太稀薄，进库只会拉高误判面。
+		if (sampleText.length >= 4) {
+			const sample = await addAdSample(env, sampleText, { source: String(options.sampleSource || 'auto') });
+			sampleAdded = Boolean(sample?.ok && sample?.added);
+		}
+	} catch (error) {
+		console.error('[广告检测] 自动学习语义样本失败:', error);
+	}
+
+	// 快照与通知只发第一主人：序号是 /ignore 的唯一入口，多人共用会互相抢号。
+	const ownerId = getOwnerNotifyTargets()[0] || '';
+	let seq = null;
+	if (ownerId) {
+		seq = await allocateAdPendingSnapshot(env, ownerId, {
+			userId,
+			chatId,
+			score: evaluation.score,
+			reasons: evaluation.reasons,
+			snapshot: evaluation.snapshot
+		});
+		const learnNote = (learned ? '；已学入 ' + learned + ' 条指纹' : '')
+			+ (sampleAdded ? '；已加 1 条 AI 样本' : '');
+		const notice = renderAdDetectionNotice(evaluation, {
+			userId,
+			chatTitle: input?.chatTitle || '',
+			seq,
+			banSummary: banSummary + learnNote
+		});
+		try {
+			await sendTelegramMessageChunks(ownerId, notice);
+		} catch (error) {
+			console.error('[广告检测] 推送判定通知失败:', error);
+		}
+	}
+
+	await deleteAdScreening(env, userId);
+	console.log(
+		'[广告检测] 已处置 user=' + userId + ' chat=' + chatId
+		+ ' layer=' + evaluation.layer + ' score=' + evaluation.score
+		+ ' 黑名单=' + blacklistCode + ' 封禁=' + banSummary
+		+ ' 指纹=' + learned + ' AI样本=' + (sampleAdded ? 1 : 0)
+	);
+	return { banned: true, seq, blacklistCode, banSummary, learned, sampleAdded };
+}
+
+// === 单个入群成员的广告筛查（两条入群路径共用）===
+// 抽出来是因为 Telegram 的入群会走两种完全不同的 update，而它们【不保证同时出现】：
+//   ① message.new_chat_members —— service message，被别人拉进群时出现
+//   ② chat_member update       —— 自己点邀请链接进群、加入请求被批准、unban 后自加回
+// 原先只有 ① 挂了广告检测，② 那条路（handleChatMemberUpdate 的 enteredGroup 分支）
+// 只查黑名单就 return，于是「点链接自己进来 + bio 里全是广告」的号一个都拦不住。
+//
+// 返回值供调用方决定要不要继续往下走：
+//   'banned' 已封禁（调用方应立即停止后续处理）/ 'observed' 转入观察 / 'clean' 干净
+//   'cooled' 冷却期内跳过 / 'skipped' 豁免或已黑 / 'error' 异常（已记日志，不抛）
+async function screenAdJoinMember(env, member, options = {}) {
+	const userId = member?.id;
+	if (!userId || member?.is_bot) return 'skipped';			// bot 交给 handleNewChatMemberBots
+	if (isPrivilegedManager(userId)) return 'skipped';			// 主人 / 副主人 / 超级管理员豁免
+	const chatId = String(options.chatId ?? '');
+	if (!chatId) return 'skipped';
+	if (!env?.DB) return 'skipped';
+	if (!(await adDetectionReady(env))) return 'skipped';
+
+	try {
+		// chat_member 那条路的调用方已经查过黑名单（复入群拦截），别再查第二遍。
+		if (options.skipBlacklistCheck !== true) {
+			const already = await checkBlacklist(userId, env);
+			if (already.isBlacklisted) return 'skipped';		// 已黑用户由既有拦截逻辑处理
+		}
+		// 用 isAdminForAdDetection 而不是 checkIfUserIsAdminInGroup：这里是【检测豁免】不是鉴权，
+		// 前者带 5 分钟按群缓存，一次批量入群（拉人进群常常一次十几个）同群只拉一份管理员列表。
+		if (await isAdminForAdDetection(chatId, userId)) return 'skipped';
+
+		const nowSeconds = Math.floor(Date.now() / 1000);
+		// 先读后写：要的是【本次入群之前】的 bio_checked_at。
+		const existing = await readAdGroupMember(env, userId);
+		// 【方案 C 的第二个修复】入群即进名册。原先名册只在 detectAdOnMessage 里写，
+		// 也就是只有发言过的人才在册 —— 一个入群时 bio 干净、之后改成广告且从不发言的号，
+		// 连闸三 cron 都扫不到他，因为他根本不在扫描源里。入群写册把这个口子堵上。
+		await upsertAdGroupMember(env, userId, chatId, member, nowSeconds);
+
+		// 去重：被别人拉进群时 ① ② 两种 update 都会到，同一个人会进来两次。
+		// 复用闸二那把三天冷却锁即可，不需要新机制。
+		// 残留竞态：两个 update 几乎同时到达时可能都读到 existing === null 而各查一次 bio，
+		// 但 fetchAdUserProfile 有 5 分钟按人缓存，第二次不会真的发出请求，代价为零。
+		if (!shouldCheckAdBio(existing, nowSeconds)) return 'cooled';
+
+		const profile = await fetchAdUserProfile(userId, member);
+		// 不查 getChatMember：restricted 已归零不计分，入群时状态必然是 member，
+		// 拉一次纯属浪费配额。留空后通知文案会显示「未查询」。
+		profile.status = '';
+		await markAdBioChecked(env, userId, nowSeconds);
+
+		const config = options.config || loadAdDetectionConfig(env);
+		const whitelist = options.whitelist || await loadAdDomainWhitelist(env);
+
+		const evaluation = await evaluateAdSuspect(
+			env,
+			{ profile, text: '', forwardChat: null },
+			// getChat 失败时不能扣「无 Bio」那一分 —— 那是「查到了、确实是空」才成立的判据。
+			{ config, whitelist, skipMissingBioPenalty: profile.bioFetched !== true }
+		);
+
+		if (evaluation.verdict === 'ban') {
+			await enforceAdDetection(env, {
+				userId,
+				chatId,
+				chatTitle: options.chatTitle || '',
+				messageId: options.messageId ?? null
+			}, evaluation, { config, whitelist });
+			return 'banned';
+		}
+		if (evaluation.verdict === 'observe') {
+			await upsertAdScreening(env, userId, {
+				chatId,
+				// 只存行为分，不存静态资料分 —— 详见 evaluateAdSuspect 返回值里 retainScore 的说明。
+				score: evaluation.retainScore ?? 0,
+				reasons: evaluation.reasons,
+				snapshot: evaluation.snapshot,
+				layer: evaluation.layer
+			}, config);
+			console.log('[广告检测] 入群转入观察 user=' + userId + ' 来源=' + (options.source || 'join')
+				+ ' score=' + evaluation.score + '/' + config.scoreThreshold
+				+ ' 留存行为分=' + (evaluation.retainScore ?? 0));
+			return 'observed';
+		}
+		return 'clean';
+	} catch (error) {
+		console.error('[广告检测] 入群检测异常 user=' + userId + ' 来源=' + (options.source || 'join') + ':', error);
+		return 'error';
+	}
+}
+
+// === 入群检测（第一道闸）===
+// 必须插在 handleMessage 顶部、handleNewChatMemberBots 之前：后者对配置群的任何进群消息
+// 一律 return true，放在它之后本函数永远不会执行。
+// 本函数固定返回 false，绝不短路，保证既有的新 bot 静音逻辑照旧运行。
+async function detectAdOnJoin(message, env, ctx) {
+	const newMembers = message?.new_chat_members;
+	if (!Array.isArray(newMembers) || !newMembers.length) return false;
+	const chat = message.chat;
+	if (!chat || !isConfiguredGroup(chat.id)) return false;
+	if (!env?.DB) return false;
+	if (!(await adDetectionReady(env))) return false;
+
+	const config = loadAdDetectionConfig(env);
+	const whitelist = await loadAdDomainWhitelist(env);
+	const chatId = String(chat.id);
+
+	// 逐个筛查。screenAdJoinMember 内部已经 try/catch，单个人异常不会中断整批
+	// （一次拉人进群可能有十几个，不能因为其中一个 getChat 失败就放过其余的）。
+	for (const member of newMembers) {
+		await screenAdJoinMember(env, member, {
+			chatId,
+			chatTitle: chat.title || '',
+			messageId: message.message_id,
+			config,
+			whitelist,
+			source: 'new_chat_members'
+		});
+	}
+
+	// 纯 D1 没有 TTL，过期剪枝只能搭车执行；进群事件频率低，放这里代价最小。
+	if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(pruneAdDetectionData(env));
+	else await pruneAdDetectionData(env);
+	return false;
+}
+
+// === 消息检测（第二道闸）===
+// 插在黑名单兜底拦截之后：已黑用户根本走不到这里。
+// 成本控制是关键：先用纯 JS 的文本 / 转发评分做零成本预筛，得分为 0 立即退出，
+// 只有可疑消息才付出 getChat + AI 推理的代价，正常聊天不产生任何额外子请求。
+// 返回 true 表示已处置（调用方应立即 return），false 表示放行给后续逻辑。
+async function detectAdOnMessage(message, env) {
+	if (!env?.DB) return false;
+	const chat = message?.chat;
+	const from = message?.from;
+	if (!chat || !from || from.is_bot) return false;
+	if (!isConfiguredGroup(chat.id)) return false;
+
+	// 临时诊断开关：环境变量 AD_DEBUG_DUMP_UPDATE=1 时，把本群每条消息的 update 原文打进日志。
+	// 刻意放在【所有豁免检查之前】—— 主人 / 管理员会在下面几行直接 return，
+	// 若放在后面，主人自己转发一条同款广告做取样时一行日志都不会打。
+	//
+	// 用途：2026-09 线上漏放 50+ 广告号，那批号的正文只有一个字母（v/z/n/x），
+	// 广告词疑似在转发体里，而 getAdDetectionBodyText 只读 text/caption。
+	// 需要真实 update JSON 才能确定 Telegram 把转发原文放在哪个字段。
+	//
+	// ⚠️ 取样完成后必须删掉这段：它会把群内消息全文打进 Worker 日志，属于隐私泄露面。
+	if (String(env.AD_DEBUG_DUMP_UPDATE || '') === '1') {
+		try {
+			console.log('[广告检测·DEBUG] update dump = ' + JSON.stringify({
+				text: message.text ?? null,
+				caption: message.caption ?? null,
+				forward_origin: message.forward_origin ?? null,
+				forward_from_chat: message.forward_from_chat ?? null,
+				forward_from: message.forward_from ?? null,
+				forward_sender_name: message.forward_sender_name ?? null,
+				quote: message.quote ?? null,
+				external_reply: message.external_reply ?? null,
+				reply_to_message: message.reply_to_message
+					? { text: message.reply_to_message.text ?? null, caption: message.reply_to_message.caption ?? null }
+					: null,
+				entities: message.entities ?? null,
+				caption_entities: message.caption_entities ?? null,
+				via_bot: message.via_bot?.username ?? null,
+				sender_chat: message.sender_chat ?? null,
+				from: { id: from.id, first_name: from.first_name ?? null, last_name: from.last_name ?? null, username: from.username ?? null },
+				__bodyTextNow: getAdDetectionBodyText(message)
+			}));
+		} catch (error) {
+			console.error('[广告检测·DEBUG] dump 失败:', error);
+		}
+	}
+	if (Array.isArray(message.new_chat_members) && message.new_chat_members.length) return false;
+
+	const userId = from.id;
+	if (isPrivilegedManager(userId)) return false;
+
+	const text = String(message.text ?? message.caption ?? '').trim();
+	if (isTelegramSlashCommand(text)) return false;
+	const forwardChat = message.forward_from_chat || message.forward_origin?.chat || null;
+	// 引用体正文：这条消息引用/回复的那条【别人的】消息里的文字。
+	// 必须参与早退判断 —— 「正文为空 + 只引用一条广告」是漏放形态的极端版，
+	// 只看 text 与 forwardChat 会在这里就 return，后面四条通道一条都跑不到。
+	const quotedText = getAdQuotedText(message);
+	// 分享名片（contact）的显示名。名片消息的 text / caption 【恒为空】，
+	// 广告内容全写在名片显示名里（实例：昵称「假钞玩妹交流群🔥快递面交都可」+ 电话 +98 993 238 8241），
+	// 所以不取它 → 下面那道早退闸门会把整条消息当「空消息」return，四条通道一条都跑不到。
+	// getContactText（:5107）从一开始就定义好了，却只被快照预览引用，从没接进评分链 —— 这才是漏检真因。
+	//
+	// 【只取显示名，不取 phone_number / vcard】按主人口径「昵称带广告就杀，无需管国内外号」：
+	//   · phone_number 是纯数字，进 AI 语义层只会稀释广告词权重，且号码国别几乎零区分力
+	//     （旧代码实测：广告名片外国号占比 17%、正常名片 20%，拿它当判据反而漏杀）；
+	//   · vcard 是原始格式串（FN: / TEL: 字段名），字段名进语义层是纯噪声，
+	//     而它承载的显示名内容与这里取的完全重复。
+	// 判据本体【一个新正则都不加】，直接复用现有 judgeAdStructure 的「招揽 ∧ 行业两类同现」。
+	// 2026-09-09 离线实测【纠正】此处原先写的验算：上例那句在四张词表与两组正则里
+	// 逐词零命中，形态 A 并不成立 —— 通路通了也定不了罪，同一句话发在正文里一样杀不掉。
+	// 补词后才真正成立：「面交」进 AD_TRADE_VERBS → solicit；「假钞」进 AD_BUSINESS_KEYWORDS → biz。
+	// 所以名片显示名的误封门槛与普通正文查杀完全同档，不是旧代码那种单词命中即杀。
+	//
+	// looksLikePersonName 是【反向白名单】（旧代码 :6632 移植）：显示名像人名就整条不看，
+	// 把「张三 / 妈妈 / 快递小哥 / John Smith」这类正常名片在进判据之前就摘出去。
+	// 它只减误封、对漏检零影响 —— 广告名片必须把广告写进显示名，写了就一定不像人名。
+	const contactDisplayName = message?.contact
+		? [message.contact.first_name, message.contact.last_name].filter(Boolean).join(' ').trim()
+		: '';
+	const contactName = looksLikePersonName(contactDisplayName) ? '' : contactDisplayName;
+	if (!text && !forwardChat && !quotedText && !contactName) return false;
+	if (!(await adDetectionReady(env))) return false;
+
+	const config = loadAdDetectionConfig(env);
+	const whitelist = await loadAdDomainWhitelist(env);
+
+	// 管理员豁免。零成本的确定性排除，放在最前面 —— 也因此管理员【不进名册】，
+	// 不占用定时扫描的每日配额。代价是「曾以普通成员身份发言、后来升管理员」的人
+	// 会留在名册里被 cron 扫到，那一轨自己也做一次豁免检查兜底。
+	// 这里用 isAdminForAdDetection 而不是 checkIfUserIsAdminInGroup：
+	// 前者带 5 分钟按群缓存（同群所有人共用一份列表），后者是 /ban 的鉴权入口不能缓存。
+	if (await isAdminForAdDetection(chat.id, userId)) return false;
+
+	const nowSeconds = Math.floor(Date.now() / 1000);
+	// 先读名册再 upsert —— 顺序不能颠倒：upsert 会把 last_seen 推到现在，
+	// 而我们要的是【本次发言之前】的 bio_checked_at。颠倒后 member 永远是刚写的那行，
+	// 但 bio_checked_at 不被 upsert 覆盖，所以实际仍能读对；保持这个顺序只是为了让
+	// 「首次发言」能明确地表现为 member === null，语义清晰。
+	const member = await readAdGroupMember(env, userId);
+	await upsertAdGroupMember(env, userId, chat.id, from, nowSeconds);
+
+	// 观察窗口历史分。作用是：入群时够可疑但没到封禁线的人，窗口期内再发广告消息即合并裁决。
+	// readAdScreening 是一次 D1 主键查询，本来就在这条路径上。
+	const screening = await readAdScreening(env, userId);
+	const historyScore = screening ? screening.score : 0;
+
+	// 历史分累加。抽成闭包是因为下面两道闸各要用一次，而累加必须【只做一次】——
+	// 闸一累加过、闸二再累加一遍会把历史分算两遍，凭空多出几分。
+	//
+	// 准入条件【本次这条消息必须自己拿出新证据】（2026-09-07 第二起误封事故后补）：
+	//
+	// 历史分取自 ad_user_screening.score，那是【上一次评分的总分】，里面本来就含了
+	// bio 链接 / username / 昵称这些恒定不变的静态资料分。而这次评分又会把同一个 bio、
+	// 同一个 username 从头算一遍 —— 同一份证据算了两次（double counting）。
+	// 再叠上 upsertAdScreening 的 score = MAX(旧, 新)（历史分只涨不跌）与每次 upsert
+	// 都刷新 expires_at（窗口无限续期），一个人一旦被判过一次 observe 就很难再降下来。
+	//
+	// 事故形态：观察线 5 与封禁线 7 只差 2 分，而「bio 含非白名单引流链接」恰好是
+	// 恒定的 +2 —— 于是【任何 bio 里放了链接又被判过一次 observe 的人，下一条消息
+	// 必被封，无论他说什么】。被误封用户 @MiLov1900 触发封禁的那条消息是
+	// 「要beta版才能用 那要等了」，behaviorScore 实测 0；8 分里 5 分是历史分，
+	// 另外 3 分正是与历史分重复的同一份静态资料（bio 链接 +2、username +1）。
+	//
+	// 所以要求 behaviorScore > 0 才让历史分参与裁决：历史分的设计语义是「累积多次
+	// 可疑*行为*」，「又干了一次」的真实含义就是本次消息自身有正文 / 上下文 / 转发证据，
+	// 而不是「同一份资料卡又被重算了一遍」。
+	//
+	// 这道闸不会放过真广告：资料已经明显到该封的号，静态分自身就够阈值，
+	// evaluateAdSuspect 里就判成 ban 了，进不到这里的分支；指纹硬命中与 AI 命中同理。
+	// 真广告号要投放就必须发正文或转发，那一刻 behaviorScore > 0，历史分【全额】参与
+	// —— 刻意不封顶：实测「正文首尾对称 emoji（+3）+ 历史 4 分 = 7」这类真广告
+	// 正好卡在封禁线上，任何封顶都会把它放过去。
+	// 被挡下的只有「资料分卡在观察线、却始终没发过任何广告内容」这一类 —— 那正是误封池。
+	//
+	// double counting 已于 2026-09-08 根治：观察记录改为【只存行为分】
+	// （upsertAdScreening 的 score 来自 evaluation.retainScore，不再是总分），
+	// 所以 historyScore 里再也不含 bio / username / 昵称这些恒定项。
+	// 本闸门（behaviorScore > 0）作为第二道保险保留：即使历史分是干净的行为分，
+	// 也只在「本次又干了一次」时才允许累加，语义才自洽。
+	const applyHistory = (evaluation) => {
+		if (historyScore <= 0) return evaluation;
+
+		if (!(Number(evaluation.behaviorScore) > 0)) {
+			evaluation.reasons.push(
+				'观察窗口历史分 ' + historyScore + ' 未参与裁决（本次消息无新增行为证据）'
+			);
+			return evaluation;
+		}
+
+		evaluation.score += historyScore;
+		evaluation.reasons.push(
+			'+' + historyScore + ' 观察窗口历史分（'
+			+ (AD_LAYER_LABELS[screening.layer] || screening.layer || '结构化评分') + '）'
+		);
+		if (evaluation.verdict !== 'ban' && evaluation.score >= config.scoreThreshold) evaluation.verdict = 'ban';
+		else if (evaluation.verdict === 'pass' && evaluation.score >= config.observationScore) evaluation.verdict = 'observe';
+		return evaluation;
+	};
+
+	// ============ 闸一 · 零成本判定（0 个 Telegram 请求）============
+	// 昵称、用户名、正文、转发来源全都在 update 里现成带着，一个字节都不用额外拉。
+	// 实测 9 个真广告样本里有 7 个仅凭这些就够封禁线 —— 广告号要让人看见广告，
+	// 就必须把广告写在别人看得见的地方，而最显眼的地方恰好都是免费的。
+	// 这一闸【完整走三层】（结构分 + 指纹库 + AI 语义）：指纹和 AI 只花 D1 与 Workers AI，
+	// 不花 Telegram 请求，而它们正是自动学习与 /spam 学习成果的落地点，压后到 3 天一次会白费。
+	const cheapProfile = {
+		firstName: from.first_name || '',
+		lastName: from.last_name || '',
+		username: from.username || '',
+		bio: '',
+		status: ''
+	};
+	const cheap = applyHistory(await evaluateAdSuspect(
+		env,
+		// text || contactName：名片消息的 text 恒为空，所以不存在覆盖正文的情况。
+		// 用「短路取值」而非拼接，是为了让名片显示名走进 payload.text 后，
+		// 结构评分 / 指纹库 / AI 语义 / 四通道结构查杀【四层全都能看到它】。
+		{ profile: cheapProfile, text: text || contactName, quotedText, forwardChat },
+		// skipMissingBioPenalty：这一闸的 bio 是「没查」而不是「没有」，不能拿它减分。
+		{ config, whitelist, skipMissingBioPenalty: true }
+	));
+
+	const needBio = shouldCheckAdBio(member, nowSeconds);
+
+	// 闸一够封禁线就地处置，不再花 getChat —— 已经确定要封的人，bio 是什么无关紧要。
+	if (cheap.verdict === 'ban') {
+		await enforceAdDetection(env, {
+			userId,
+			chatId: chat.id,
+			chatTitle: chat.title || '',
+			messageId: message.message_id
+		}, cheap, { config, whitelist });
+		return true;
+	}
+
+	// 闸一没定罪、且这个人的 bio 在冷却期内 —— 到此结束，本条消息 0 个 Telegram 请求。
+	// 这是稳态下的绝大多数情况（正常聊天），也是「不要每条信息都拉」的落点。
+	if (!needBio) {
+		if (cheap.verdict === 'observe') {
+			await upsertAdScreening(env, userId, {
+				chatId: chat.id,
+				// 只存行为分，见 retainScore 说明。
+				score: cheap.retainScore ?? 0,
+				reasons: cheap.reasons,
+				snapshot: cheap.snapshot,
+				layer: cheap.layer
+			}, config);
+			console.log('[广告检测] 闸一转入观察 user=' + userId + ' score=' + cheap.score + '/' + config.scoreThreshold
+				+ ' 留存行为分=' + (cheap.retainScore ?? 0));
+		}
+		return false;
+	}
+
+	// ============ 闸二 · 查一次 bio（1 个 Telegram 请求）============
+	// 触发条件：首次发言，或距上次查 bio 已超过 AD_BIO_RECHECK_DAYS 天。
+	// 专治闸一抓不到的那一类 —— 昵称「【出租账号】」正文「详情见简介」、
+	// 昵称「小李」正文「在吗」：零成本信号全 0 分，广告【只写在 bio 里】。
+	// 无论 getChat 成功与否都记下时间戳：失败多半是 429，立刻重试只会继续撞墙，
+	// 而 cron 那一轨会按 bio_checked_at ASC 把他重新排上来，不会永久漏掉。
+	const profile = await fetchAdUserProfile(userId, from);
+	// 【热路径不查 getChatMember】。它原本只为拿 restricted 状态，而 restricted 已归零
+	// 不计分（AD_RESTRICTED_STATUS_SCORE = 0），返回值仅用于通知文案里的「群内身份」一行。
+	// 为一行展示文案给每条消息加一个 Telegram 请求不值得，故留空，
+	// 由 formatAdMemberStatus 渲染成「未查询」。
+	profile.status = '';
+	await markAdBioChecked(env, userId, nowSeconds);
+
+	// 据实传：getChat 成功就正常判定（空 bio 该减分就减），失败则跳过减分。
+	// 两轨用同一个判断依据（profile.bioFetched），阈值与判据完全一致，不另立标准。
+	const evaluation = applyHistory(await evaluateAdSuspect(
+		env,
+		// 与闸一同一口径传名片显示名。漏传这里会造成一种诡异形态：
+		// 名片消息在闸一（无 bio）没定罪 → 走到闸二拉了 bio 本该更容易定罪，
+		// 结果因为 text 又变回空串，反而比闸一更判不出来。
+		{ profile, text: text || contactName, quotedText, forwardChat },
+		{ config, whitelist, skipMissingBioPenalty: profile.bioFetched !== true }
+	));
+
+	if (evaluation.verdict === 'ban') {
+		await enforceAdDetection(env, {
+			userId,
+			chatId: chat.id,
+			chatTitle: chat.title || '',
+			messageId: message.message_id
+		}, evaluation, { config, whitelist });
+		return true;
+	}
+
+	if (evaluation.verdict === 'observe') {
+		await upsertAdScreening(env, userId, {
+			chatId: chat.id,
+			// 只存行为分，见 retainScore 说明。
+			score: evaluation.retainScore ?? 0,
+			reasons: evaluation.reasons,
+			snapshot: evaluation.snapshot,
+			layer: evaluation.layer
+		}, config);
+		console.log('[广告检测] 闸二转入观察 user=' + userId + ' score=' + evaluation.score + '/' + config.scoreThreshold
+			+ ' 留存行为分=' + (evaluation.retainScore ?? 0));
+	}
+	return false;
+}
+
+// === 命令层 ===
+// 10 条广告检测命令一律走这一个入口，handleMessage 里只挂一个钩子，
+// 不改动任何既有命令分支。返回 true 表示命令已被处理，调用方应立即 return。
+// 【2026-09-08 从 11 条减为 10 条】confirm 已删除，见 handleAdIgnoreCommand 上方的说明。
+const AD_COMMAND_RE = /^\/(pending|ignore|addword|delword|words|addsample|clearsamples|adstats|whitelist|rescreen|warmup)(?:@[^\s]+)?(?:\s|$)/i;
+
+// 快照 → 判定载荷。/ignore 标误判、删 AI 样本都要用同一份载荷，保证两边命中的集合一致。
+function adPayloadFromSnapshot(snapshot) {
+	const snap = snapshot?.snapshot || {};
+	const name = String(snap.name || '');
+	const bio = String(snap.bio || '');
+	const text = String(snap.text || '');
+	return {
+		name,
+		username: String(snap.username || ''),
+		bio,
+		text,
+		domains: extractAdDomains([name, bio, text].filter(Boolean).join('\n'))
+	};
+}
+
+async function handleAdDetectionCommands(message, env, ctx) {
+	const raw = typeof message?.text === 'string' ? message.text.trim() : '';
+	if (!raw) return false;
+	const match = raw.match(AD_COMMAND_RE);
+	if (!match) return false;
+
+	const command = match[1].toLowerCase();
+	const chatId = message.chat.id;
+	const userId = getMessageActorId(message);
+	const isInGroup = message.chat.type !== 'private';
+
+	// 指纹库与样本库直接决定自动封禁行为，权限外泄等于把封禁开关交出去 → 只给第一主人。
+	// 群内一律只撤回命令、不回权限提示，避免向群成员暴露这些命令的存在。
+	if (!isPrimaryOwner(userId)) {
+		if (!isInGroup) {
+			await sendTelegramMessage(chatId, '❌ <b>权限不足</b>\n\n广告检测管理命令仅限第一主人私聊使用。');
+		}
+		return true;
+	}
+	if (isInGroup) {
+		await deleteAuthorizedGroupCommandMessage(message, '/' + command);
+		await sendTelegramMessage(userId, 'ℹ️ 广告检测管理命令请在私聊中使用。');
+		return true;
+	}
+	if (!env.DB) {
+		await sendTelegramMessage(chatId, '❌ 未绑定 D1 存储空间，广告检测不可用。');
+		return true;
+	}
+	if (!(await adDetectionReady(env))) {
+		await sendTelegramMessage(chatId, '❌ 广告检测数据表初始化失败，请稍后重试或检查 D1 绑定。');
+		return true;
+	}
+
+	const arg = raw.replace(AD_COMMAND_RE, '').trim();
+	const ownerId = String(userId);
+
+	try {
+		switch (command) {
+			case 'pending': await handleAdPendingCommand(env, chatId, ownerId, arg); break;
+			case 'ignore': await handleAdIgnoreCommand(env, chatId, ownerId, arg); break;
+			case 'addword': await handleAdAddWordCommand(env, chatId, ownerId, arg); break;
+			case 'delword': await handleAdDelWordCommand(env, chatId, ownerId, arg); break;
+			case 'words': await handleAdWordsCommand(env, chatId, arg); break;
+			case 'addsample': await handleAdAddSampleCommand(env, chatId, arg); break;
+			case 'clearsamples': await handleAdClearSamplesCommand(env, chatId, ownerId, arg); break;
+			case 'adstats': await handleAdStatsCommand(env, chatId); break;
+			case 'whitelist': await handleAdWhitelistCommand(env, chatId, ownerId, arg); break;
+			case 'rescreen': await handleAdRescreenCommand(env, chatId, arg); break;
+			case 'warmup': await handleAdWarmupCommand(env, chatId); break;
+		}
+	} catch (error) {
+		console.error('[广告检测] 命令 /' + command + ' 执行异常:', error);
+		await sendTelegramMessage(chatId, '❌ 命令执行异常：' + escapeHtml(String(error?.message || error)));
+	}
+	return true;
+}
+
+// /pending [数量]：列出待确认的判定快照，1 小时后自动过期。
+async function handleAdPendingCommand(env, chatId, ownerId, arg) {
+	const parsed = parseInt(arg, 10);
+	const limit = Number.isFinite(parsed) && parsed > 0
+		? Math.min(AD_PENDING_MAX_LIMIT, parsed)
+		: AD_PENDING_DEFAULT_LIMIT;
+	const result = await listAdPendingSnapshots(env, ownerId, limit);
+	if (!result.ok) {
+		await sendTelegramMessage(chatId, '❌ 读取待确认快照失败。');
+		return;
+	}
+	if (!result.rows.length) {
+		await sendTelegramMessage(chatId, '📭 <b>待复核快照</b>\n\n当前没有待复核的广告判定记录。\n快照长期保留，复核过（/ignore）的会从列表移除。');
+		return;
+	}
+	const lines = ['<b>📋 待复核广告判定</b>', '共 <b>' + result.total + '</b> 条，显示 ' + result.rows.length + ' 条（最新在前）', ''];
+	for (const row of result.rows) {
+		const snap = row.snapshot || {};
+		const when = row.createdAt ? new Date(row.createdAt * 1000).toISOString().replace('T', ' ').slice(0, 19) : '未知';
+		lines.push('<b>#' + row.seq + '</b>　<code>' + escapeHtml(row.userId) + '</code>　得分 ' + row.score);
+		if (snap.name) lines.push('　名称：' + escapeHtml(String(snap.name).slice(0, 60)));
+		if (snap.text) lines.push('　消息：' + escapeHtml(String(snap.text).slice(0, 60)));
+		lines.push('　时间：' + when + ' UTC');
+	}
+	lines.push('');
+	lines.push('判定正确：无需任何操作（指纹与 AI 样本已自动学入）');
+	lines.push('判定错误并解封：/ignore 序号　支持批量 /ignore 3 5 7 与区间 /ignore 3-8');
+	await sendTelegramMessageChunks(chatId, lines.join('\n'));
+}
+
+// /confirm 已于 2026-09-08 删除。
+// 理由（主人原话）：「这个 /confirm 就删掉，不需要了，因为通过 spam 的话它会自动学习指纹，
+// 如果是误封还可以通过指定指令执行全群解封并删除已经记录的指令。」
+// 它做的两件事现在都在 enforceAdDetection 里自动完成了 —— 任何一层定罪即学指纹、
+// 即加 AI 样本，主人对判定正确的号【不需要任何操作】，只在误判时发 /ignore。
+// ⚠️ 与 ad_confirm_tokens 那张表无关，那是通用二次确认令牌机制，不要一起动。
+
+// 单条误判回滚：移出黑名单 → 全群解封 → 指纹记误报并即删 → 删掉对应 AI 样本 → 标记快照已复核。
+// 抽出来给 /ignore 的单条与批量两种用法共用，保证两条路径的副作用完全一致。
+async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
+	const targetId = snapshot.userId;
+	const removed = await removeFromBlacklist(targetId, env);
+	// 必须先确认黑名单已清（或本就不在），再解 Telegram 封禁，避免解完又被兜底拦截重新踢掉。
+	let unbanSummary = '未执行';
+	if (removed.success || removed.code === 'NOT_FOUND') {
+		const results = await unbanUserFromAllGroups(targetId);
+		const okCount = results.filter((r) => r.ok).length;
+		unbanSummary = okCount + '/' + results.length + ' 个群成功';
+		const failed = results.filter((r) => !r.ok);
+		if (failed.length) {
+			unbanSummary += '；失败群：' + failed.slice(0, 3).map((r) => r.groupId + '(' + (r.error || '未知') + ')').join('、');
+		}
+	}
+
+	const payload = adPayloadFromSnapshot(snapshot);
+	// purge: true —— 主人已明确说这是误判，命中的指纹当次即删，不再攒 3 次误报。
+	// 同批改动拆掉了自动学习的强动词闸门，指纹写入变宽，纠错端必须同步变快。
+	const fp = await markAdFingerprintFalsePositive(env, payload, { purge: true });
+	// 删掉当初自动学进去的那条 AI 语义样本。在这批改动之前 /ignore 碰都没碰样本库 ——
+	// 于是指纹删了、号解封了，错样本却永久留在 AI 样本库里继续误伤相似的正常用户，
+	// 而 AI 层是硬命中即封、不看豁免词也不看总分的，一条错样本比一条错指纹更危险。
+	const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
+	await deleteAdScreening(env, targetId);
+	await deleteAdPendingSnapshot(env, ownerId, seq);
+	return { targetId, removed, unbanSummary, fp, sampleRemoved };
+}
+
+// /ignore 单次最多处理多少个序号。
+// 每个序号都要跑一遍 unbanUserFromAllGroups（群数 × 1 次 TG API）+ 指纹与样本的 D1 写入，
+// 不设上限的话一句手滑的 /ignore 1-99999 会直接撞 TG 限流和 Workers 子请求预算。
+const AD_IGNORE_BATCH_MAX = 10;
+
+// 解析 /ignore 的序号参数。支持单个「3」、多个「3 5 7」、区间「3-8」，可混写；
+// 分隔符收了半角/全角逗号、顿号与空白 —— 主人从 /pending 回执里复制序号时这些都可能带进来。
+function parseAdSeqList(arg) {
+	const raw = String(arg ?? '').trim();
+	if (!raw) return { ok: false, seqs: [], truncated: false };
+	const seqs = new Set();
+	let truncated = false;
+	for (const token of raw.split(/[\s,，、]+/).filter(Boolean)) {
+		if (truncated) break;
+		const range = token.match(/^(\d{1,6})\s*[-~－～]\s*(\d{1,6})$/);
+		if (range) {
+			const from = parseInt(range[1], 10);
+			const to = parseInt(range[2], 10);
+			if (!(from >= 1) || !(to >= 1)) return { ok: false, seqs: [], truncated: false };
+			for (let n = Math.min(from, to); n <= Math.max(from, to); n += 1) {
+				if (seqs.size >= AD_IGNORE_BATCH_MAX) { truncated = true; break; }
+				seqs.add(n);
+			}
+			continue;
+		}
+		if (!/^\d{1,6}$/.test(token)) return { ok: false, seqs: [], truncated: false };
+		const n = parseInt(token, 10);
+		if (!(n >= 1)) return { ok: false, seqs: [], truncated: false };
+		if (seqs.size >= AD_IGNORE_BATCH_MAX) { truncated = true; break; }
+		seqs.add(n);
+	}
+	if (!seqs.size) return { ok: false, seqs: [], truncated: false };
+	return { ok: true, seqs: [...seqs].sort((a, b) => a - b), truncated };
+}
+
+// /ignore <序号...>：判定错误 → 移出黑名单 + 全群解封 + 删掉学到的指纹与 AI 样本。
+// 这是唯一的回滚入口，必须做到「一条命令彻底恢复」，否则自动封禁不敢开。
+// 支持批量是因为主人的原话：「我觉得指令可以支持批量删除，可以通过现有的指令库来执行批量删除号。」
+async function handleAdIgnoreCommand(env, chatId, ownerId, arg) {
+	const parsed = parseAdSeqList(arg);
+	if (!parsed.ok) {
+		await sendTelegramMessage(chatId, [
+			'用法：<code>/ignore 3</code>',
+			'批量：<code>/ignore 3 5 7</code>　区间：<code>/ignore 3-8</code>',
+			'序号来自 /pending 列表，单次最多 ' + AD_IGNORE_BATCH_MAX + ' 个。'
+		].join('\n'));
+		return;
+	}
+	const single = parsed.seqs.length === 1;
+	const lines = [];
+	let rolled = 0;
+	let missed = 0;
+	for (const seq of parsed.seqs) {
+		const snapshot = await readAdPendingSnapshot(env, ownerId, seq);
+		if (!snapshot) {
+			missed += 1;
+			// 单序号时给完整指引：主人手上那条通知可能已经复核过了，直接说清楚下一步查哪里。
+			// 【不能沿用批量那行简短提示】否则回执标题仍是「已按误判回滚」而实际一个号都没解 ——
+			// 主人会以为解封成功了，那个号还在黑名单里继续被拦。
+			if (single) {
+				await sendTelegramMessage(chatId, '⚠️ 序号 <b>#' + seq + '</b> 不存在或已复核过（快照长期保留，复核过的会从 /pending 列表移除）。\n用 /pending 查看当前待复核序号。');
+				return;
+			}
+			lines.push('<b>#' + seq + '</b>　⚠️ 序号不存在或已复核过');
+			continue;
+		}
+		const r = await rollbackAdPendingSnapshot(env, ownerId, seq, snapshot);
+		rolled += 1;
+		const fpNote = r.fp.ok
+			? ('指纹 标记 ' + (r.fp.affected || 0) + ' / 删除 ' + (r.fp.retired || 0))
+			: '指纹 标记失败';
+		const sampleNote = r.sampleRemoved.ok
+			? (r.sampleRemoved.removed > 0 ? 'AI 样本 已删 ' + r.sampleRemoved.removed : 'AI 样本 无对应')
+			: 'AI 样本 删除失败';
+		if (single) {
+			lines.push('用户：<code>' + escapeHtml(r.targetId) + '</code>');
+			lines.push('黑名单：' + (r.removed.success ? '已移除' : (r.removed.code === 'NOT_FOUND' ? '本就不在黑名单' : '移除失败')));
+			lines.push('解封：' + escapeHtml(r.unbanSummary));
+			lines.push('指纹修正：' + (r.fp.ok ? '已标记 <b>' + (r.fp.affected || 0) + '</b> 条误判，删除 <b>' + (r.fp.retired || 0) + '</b> 条' : '标记失败'));
+			lines.push('AI 样本：' + (r.sampleRemoved.ok ? (r.sampleRemoved.removed > 0 ? '已删除 <b>' + r.sampleRemoved.removed + '</b> 条' : '无对应样本') : '删除失败'));
+			if (r.fp.ok && r.fp.affected > 0 && Array.isArray(r.fp.rows)) {
+				lines.push('');
+				lines.push('受影响指纹：');
+				for (const row of r.fp.rows.slice(0, 5)) lines.push('· [' + escapeHtml(row.type) + '] ' + escapeHtml(String(row.value).slice(0, 40)));
+			}
+		} else {
+			lines.push('<b>#' + seq + '</b>　<code>' + escapeHtml(r.targetId) + '</code>　解封 '
+				+ escapeHtml(r.unbanSummary) + '　' + fpNote + '　' + sampleNote);
+		}
+	}
+	const header = single
+		? ['<b>♻️ 已按误判回滚</b>', '序号：<b>#' + parsed.seqs[0] + '</b>']
+		: ['<b>♻️ 批量误判回滚</b>', '已回滚 <b>' + rolled + '</b> 个，跳过 <b>' + missed + '</b> 个', ''];
+	if (parsed.truncated) {
+		header.push('⚠️ 序号超过单次上限 ' + AD_IGNORE_BATCH_MAX + ' 个，只处理了前 ' + parsed.seqs.length + ' 个，其余请再发一次。');
+	}
+	await sendTelegramMessageChunks(chatId, header.concat(lines).join('\n'));
+}
+
+// /addword <值> [类型]：手动加指纹。类型缺省按值形态推断（@ → username，域名 → domain，其余 keyword）。
+async function handleAdAddWordCommand(env, chatId, ownerId, arg) {
+	if (!arg) {
+		await sendTelegramMessage(chatId, [
+			'用法：<code>/addword 收U秒结 keyword</code>',
+			'',
+			'类型可选：keyword（关键词，默认）、domain（域名）、username（@账号）、bio（简介片段）',
+			'类型省略时按值形态自动推断。',
+			'手动指纹权重固定 1，且不会被误判退役机制自动清除。'
+		].join('\n'));
+		return;
+	}
+	const parts = arg.split(/\s+/);
+	const maybeType = parts.length > 1 ? String(parts[parts.length - 1]).toLowerCase() : '';
+	const hasType = AD_FINGERPRINT_TYPES.includes(maybeType);
+	const value = hasType ? parts.slice(0, -1).join(' ') : arg;
+	const result = await addAdFingerprint(env, value, { type: hasType ? maybeType : '', createdBy: ownerId });
+	if (!result.ok) {
+		const reasonMap = { too_short: '值太短（至少 2 个字符）', invalid: '值不合法', unavailable: '数据表不可用', error: '写入失败' };
+		await sendTelegramMessage(chatId, '❌ 添加指纹失败：' + (reasonMap[result.reason] || result.reason));
+		return;
+	}
+	await sendTelegramMessage(chatId, [
+		'<b>✅ 指纹已' + (result.existed ? '更新' : '添加') + '</b>',
+		'类型：' + escapeHtml(result.type),
+		'值：<code>' + escapeHtml(result.value) + '</code>',
+		'权重：1　置信度：1.00　来源：manual'
+	].join('\n'));
+}
+
+// /delword：三种用法。
+//   1) /delword <值>              —— 原有行为，按原文或归一化值删除，同一值跨类型一并清掉；
+//   2) /delword noise             —— 批量删掉命中 0 次的噪声指纹（不含种子），走二次确认；
+//   3) /delword type:username     —— 批量删掉整类指纹（不含种子），走二次确认。
+//
+// 批量档【强制二次确认】：先列出条数与前 10 条样本，签一个 60 秒一次性令牌，
+// 主人看过清单再发 /delword bulk <令牌> 才真删。指纹库没有回收站，一次手滑
+// 能把几十条学习成果清空，而重新学回来要等下一批广告号真的来。
+// 令牌语法刻意带 bulk 前缀：不然那串 hash 会被上面第 1 种用法当成「要删的值」，
+// 静默走进按值删除、报一句「指纹库中没有」，主人还以为是令牌过期了。
+async function handleAdDelWordCommand(env, chatId, ownerId, arg) {
+	if (!arg) {
+		await sendTelegramMessage(chatId, [
+			'用法：<code>/delword 收U秒结</code>　按值删除，同一值的所有类型一并清除',
+			'批量：<code>/delword noise</code>　删掉命中 0 次的噪声指纹',
+			'　　　<code>/delword type:username</code>　删掉整类（' + AD_FINGERPRINT_TYPES.join(' / ') + '）',
+			'',
+			'批量档需二次确认，且一律不动种子指纹（中心特征，删了不会自动补回）。',
+			'用 /words 查看现有指纹。'
+		].join('\n'));
+		return;
+	}
+
+	// 令牌确认档：/delword bulk <令牌>
+	const bulkToken = arg.match(/^bulk\s+(\S+)$/i);
+	if (bulkToken) {
+		const consumed = await consumeAdConfirmToken(env, bulkToken[1], 'bulk_delword', ownerId);
+		if (!consumed) {
+			await sendTelegramMessage(chatId, '❌ 令牌无效、已使用或已过期（有效期 60 秒）。\n请重新执行批量 /delword 获取新令牌。');
+			return;
+		}
+		// 令牌里只存筛选 key，SQL 片段现场重建 —— 不让任何 SQL 文本进 D1 的 payload 再取出来执行。
+		const filter = buildAdFingerprintBulkFilter(String(consumed.payload?.key || ''));
+		if (!filter || filter.ok !== true) {
+			await sendTelegramMessage(chatId, '❌ 令牌内容异常（筛选条件无法还原），未做任何改动。');
+			return;
+		}
+		const result = await bulkDeleteAdFingerprints(env, filter);
+		if (!result.ok) {
+			await sendTelegramMessage(chatId, '❌ 批量删除失败：' + escapeHtml(String(result.reason || '未知')));
+			return;
+		}
+		await sendTelegramMessage(chatId, [
+			'<b>🗑 已批量删除指纹</b>',
+			'筛选：' + escapeHtml(filter.label),
+			'删除 <b>' + result.removed + '</b> 条（种子指纹未受影响）。'
+		].join('\n'));
+		return;
+	}
+
+	// 批量筛选档：先预览再签令牌。
+	const filter = buildAdFingerprintBulkFilter(arg);
+	if (filter && filter.ok === false) {
+		await sendTelegramMessage(chatId, '⚠️ 未知指纹类型 <code>' + escapeHtml(String(filter.type || '')) + '</code>。\n可用类型：' + AD_FINGERPRINT_TYPES.join(' / '));
+		return;
+	}
+	if (filter) {
+		const preview = await previewAdFingerprintBulkDelete(env, filter);
+		if (!preview.ok) {
+			await sendTelegramMessage(chatId, '❌ 预览失败：' + escapeHtml(String(preview.reason || '未知')));
+			return;
+		}
+		if (!preview.total) {
+			await sendTelegramMessage(chatId, '📭 没有匹配「' + escapeHtml(filter.label) + '」的指纹，未做任何改动。');
+			return;
+		}
+		const token = await issueAdConfirmToken(env, 'bulk_delword', ownerId, { key: filter.key });
+		if (!token) {
+			await sendTelegramMessage(chatId, '❌ 签发确认令牌失败，请稍后重试。');
+			return;
+		}
+		const lines = [
+			'<b>⚠️ 确认批量删除指纹</b>',
+			'',
+			'筛选：' + escapeHtml(filter.label),
+			'将删除 <b>' + preview.total + '</b> 条（种子指纹已排除，不会被删）。',
+			''
+		];
+		lines.push('样本（按命中次数倒序，最多 10 条）：');
+		for (const row of preview.rows) {
+			lines.push('· [' + escapeHtml(String(row.type)) + '] ' + escapeHtml(String(row.value).slice(0, 40))
+				+ '　命中 ' + (Number(row.match_count) || 0) + '　来源 ' + escapeHtml(String(row.source || '未知')));
+		}
+		if (preview.total > preview.rows.length) lines.push('… 其余 ' + (preview.total - preview.rows.length) + ' 条未列出');
+		lines.push('');
+		lines.push('确认请在 60 秒内执行：');
+		lines.push('<code>/delword bulk ' + token + '</code>');
+		await sendTelegramMessageChunks(chatId, lines.join('\n'));
+		return;
+	}
+
+	// 单条按值删除：原有行为，一个字都没改。
+	const result = await removeAdFingerprint(env, arg);
+	if (!result.ok) {
+		await sendTelegramMessage(chatId, '❌ 删除指纹失败：' + escapeHtml(String(result.reason || '未知')));
+		return;
+	}
+	if (!result.removed) {
+		await sendTelegramMessage(chatId, '⚠️ 指纹库中没有 <code>' + escapeHtml(arg) + '</code>，未做任何改动。');
+		return;
+	}
+	await sendTelegramMessage(chatId, '✅ 已删除 <b>' + result.removed + '</b> 条指纹：<code>' + escapeHtml(arg) + '</code>');
+}
+
+// /words [关键词] [页码]：按命中次数倒序分页列出指纹库，每页 AD_WORDS_PAGE_LIMIT 条。
+//
+// 2026-09-09 主人要求新增关键词搜索：「要是有广告有类似的词 就可以通过这个查找，
+// 并且筛选误封的指纹进行删除」。所以它的定位是【配合 /delword 挑误封指纹】，
+// 匹配范围只有 value 一列（主人选定，source 不搜）。
+//
+// 参数解析要同时喂三种写法，且【不能破坏老写法】：
+//   /words            → 第 1 页，无关键词
+//   /words 2          → 第 2 页，无关键词（纯数字仍当页码，老行为原样保留）
+//   /words 收U        → 搜「收U」第 1 页
+//   /words 收U 2      → 搜「收U」第 2 页（按钮塞不下时的文本兜底写法）
+function parseAdWordsArg(arg) {
+	const tokens = String(arg || '').trim().split(/\s+/).filter(Boolean);
+	if (!tokens.length) return { keyword: '', page: 1 };
+	// 末尾是纯数字且前面还有别的词 → 那个数字是页码，其余是关键词。
+	if (tokens.length > 1 && /^\d+$/.test(tokens[tokens.length - 1])) {
+		return { keyword: tokens.slice(0, -1).join(' '), page: Math.max(1, parseInt(tokens[tokens.length - 1], 10) || 1) };
+	}
+	// 只有一个纯数字 token → 老写法的页码。想搜纯数字指纹（例如「8888」）就写 `/words 8888 1`。
+	if (tokens.length === 1 && /^\d+$/.test(tokens[0])) {
+		return { keyword: '', page: Math.max(1, parseInt(tokens[0], 10) || 1) };
+	}
+	return { keyword: tokens.join(' '), page: 1 };
+}
+
+// 渲染一页。命令首次发送与按钮翻页【共用同一个渲染器】，
+// 否则编辑后的文本会与首次发送的排版不一致，翻一页就换个长相。
+async function renderAdWordsPage(env, { page = 1, keyword = '' } = {}) {
+	const limit = AD_WORDS_PAGE_LIMIT;
+	const safePage = Math.max(1, Number(page) || 1);
+	const result = await listAdFingerprints(env, { limit, offset: (safePage - 1) * limit, keyword });
+	if (!result.ok) return { ok: false, notice: '读取指纹库失败' };
+	const label = keyword ? '🔎 指纹库搜索：<code>' + escapeHtml(keyword) + '</code>' : '🔎 指纹库';
+	if (!result.total) {
+		return {
+			ok: true,
+			empty: true,
+			text: keyword
+				? '📭 <b>' + label + '</b>\n\n没有匹配的指纹。搜索只匹配指纹内容（value），不匹配来源。'
+				: '📭 <b>指纹库</b>\n\n当前为空。自动学习会在确认广告后逐步积累，也可用 /addword 手动添加。',
+			keyboard: null,
+			fallbackLine: ''
+		};
+	}
+	const totalPages = Math.max(1, Math.ceil(result.total / limit));
+	const lines = ['<b>' + label + '</b>', '共 <b>' + result.total + '</b> 条　第 ' + safePage + '/' + totalPages + ' 页', ''];
+	if (!result.rows.length) {
+		lines.push('该页没有数据，最大页码 ' + totalPages + '。');
+	}
+	for (const row of result.rows) {
+		lines.push(
+			'[' + escapeHtml(row.type) + '] <code>' + escapeHtml(String(row.value).slice(0, 50)) + '</code>'
+		);
+		lines.push(
+			'　权重 ' + row.weight + '　命中 ' + row.matchCount + '　误判 ' + row.falsePositiveCount
+			+ '　置信 ' + row.confidence.toFixed(2) + '　来源 ' + escapeHtml(row.source)
+		);
+	}
+	const keyboard = buildAdPaginationKeyboard(
+		AD_WORDS_PAGINATION_PREFIX, safePage, totalPages, encodeAdCallbackToken(keyword)
+	);
+	// 文本兜底：只在「按钮挂不上」时才附加（消息被分块，或关键词长到 callback_data 装不下）。
+	const fallbackLine = totalPages > 1
+		? '翻页：<code>/words ' + (keyword ? escapeHtml(keyword) + ' ' : '') + Math.min(totalPages, safePage + 1) + '</code>'
+		: '';
+	return { ok: true, text: lines.join('\n'), keyboard, fallbackLine, totalPages };
+}
+
+async function handleAdWordsCommand(env, chatId, arg) {
+	const { keyword, page } = parseAdWordsArg(arg);
+	const rendered = await renderAdWordsPage(env, { page, keyword });
+	if (!rendered.ok) {
+		await sendTelegramMessage(chatId, '❌ 读取指纹库失败。');
+		return;
+	}
+	await sendAdPagedMessage(chatId, rendered.text, rendered.keyboard, rendered.fallbackLine);
+}
+
+// /addsample <文本>：新增语义样本。向量不在此刻生成，由检测时的懒加载分批补齐，
+// 避免一条命令里连跑多次 AI 推理撞上单请求子请求上限。
+async function handleAdAddSampleCommand(env, chatId, arg) {
+	if (!arg) {
+		await sendTelegramMessage(chatId, [
+			'用法：<code>/addsample 收各种赚钱包盒项目 秒结不拖欠</code>',
+			'',
+			'样本用于第三层 AI 语义相似度比对，建议直接粘贴真实广告原文。',
+			'向量由检测时分批自动补齐（每次最多 ' + AD_SAMPLE_LAZY_BATCH + ' 条），无需手动触发。'
+		].join('\n'));
+		return;
+	}
+	const result = await addAdSample(env, arg, { source: 'manual' });
+	if (!result.ok) {
+		const reasonMap = { too_short: '样本太短（至少 4 个字符）', unavailable: '数据表不可用', error: '写入失败' };
+		await sendTelegramMessage(chatId, '❌ 添加样本失败：' + (reasonMap[result.reason] || result.reason));
+		return;
+	}
+	const counts = await countAdSamples(env);
+	await sendTelegramMessage(chatId, [
+		result.added ? '<b>✅ 样本已添加</b>' : '<b>ℹ️ 样本已存在</b>',
+		'内容：' + escapeHtml(String(result.text).slice(0, 120)),
+		'样本库：共 <b>' + counts.total + '</b> 条，已生成向量 <b>' + counts.ready + '</b> 条'
+	].join('\n'));
+}
+
+// /warmup：手动补齐语义样本向量，每次最多 AD_SAMPLE_LAZY_BATCH 条。
+// 存在意义：向量原本只在第三层被调用时懒加载，而第三层需要可疑消息才会触发，
+// 指纹层命中即定罪的情况更走不到 —— 于是新部署的向量可能长期为 0，第三层空转。
+// 本命令给主人一个明确的补齐入口与进度反馈，反复执行即可补满。
+// 单次仍受 AD_SAMPLE_LAZY_BATCH 限制，避免一口气跑几十次 AI 推理撞子请求预算。
+async function handleAdWarmupCommand(env, chatId) {
+	const config = loadAdDetectionConfig(env);
+	if (!config.aiEnabled) {
+		await sendTelegramMessage(chatId, [
+			'⚠️ <b>未绑定 Workers AI</b>',
+			'',
+			'第三层语义判定不可用，无需补齐向量。',
+			'当前按「结构化评分 + 指纹库」两层工作。'
+		].join('\n'));
+		return;
+	}
+	const before = await countAdSamples(env);
+	if (!before.total) {
+		await sendTelegramMessage(chatId, '📭 样本库为空，请先用 <code>/addsample 文本</code> 添加样本。');
+		return;
+	}
+	// 【2026-09-08 目标从 min(total, 30) 改成 total】配套 topUpAdSampleEmbeddings 去掉 30 条硬上限。
+	// 旧口径：target = min(total, 30)，库里有 50 条样本、其中 32 条有向量时 32 >= 30 成立，
+	// 于是走进下面的「✅ 向量已就绪 … 无需再补」分支 —— 而实际还有 18 条样本永远没有向量、
+	// 永不参与判定（loadAdSampleEmbeddings 只读 embedding IS NOT NULL）。离线实测确认过这个误报。
+	// 新口径：只要还有一条样本没向量就不算就绪，因为现在补齐没有上限、每条样本都该拿到向量。
+	const target = before.total;
+	// 陈旧向量优先处理：维度不符的向量在判定时会被跳过，此时 ready 达标也不代表第三层可用，
+	// 直接报「已就绪」会误导运维。必须先引导清空，否则 /warmup 补不动（embedding 非 NULL 不会被重算）。
+	if (before.stale > 0) {
+		await sendTelegramMessageChunks(chatId, [
+			'⚠️ <b>存在旧模型维度的向量</b>',
+			'',
+			'共 <b>' + before.stale + '</b> 条向量的维度与当前模型不符，判定时会被跳过。',
+			'当前模型：<code>' + AD_EMBEDDING_MODEL + '</code>（' + AD_EMBEDDING_DIMENSION + ' 维）',
+			'',
+			'这些行的 embedding 非空，<code>/warmup</code> 不会重算它们。',
+			'请先发 <code>/clearsamples</code> 清空样本库（会走二次确认），',
+			'再用 <code>/addsample</code> 补回你的自定义样本，然后重新 <code>/warmup</code>。',
+			'',
+			'提示：内置 10 条种子样本会在样本表为空时由下次冷启动的建表检查补回'
+			+ '（同一 isolate 内建表结果被缓存，不会立即重建）。'
+		].join('\n'));
+		return;
+	}
+	if (before.ready >= target) {
+		await sendTelegramMessage(chatId, [
+			'✅ <b>向量已就绪</b>',
+			'',
+			'全部 <b>' + before.total + '</b> 条样本均已生成向量。',
+			'第三层 AI 语义判定正常工作，无需再补。'
+		].join('\n'));
+		return;
+	}
+	const filled = await topUpAdSampleEmbeddings(env);
+	const after = await countAdSamples(env);
+	const remain = Math.max(0, after.total - after.ready);
+	const lines = [
+		filled > 0 ? '✅ <b>已生成 ' + filled + ' 条向量</b>' : '⚠️ <b>本次未生成任何向量</b>',
+		'',
+		'进度：<b>' + after.ready + '</b> / ' + after.total + ' 条样本已生成向量'
+	];
+	if (remain > 0) {
+		lines.push('还差 <b>' + remain + '</b> 条，再发 /warmup 继续（每次最多 ' + AD_SAMPLE_LAZY_BATCH + ' 条）。');
+	} else {
+		lines.push('全部样本向量已补齐，第三层 AI 语义判定现已生效。');
+	}
+	if (filled === 0) {
+		lines.push('');
+		lines.push('未生成的可能原因：AI 调用失败或限流。可查 Workers Logs 搜 <code>[广告检测]</code> 前缀。');
+	}
+	await sendTelegramMessageChunks(chatId, lines.join('\n'));
+}
+
+// /clearsamples：清空全部语义样本（含内置种子）。破坏性操作 → 走 D1 一次性令牌二次确认。
+// 纯 D1 环境没有 KV 的 TTL，令牌表用 expires_at + 读取即删实现 60 秒有效且只能用一次。
+async function handleAdClearSamplesCommand(env, chatId, ownerId, arg) {
+	const counts = await countAdSamples(env);
+	if (!arg) {
+		if (!counts.total) {
+			await sendTelegramMessage(chatId, '📭 样本库已经是空的，无需清理。');
+			return;
+		}
+		const token = await issueAdConfirmToken(env, 'clear_samples', ownerId, { total: counts.total });
+		if (!token) {
+			await sendTelegramMessage(chatId, '❌ 签发确认令牌失败，请稍后重试。');
+			return;
+		}
+		await sendTelegramMessage(chatId, [
+			'<b>⚠️ 确认清空语义样本库</b>',
+			'',
+			'当前共 <b>' + counts.total + '</b> 条样本（含内置种子 ' + AD_SAMPLE_SEED_TEXTS.length + ' 条），已生成向量 ' + counts.ready + ' 条。',
+			'清空后第三层 AI 语义检测会失效，直到重新添加样本。',
+			'',
+			'确认请在 60 秒内执行：',
+			'<code>/clearsamples ' + token + '</code>'
+		].join('\n'));
+		return;
+	}
+
+	const consumed = await consumeAdConfirmToken(env, arg, 'clear_samples', ownerId);
+	if (!consumed) {
+		await sendTelegramMessage(chatId, '❌ 令牌无效、已使用或已过期（有效期 60 秒）。\n请重新执行 /clearsamples 获取新令牌。');
+		return;
+	}
+	const result = await clearAdSamples(env);
+	if (!result.ok) {
+		await sendTelegramMessage(chatId, '❌ 清空样本失败：' + escapeHtml(String(result.reason || '未知')));
+		return;
+	}
+	await sendTelegramMessage(chatId, [
+		'<b>🗑 样本库已清空</b>',
+		'删除 <b>' + result.removed + '</b> 条样本。',
+		'',
+		'第三层 AI 语义检测当前无样本可比，实际按「评分 + 指纹」两层运行。',
+		'用 /addsample 重新添加样本即可恢复。'
+	].join('\n'));
+}
+
+// /adstats：一屏看全检测状态 —— 配置、指纹库、样本库、观察窗口、待确认快照、域名白名单。
+async function handleAdStatsCommand(env, chatId) {
+	const config = loadAdDetectionConfig(env);
+	// 顺带补一批样本向量。此前 topUpAdSampleEmbeddings 的唯一调用点在 checkAdAiSimilarity 内部，
+	// 而第三层只在消息通过零成本预筛后才会走到 —— 形成死锁：
+	//   没有可疑消息 → 第三层不被调用 → 向量不补 → 一直 0 条 → 即使来了可疑消息，
+	//   samples 为空也直接返回相似度 0，第三层等于不存在。
+	// 指纹层命中即定罪的情况更走不到第三层，向量可能永远补不上。
+	// 放在 /adstats 里：主人查状态是自然的补齐时机，且能立刻在回执里看到进度。
+	const warmed = await topUpAdSampleEmbeddings(env);
+	const now = Math.floor(Date.now() / 1000);
+	const samples = await countAdSamples(env);
+	const whitelist = await loadAdDomainWhitelist(env);
+
+	let fpTotal = 0;
+	let fpByType = [];
+	let fpTop = [];
+	let screeningCount = 0;
+	let pendingCount = 0;
+	let whitelistRows = 0;
+	try {
+		const rows = await env.DB.batch([
+			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_fingerprints'),
+			env.DB.prepare('SELECT type, COUNT(*) AS c FROM ad_fingerprints GROUP BY type ORDER BY c DESC'),
+			env.DB.prepare('SELECT type, value, match_count FROM ad_fingerprints ORDER BY match_count DESC, updated_at DESC LIMIT 5'),
+			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_user_screening WHERE expires_at > ?').bind(now),
+			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE expires_at > ?').bind(now),
+			env.DB.prepare('SELECT COUNT(*) AS c FROM ad_domain_whitelist')
+		]);
+		fpTotal = Number(rows[0]?.results?.[0]?.c) || 0;
+		fpByType = rows[1]?.results || [];
+		fpTop = rows[2]?.results || [];
+		screeningCount = Number(rows[3]?.results?.[0]?.c) || 0;
+		pendingCount = Number(rows[4]?.results?.[0]?.c) || 0;
+		whitelistRows = Number(rows[5]?.results?.[0]?.c) || 0;
+	} catch (error) {
+		console.error('[广告检测] 统计查询失败:', error);
+	}
+
+	const lines = [
+		'<b>📊 广告检测状态</b>',
+		'',
+		'<b>判定配置</b>',
+		'封禁阈值：<b>' + config.scoreThreshold + '</b>　观察阈值：<b>' + config.observationScore + '</b>',
+		'观察窗口：' + config.observationHours + ' 小时',
+		'AI 语义阈值：' + config.aiSimilarityThreshold + '　指纹最低置信：' + config.fingerprintMinConfidence,
+		'第三层 AI：' + (config.aiEnabled ? '✅ 已绑定（' + AD_EMBEDDING_MODEL + ' / ' + AD_EMBEDDING_DIMENSION + ' 维）' : '⚠️ 未绑定，降级为评分 + 指纹两层'),
+		'',
+		'<b>指纹库</b>　共 <b>' + fpTotal + '</b> 条'
+	];
+	if (fpByType.length) {
+		lines.push('分类：' + fpByType.map((r) => escapeHtml(String(r.type)) + ' ' + (Number(r.c) || 0)).join('　'));
+	}
+	for (const row of fpTop) {
+		lines.push('· [' + escapeHtml(String(row.type)) + '] ' + escapeHtml(String(row.value).slice(0, 40)) + '　命中 ' + (Number(row.match_count) || 0));
+	}
+	lines.push('');
+	lines.push('<b>语义样本</b>　共 <b>' + samples.total + '</b> 条，已生成向量 <b>' + samples.ready + '</b> 条');
+	if (warmed > 0) {
+		lines.push('　↳ 本次顺带生成 <b>' + warmed + '</b> 条向量' + (samples.ready < samples.total ? '，再发几次 /adstats 或 /warmup 可继续补齐' : ''));
+	} else if (config.aiEnabled && samples.ready === 0 && samples.total > 0) {
+		lines.push('　↳ ⚠️ 向量为 0，第三层 AI 实际未生效，请发 /warmup 补齐');
+	} else if (config.aiEnabled && samples.ready < samples.total) {
+		// 配套「向量补齐无上限」：只要还有样本没向量就明确报出来，
+		// 不再因为「够 30 条了」就假装齐了 —— 没向量的样本是完全不参与判定的。
+		lines.push('　↳ 还有 <b>' + (samples.total - samples.ready) + '</b> 条样本没有向量，发 /warmup 可继续补齐');
+	}
+	if (samples.stale > 0) {
+		lines.push('　↳ ⚠️ 其中 <b>' + samples.stale + '</b> 条是旧模型维度，判定时会被跳过');
+		lines.push('　　 用 /clearsamples 清空后重新 /warmup 生成');
+	}
+	lines.push('<b>观察窗口</b>　窗口内 <b>' + screeningCount + '</b> 人');
+	lines.push('<b>待确认快照</b>　<b>' + pendingCount + '</b> 条（保留 1 小时）');
+	lines.push('<b>域名白名单</b>　生效 <b>' + whitelist.size + '</b> 条（D1 自定义 ' + whitelistRows + ' 条，内置种子 ' + AD_DOMAIN_WHITELIST_SEED.length + ' 条）');
+	await sendTelegramMessageChunks(chatId, lines.join('\n'));
+}
+
+// /whitelist [list|add|del] [域名]：域名白名单管理。
+// D1 表为空时自动回落到内置种子，所以「删到空」不会导致所有链接都被判广告。
+async function handleAdWhitelistCommand(env, chatId, ownerId, arg) {
+	const parts = arg ? arg.split(/\s+/) : [];
+	const action = (parts[0] || 'list').toLowerCase();
+	const target = parts.slice(1).join(' ').trim();
+
+	if (action === 'add' || action === 'del') {
+		if (!target) {
+			await sendTelegramMessage(chatId, '用法：<code>/whitelist ' + action + ' github.com</code>');
+			return;
+		}
+		const result = action === 'add'
+			? await addAdDomainWhitelist(env, target, ownerId)
+			: await removeAdDomainWhitelist(env, target);
+		if (!result.ok) {
+			const reasonMap = { invalid: '域名不合法', unavailable: '数据表不可用', error: '写入失败' };
+			await sendTelegramMessage(chatId, '❌ 操作失败：' + (reasonMap[result.reason] || result.reason));
+			return;
+		}
+		if (action === 'add') {
+			await sendTelegramMessage(chatId, (result.added ? '✅ 已加入白名单：' : 'ℹ️ 已在白名单中：') + '<code>' + escapeHtml(result.domain) + '</code>');
+		} else {
+			await sendTelegramMessage(chatId, (result.removed ? '✅ 已从白名单移除：' : '⚠️ 白名单中没有该域名：') + '<code>' + escapeHtml(result.domain) + '</code>');
+		}
+		return;
+	}
+
+	if (action !== 'list') {
+		await sendTelegramMessage(chatId, '用法：<code>/whitelist list</code>｜<code>/whitelist add github.com</code>｜<code>/whitelist del github.com</code>');
+		return;
+	}
+
+	let customRows = [];
+	try {
+		const { results } = await env.DB.prepare('SELECT domain, added_by, created_at FROM ad_domain_whitelist ORDER BY created_at DESC LIMIT 50').all();
+		customRows = results || [];
+	} catch (error) {
+		console.error('[广告检测] 读取白名单失败:', error);
+	}
+	const effective = await loadAdDomainWhitelist(env);
+	const lines = [
+		'<b>🛡 域名白名单</b>',
+		'生效 <b>' + effective.size + '</b> 条（白名单内的域名不计入链接可疑分）',
+		''
+	];
+	if (customRows.length) {
+		lines.push('<b>D1 自定义（' + customRows.length + ' 条）</b>');
+		for (const row of customRows) lines.push('· <code>' + escapeHtml(String(row.domain)) + '</code>');
+	} else {
+		lines.push('D1 自定义：无，当前使用内置种子 ' + AD_DOMAIN_WHITELIST_SEED.length + ' 条。');
+		lines.push('提示：一旦用 /whitelist add 添加任意域名，生效集合即切换为 D1 表内容，内置种子不再自动合并。');
+	}
+	lines.push('');
+	lines.push('支持 <code>*.example.com</code> 形式的泛域名；子域名自动向上匹配父域。');
+	await sendTelegramMessageChunks(chatId, lines.join('\n'));
+}
+
+// /rescreen [数量]：对观察窗口内的用户按当前指纹库与样本库重新判定。
+// 用途是「刚学会新指纹，回头把窗口里的人再筛一遍」。
+// 每个用户要付出 getChat + getChatMember + 一次 AI 推理，所以默认只跑 10 个，上限 30，
+// 避免单次命令撞上 Worker 单请求子请求上限。
+async function handleAdRescreenCommand(env, chatId, arg) {
+	const parsed = parseInt(arg, 10);
+	const limit = Number.isFinite(parsed) && parsed > 0
+		? Math.min(AD_RESCREEN_BATCH_LIMIT, parsed)
+		: Math.min(AD_RESCREEN_BATCH_LIMIT, 10);
+
+	let rows = [];
+	try {
+		const result = await env.DB.prepare(
+			'SELECT user_id, chat_id, score, snapshot FROM ad_user_screening WHERE expires_at > ? ORDER BY score DESC, updated_at DESC LIMIT ?'
+		).bind(Math.floor(Date.now() / 1000), limit).all();
+		rows = result?.results || [];
+	} catch (error) {
+		console.error('[广告检测] 读取观察窗口失败:', error);
+		await sendTelegramMessage(chatId, '❌ 读取观察窗口失败。');
+		return;
+	}
+	if (!rows.length) {
+		await sendTelegramMessage(chatId, '📭 观察窗口内没有待复判的用户。');
+		return;
+	}
+
+	const config = loadAdDetectionConfig(env);
+	const whitelist = await loadAdDomainWhitelist(env);
+	const banned = [];
+	const kept = [];
+	const cleared = [];
+	const failed = [];
+
+	for (const row of rows) {
+		const userId = String(row.user_id || '');
+		if (!userId) continue;
+		let snapshot = {};
+		try { snapshot = JSON.parse(String(row.snapshot || '{}')); } catch { snapshot = {}; }
+		const targetChatId = String(row.chat_id || '') || String(GROUP_IDS[0] || '');
+		try {
+			if (isPrivilegedManager(userId)) { cleared.push(userId); await deleteAdScreening(env, userId); continue; }
+			const already = await checkBlacklist(userId, env);
+			if (already.isBlacklisted) { cleared.push(userId); await deleteAdScreening(env, userId); continue; }
+
+			const profile = await fetchAdUserProfile(userId, {});
+			if (targetChatId) profile.status = await fetchAdMemberStatus(targetChatId, userId);
+			// 复判用当前库重新算分，不叠加历史分：历史分本就来自同一份资料，叠加等于重复计分。
+			const evaluation = await evaluateAdSuspect(
+				env,
+				{ profile, text: String(snapshot.text || ''), forwardChat: null },
+				{ config, whitelist }
+			);
+
+			if (evaluation.verdict === 'ban') {
+				await enforceAdDetection(env, {
+					userId,
+					chatId: targetChatId,
+					chatTitle: '',
+					messageId: null
+				}, evaluation, { config, whitelist });
+				banned.push(userId + '(' + evaluation.score + ')');
+			} else if (evaluation.verdict === 'observe') {
+				await upsertAdScreening(env, userId, {
+					chatId: targetChatId,
+					// 定时复查只看资料卡、没有正文 —— retainScore 恒为 0，
+					// 正是要的结果：静态资料分不许进观察历史（见 retainScore 说明）。
+					score: evaluation.retainScore ?? 0,
+					reasons: evaluation.reasons,
+					snapshot: evaluation.snapshot,
+					layer: evaluation.layer
+				}, config);
+				kept.push(userId + '(' + evaluation.score + ')');
+			} else {
+				await deleteAdScreening(env, userId);
+				cleared.push(userId);
+			}
+		} catch (error) {
+			console.error('[广告检测] 复判失败 user=' + userId + ':', error);
+			failed.push(userId);
+		}
+	}
+
+	const lines = [
+		'<b>🔄 观察窗口复判完成</b>',
+		'本次处理 <b>' + rows.length + '</b> 人（上限 ' + limit + '）',
+		'',
+		'判定为广告并封禁：<b>' + banned.length + '</b>',
+		'继续观察：<b>' + kept.length + '</b>',
+		'解除观察：<b>' + cleared.length + '</b>',
+		'复判失败：<b>' + failed.length + '</b>'
+	];
+	if (banned.length) {
+		lines.push('');
+		lines.push('已封禁：');
+		for (const item of banned.slice(0, 10)) lines.push('· <code>' + escapeHtml(item) + '</code>');
+	}
+	if (failed.length) {
+		lines.push('');
+		lines.push('失败：' + failed.slice(0, 10).map((id) => escapeHtml(id)).join('、'));
+	}
+	if (banned.length) {
+		lines.push('');
+		lines.push('每个封禁都已生成快照，用 /pending 查看，判错用 /ignore 序号 回滚。');
+	}
+	await sendTelegramMessageChunks(chatId, lines.join('\n'));
+}
+
+// === 回复式学习 ===
+// 管理员在群里回复一条广告消息并说「广告」/「封」/「学习」→ 立即学入指纹库并封禁作者；
+// 说「不是广告」/「误判」→ 反向操作：解封 + 给命中的指纹累加误判计数。
+// 否定词必须先判：「不是广告」本身包含触发词「广告」，顺序反了就会把纠错当确认执行。
+// 触发要求回复文本足够短，避免正常聊天里带一句「这广告真烦」被当成指令。
+function classifyAdReplyIntent(text) {
+	const value = String(text ?? '').trim();
+	if (!value || value.length > 20) return '';
+	// 【slash 命令一律不进回复学习】2026-09-08 主人选定的「宽特例」。
+	//
+	// 起因：AD_REPLY_LEARN_TRIGGER_PATTERNS 里的 /\bspam/i 会被 `/spam` 自己命中
+	//（`/` 与 `s` 之间词边界成立），而 handleAdReplyLearning 排在命令分发【之前】，
+	// 于是「引用某条广告 + 发 /spam」永远被回复学习截走并 return true ——
+	// /spam 引用分支里那段 source='spam' 的自动学习一次都执行不到，等于死代码。
+	//
+	// 后果不只是走错分支：回复学习学的指纹标 source='manual'，而 manual 会被
+	// markAdFingerprintFalsePositive 的退役 DELETE 豁免（那句带 source != 'manual'）。
+	// 也就是说 /spam 学到的每一条指纹都是永久的 —— 万一学到「实名号」这类正常人也会说
+	// 的词，之后每个说这词的人都被封，/ignore 解封多少次都清不掉它。
+	// source='spam' 的设计初衷正是保住这条误报自动退役的安全网。
+	//
+	// 特例做宽（所有 slash 命令）而不是只放行 /spam：`/ban 广告号` 会命中中文触发词
+	// 「广告」，`/kick 封了他` 命中「封了」—— 只堵 /spam 的话同一个坑换个命令就能再踩。
+	// 命令有自己的分发分支，回复学习只负责「说人话」那条路（回复 + 「这是广告」）。
+	if (isTelegramSlashCommand(value)) return '';
+	const lower = value.toLowerCase();
+	for (const negator of AD_REPLY_LEARN_NEGATORS) {
+		if (lower.includes(String(negator).toLowerCase())) return 'negative';
+	}
+	for (const trigger of AD_REPLY_LEARN_TRIGGERS) {
+		if (lower.includes(String(trigger).toLowerCase())) return 'positive';
+	}
+	// 英文触发词单独走词边界正则，放在中文之后：否定词已在上面拦过，这里只剩纯肯定语义。
+	for (const pattern of AD_REPLY_LEARN_TRIGGER_PATTERNS) {
+		if (pattern.test(value)) return 'positive';
+	}
+	return '';
+}
+
+// 返回 true 表示已处理该消息（调用方应立即 return），false 表示放行。
+// ctx 必须由调用方透传：sendFlashMessage 靠 ctx.waitUntil 注册延时撤回，
+// 传 null 会让闪屏永久留在群里（回执含 TGID 与指纹计数，不该长期公开展示）。
+async function handleAdReplyLearning(message, env, ctx) {
+	if (!env?.DB) return false;
+	const chat = message?.chat;
+	const target = message?.reply_to_message;
+	const from = message?.from;
+	if (!chat || !target || !from || from.is_bot) return false;
+	if (!isConfiguredGroup(chat.id)) return false;
+
+	const intent = classifyAdReplyIntent(message.text);
+	if (!intent) return false;
+
+	const operatorId = from.id;
+	const isAllowed = isPrivilegedManager(operatorId) || await checkIfUserIsAdminInGroup(operatorId, chat.id);
+	if (!isAllowed) return false;
+
+	const targetUser = target.from;
+	if (!targetUser || targetUser.is_bot) return false;
+	const targetId = String(targetUser.id);
+	if (isPrivilegedManager(targetId)) {
+		await sendFlashMessage(chat.id, '⚠️ 目标是管理层，已忽略该操作。', ctx);
+		return true;
+	}
+	if (!(await adDetectionReady(env))) return false;
+
+	const config = loadAdDetectionConfig(env);
+	const whitelist = await loadAdDomainWhitelist(env);
+	const targetText = String(target.text ?? target.caption ?? '').trim();
+	// 被举报那条消息自己的引用体：/spam 也要能吃「正文一个字母 + 引用广告」这种形态，
+	// 否则管理员举报它时评分依据里一个广告词都看不到，快照与复盘信息全是空的。
+	const targetQuotedText = getAdQuotedText(target);
+	const profile = await fetchAdUserProfile(targetId, targetUser);
+	const forwardChat = target.forward_from_chat || target.forward_origin?.chat || null;
+
+	// 纠错分支：不判定、不评分，直接回滚 + 给命中的指纹记误判。
+	if (intent === 'negative') {
+		const displayName = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
+		const payload = {
+			name: displayName,
+			username: profile.username ? '@' + String(profile.username).replace(/^@/, '') : '',
+			bio: profile.bio || '',
+			text: targetText,
+			domains: extractAdDomains([displayName, profile.bio, targetText].filter(Boolean).join('\n'))
+		};
+		const removed = await removeFromBlacklist(targetId, env);
+		let unbanOk = 0;
+		let unbanTotal = 0;
+		if (removed.success || removed.code === 'NOT_FOUND') {
+			const results = await unbanUserFromAllGroups(targetId);
+			unbanTotal = results.length;
+			unbanOk = results.filter((r) => r.ok).length;
+		}
+		// purge: true —— 管理员已经明确声明这是误判，指纹当次即删，不再攒 3 次误报。
+		// 主人原话：「除非说误判了，我就可以通过指定的指令执行全群解封并给指纹记误报 + 删除记录的指纹。」
+		const fp = await markAdFingerprintFalsePositive(env, payload, { purge: true });
+		// 同步清掉当初自动学进去的那条 AI 语义样本。拼法必须走 buildAdSampleText，
+		// 与 enforceAdDetection 写入时完全一致，否则 text_hash 对不上、静默删不掉，
+		// 错样本会永久留在库里继续把相似的正常用户往高相似度上拉（AI 层是硬命中即封）。
+		const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
+		await deleteAdScreening(env, targetId);
+		await sendTelegramMessage(chat.id, [
+			'<b>♻️ 已按误判处理</b>',
+			'用户：<code>' + escapeHtml(targetId) + '</code>',
+			'黑名单：' + (removed.success ? '已移除' : (removed.code === 'NOT_FOUND' ? '本就不在黑名单' : '移除失败')),
+			'解封：' + unbanOk + '/' + unbanTotal + ' 个群成功',
+			'指纹修正：' + (fp.ok ? '标记 ' + (fp.affected || 0) + ' 条误判，删除 ' + (fp.retired || 0) + ' 条' : '标记失败'),
+			'AI 样本：' + (sampleRemoved.ok ? (sampleRemoved.removed > 0 ? '已删除 ' + sampleRemoved.removed + ' 条' : '无对应样本') : '删除失败')
+		].join('\n'));
+		return true;
+	}
+
+	// 确认分支：管理员已经明确说这是广告，所以不再让阈值裁决，强制按封禁处置；
+	// 但仍跑一次完整判定，为的是拿到真实得分与命中依据写进快照，便于事后复盘。
+	profile.status = await fetchAdMemberStatus(chat.id, targetId);
+	const evaluation = await evaluateAdSuspect(env, { profile, text: targetText, quotedText: targetQuotedText, forwardChat }, { config, whitelist });
+	evaluation.verdict = 'ban';
+	evaluation.reasons.push('管理员 ' + operatorId + ' 回复判定为广告');
+
+	// ===== 语义样本取材：正文太短时改用引用体（2026-09-08 项 6）=====
+	// 原实现固定用 name + bio + text。碰上「本人正文只有一个字母 c、广告全在引用块里」
+	// 这种形态（线上漏放 50+ 个号的共同特征），拼出来的就是「Maybell Tillman c」这种废话 ——
+	// 离线实测确认过库里真的存着这条。学一堆人名进 AI 样本库不但没有召回价值，
+	// 还会把「英文人名 + 单字母」这个模式推成广告特征，反过来误伤正常外国用户。
+	//
+	// 换用引用体的两个前提，缺一不可：
+	//   1) 本人正文短到没有语义（≤ AD_QUOTED_KILL_MAX_OWN_TEXT）—— 正文有内容时那才是他自己写的东西；
+	//   2) 本人正文不含举报 / 吐槽语义 —— 这是 judgeAdQuotedKill 的门槛二，防止管理员
+	//      误举报「引用广告并回一句『骗子』」的群友时，把那段广告记成【举报者】的特征。
+	// 刻意【不要求】引用体过构词判据：/spam 是人工确认路径，主人的口径是
+	// 「有权限的人使用这个指令去提交就绝对是广告」，新型广告本来就抓不到构词，
+	// 要是这里再卡一道判据，最该学的新变体反而学不到。
+	const ownSnapshotText = String(evaluation.snapshot.text || '').trim();
+	const quotedForSample = String(targetQuotedText || '').trim();
+	const useQuotedForSample = Boolean(quotedForSample)
+		&& ownSnapshotText.length <= AD_QUOTED_KILL_MAX_OWN_TEXT
+		&& !countAdKeywordHits(ownSnapshotText, AD_QUOTED_KILL_NEGATORS).length;
+	const semanticText = buildAdSampleText({
+		name: evaluation.snapshot.name,
+		bio: evaluation.snapshot.bio,
+		text: useQuotedForSample ? quotedForSample : evaluation.snapshot.text
+	});
+	const semanticSource = useQuotedForSample ? 'reply-quoted' : 'reply';
+	const learn = await learnAdFingerprints(env, evaluation.payload, { source: 'manual', createdBy: String(operatorId) });
+
+	// 先删被举报的那条广告消息，再走统一处置链（处置链里的 revoke_messages 会清该用户其余消息）。
+	if (target.message_id) {
+		try { await deleteMessage(chat.id, target.message_id); } catch (error) { console.error('[广告检测] 删除被举报消息失败:', error); }
+	}
+	// 样本不在这里自己写，而是把取材结果交给 enforceAdDetection 统一落库 ——
+	// 那边（项 7）现在也会自动加样本，两处都写会往库里塞一条纯噪声的
+	// 「昵称 + 单字母」样本，把上面这段取材逻辑白做掉。
+	const enforced = await enforceAdDetection(env, {
+		userId: targetId,
+		chatId: chat.id,
+		chatTitle: chat.title || '',
+		messageId: null
+	}, evaluation, { config, whitelist, sampleText: semanticText, sampleSource: semanticSource });
+
+	await deleteMessage(chat.id, message.message_id);
+	await sendFlashMessage(chat.id, [
+		'✅ 已按广告处置 ' + targetId,
+		'指纹 +' + (Number(learn?.learned) || 0) + '　封禁 ' + (enforced.banSummary || '未知')
+	].join('\n'), ctx);
+
+	// 群内只留 5 秒闪屏（含 TGID 与指纹计数，不宜长期公开），完整详情私聊第一主人。
+	// enforceAdDetection 内部只在【自动判定】路径推送快照通知；回复学习是管理员主动触发，
+	// 此前没有任何私聊回执 —— 群里闪屏一撤回就什么都不剩，主人无从知晓谁在替他做处置。
+	// 这里补上操作人、目标、判定依据与后续可用命令，与自动判定通知的信息量对齐。
+	const ownerId = getOwnerNotifyTargets()[0] || '';
+	if (ownerId) {
+		const displayName = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
+		const noticeLines = [
+			'<b>🛡 回复学习已执行</b>',
+			'',
+			'<b>操作人：</b>' + formatUserReference(operatorId, from),
+			'<b>群组：</b>' + escapeHtml(chat.title || '未知') + '（<code>' + escapeHtml(String(chat.id)) + '</code>）',
+			'',
+			'<b>目标：</b><code>' + escapeHtml(targetId) + '</code>',
+			// 不脱敏，与自动判定通知 renderAdDetectionNotice 的口径一致：
+			// 这条通知只发给第一主人，不存在群内二次传播的风险；而昵称本身就是判定依据
+			//（结构判据「机器生成型西方全名」「非常用书写系统短随机串」都靠它给分），
+			// 脱敏成「F***r」主人就无法复核这条依据到底成不成立。
+			'<b>昵称：</b>' + (displayName ? escapeHtml(displayName) : '（空）'),
+			'<b>判定得分：</b>' + evaluation.score + '（管理员强制判定，不受阈值裁决）',
+			'<b>命中依据：</b>' + escapeHtml(evaluation.reasons.slice(0, 6).join('；') || '（无）'),
+			'',
+			'<b>处置结果</b>',
+			'黑名单：' + (enforced.blacklistCode === 'ADDED' ? '已加入' : enforced.blacklistCode === 'EXISTS' ? '此前已在黑名单' : String(enforced.blacklistCode || '未知')),
+			'全群封禁：' + (enforced.banSummary || '未知'),
+			'学入指纹：' + (Number(learn?.learned) || 0) + ' 条（manual 来源，豁免误报退役）',
+			''
+		];
+		if (enforced.seq) {
+			noticeLines.push('复核：/pending 查看第 <b>' + enforced.seq + '</b> 号快照，'
+				+ '判错发 <code>/ignore ' + enforced.seq + '</code> 可解黑 + 全群解封 + 给指纹记误报。');
+		} else {
+			noticeLines.push('如需撤销：<code>/unban ' + escapeHtml(targetId) + '</code>');
+		}
+		try {
+			await sendTelegramMessageChunks(ownerId, noticeLines.join('\n'));
+		} catch (error) {
+			console.error('[广告检测] 回复学习私聊通知失败:', error);
+		}
+	}
+	return true;
 }
