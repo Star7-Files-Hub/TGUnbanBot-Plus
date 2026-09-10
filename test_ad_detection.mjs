@@ -523,14 +523,11 @@ section('[4] 指纹库读写与误报回滚');
 	assert('学到 keyword 类指纹', rows.some((r) => r.type === 'keyword'), JSON.stringify(rows));
 	assert('学到 bio 类指纹', rows.some((r) => r.type === 'bio'), JSON.stringify(rows));
 	assert('学到非白名单域名（domain 类）', rows.some((r) => r.type === 'domain' && r.value === 'evil-shop.top'), JSON.stringify(rows));
-	// 【2026-09-10 方案 A：username 维度整体下线】断言翻转 ——
-	// 原来这里要求「bio 内 @引流账号」与「广告号自身 username」都学成 username 型指纹。
-	// 线上证明这条通道是误封主因：username 权重 0.8 恰好触及 AD_FINGERPRINT_BAN_WEIGHT，
-	// 单条命中即定罪、不看总分。#143 因广告号艾特主人而把主人 @handle 学进库，
-	// 此后任何人艾特主人都被封（得分 3/阈值 7 照样封 14 群）。
-	// 现在改为断言【一条 username 型指纹都不许产生】。
-	assert('bio 内 @引流账号不再学成 username 指纹', !rows.some((r) => r.type === 'username'), JSON.stringify(rows));
-	assert('广告号自身 username 不再学成指纹', !rows.some((r) => r.type === 'username' && r.value === '@ad_seller_001'), JSON.stringify(rows));
+	// 广告号自身 username 学成 username 型指纹（匹配端只比 payload.username 字段，
+	// 正文里艾特不命中，解决 #143 误封根因）。
+	// bio 内 @引流账号（@promo_channel_x）不再学成 username 指纹——@提及扫描路径已永久删除。
+	assert('广告号自身 username 学成指纹', rows.some((r) => r.type === 'username' && r.value === '@ad_seller_001'), JSON.stringify(rows));
+	assert('bio 内 @引流账号不学成 username 指纹', !rows.some((r) => r.type === 'username' && r.value === '@promo_channel_x'), JSON.stringify(rows));
 
 	// 2026-09-08 拆掉了「source='auto' 必须含强交易动词」的闸门（详见 learnAdFingerprints 注释：
 	// AI 层定罪时 structure.guilty 为 false，那道闸门让「AI 越有用、指纹库学到的越少」）。
@@ -1618,22 +1615,21 @@ section('[12] 修复项专项：manual 提权 / 自身 username / 回复学习�
 	assert('A1 manual 指纹扛过 5 次误判不被退役', env12.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE source = 'manual'")[0].c === manualBefore, JSON.stringify(env12.DB.query('SELECT value, source, match_count, false_positive_count, confidence FROM ad_fingerprints')));
 	assert('A1 对照组 auto 指纹被退役清空', env12.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE source = 'auto'")[0].c === 0, JSON.stringify(env12.DB.query('SELECT value, source, confidence FROM ad_fingerprints')));
 
-	// —— B1：username 维度已整体下线（2026-09-10 方案 A）——
-	// 这一组原本逐项断言 username 的入库与边界（自身入库 / 无 @ 前缀归一化 / 过短剔除 /
-	// 非法字符剔除 / 自身与提及同时入库 / 重复去重）。username 维度删除后，
-	// 全部翻转为「任何形态都不产生 username 候选」—— 边界用例保留，因为它们恰好覆盖了
-	// 各种可能的漏法：合法长 handle、无 @ 前缀、过短、非法字符、自身+提及、重复。
-	assert('B1 自身 username 不再入库', env12.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE type = 'username'")[0].c === 0, JSON.stringify(env12.DB.query("SELECT type, value FROM ad_fingerprints")));
+	// —— B1：username 维度精确化（2026-09-10 方案 B）——
+	// matchAdFingerprints 只比对 payload.username 字段，不扫 haystack（正文/简介/昵称）。
+	// extractAdFingerprintCandidates 只学账号自身 handle，@提及扫描路径已永久删除（#143 根因）。
+	// 以下断言验证「自身入库」和「边界剔除」两类行为均符合新设计。
+	assert('B1 自身 username 入库', env12.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE type = 'username'")[0].c > 0, JSON.stringify(env12.DB.query("SELECT type, value FROM ad_fingerprints")));
 	const candNoAt = W.extractAdFingerprintCandidates({ name: '收U代理', username: 'no_at_prefix_ok', bio: '', text: '' }, new Set());
-	assert('B1 不带 @ 前缀的 username 不入库', !candNoAt.some((c) => c.type === 'username'), JSON.stringify(candNoAt));
+	assert('B1 不带 @ 前缀的 username 仍入库（push 内部补 @）', candNoAt.some((c) => c.type === 'username'), JSON.stringify(candNoAt));
 	const candBad = W.extractAdFingerprintCandidates({ name: '收U代理', username: '@ab', bio: '', text: '' }, new Set());
 	assert('B1 过短 username 不入库', !candBad.some((c) => c.type === 'username'), JSON.stringify(candBad));
 	const candIllegal = W.extractAdFingerprintCandidates({ name: '收U代理', username: '@有中文的名字', bio: '', text: '' }, new Set());
 	assert('B1 非法字符 username 不入库', !candIllegal.some((c) => c.type === 'username'), JSON.stringify(candIllegal));
 	const candBoth = W.extractAdFingerprintCandidates({ name: '收U代理', username: '@self_handle_x', bio: '请联系 @other_handle_y 详谈', text: '' }, new Set());
-	assert('B1 自身与提及的 username 都不入库', !candBoth.some((c) => c.type === 'username'), JSON.stringify(candBoth));
+	assert('B1 自身 username 入库、bio @提及不入库', candBoth.filter((c) => c.type === 'username').length === 1 && candBoth.some((c) => c.type === 'username' && c.value === '@self_handle_x'), JSON.stringify(candBoth));
 	const candDup = W.extractAdFingerprintCandidates({ name: '收U代理', username: '@same_handle_z', bio: '联系 @same_handle_z', text: '' }, new Set());
-	assert('B1 重复 username 一条都不入库', candDup.filter((c) => c.type === 'username').length === 0, JSON.stringify(candDup));
+	assert('B1 重复 username 去重后恰好一条', candDup.filter((c) => c.type === 'username').length === 1, JSON.stringify(candDup));
 
 	// —— C1：回复学习词表不再裸子串误判 ——
 	// 这些是旧词表（含单字「封」、子串 'ad'、'学习'）会误判成封禁指令的正常回复。
@@ -1652,8 +1648,9 @@ section('[12] 修复项专项：manual 提权 / 自身 username / 回复学习�
 	assert('C1 「该封」触发', W.classifyAdReplyIntent('该封') === 'positive');
 	assert('C1 「封禁吧」触发', W.classifyAdReplyIntent('封禁吧') === 'positive');
 	assert('C1 「垃圾消息」触发', W.classifyAdReplyIntent('垃圾消息') === 'positive');
-	assert('C1 英文 spam 触发', W.classifyAdReplyIntent('this is spam') === 'positive');
-	assert('C1 spammer 触发', W.classifyAdReplyIntent('spammer') === 'positive');
+	// 【2026-09-10】裸 spam / spammer 不再触发：忘带 / 的误操作代价太大，/spam 斜杠命令不受影响。
+	assert('C1 英文 spam 裸词不触发', W.classifyAdReplyIntent('this is spam') === '');
+	assert('C1 spammer 裸词不触发', W.classifyAdReplyIntent('spammer') === '');
 	// 否定词必须永远优先：这些短句都含新触发词的子串。
 	assert('C1 「不要封」判为 negative', W.classifyAdReplyIntent('不要封') === 'negative');
 	assert('C1 「不该封」判为 negative', W.classifyAdReplyIntent('不该封') === 'negative');

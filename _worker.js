@@ -1988,10 +1988,11 @@ async function replyToAdmin(message, ctx, { flashText, detailText, isInGroup, no
 		await sendFlashMessage(chatId, flashText, ctx);
 	}
 	if (targets.length) {
+		const chatTitle = message.chat?.title ? `${message.chat.title}（<code>${escapeHtml(String(chatId))}</code>）` : `<code>${escapeHtml(String(chatId))}</code>`;
 		await mapWithConcurrency(targets, BATCH_USER_PROFILE_CONCURRENCY, async (oid) => {
 			const auditText = (triggerIdStr === oid)
-				? `🔔 <b>主人操作通知</b>\n👤 操作人:${operator}（你自己）\n📍 来源:群内\n\n${detailText}`
-				: renderAuditNotification(operator, detailText, '群内', classifyMessageOperatorRole(message, '群管理员'));
+				? `🔔 <b>主人操作通知</b>\n👤 操作人:${operator}（你自己）\n📍 来源:${chatTitle}\n\n${detailText}`
+				: renderAuditNotification(operator, detailText, chatTitle, classifyMessageOperatorRole(message, '群管理员'));
 			const result = await sendTelegramMessageChunks(oid, auditText, replyMarkup);
 			if (!result?.ok) console.error(`[审计通知] 私聊主人${oid}失败:${result?.description || result?.error || '未知'}`);
 		});
@@ -8976,7 +8977,9 @@ const AD_EXEMPT_KEYWORDS = [
 // 英文触发词改走词边界正则，避免 bad / road / download / ready 被 'ad' 命中。
 // 否定词永远先于触发词匹配：「不要封」含「要封」、「取消封禁」含「封禁」，靠顺序保证不误封。
 const AD_REPLY_LEARN_TRIGGERS = ['广告', '垃圾', '封了', '封他', '封她', '封掉', '该封', '要封', '封禁'];
-const AD_REPLY_LEARN_TRIGGER_PATTERNS = [/\bspam/i];
+// 【2026-09-10】移除裸 spam 触发：管理员忘带 / 随手打 spam 会触发全群封禁，误操作代价太大。
+// /spam 斜杠命令走命令分发分支（isTelegramSlashCommand 守卫），不受此处影响。
+const AD_REPLY_LEARN_TRIGGER_PATTERNS = [];
 const AD_REPLY_LEARN_NEGATORS = [
 	'不是广告', '不算广告', '非广告', '别封', '不要封', '不用封', '不该封',
 	'误封', '误判', '不是spam', 'not spam', '不是垃圾', '取消封', '解封'
@@ -10379,10 +10382,17 @@ async function matchAdFingerprints(env, payload, options = {}) {
 	let nonSingleMaxWeight = 0; // 非单业务词命中的最大权重 —— P1：只有它才能构成指纹级封禁
 	for (const row of fingerprints) {
 		if (row.confidence < config.fingerprintMinConfidence) continue;
-		// 【方案 A】历史遗留的 username 型指纹一律跳过，不匹配、不计分、不定罪。
-		// 库里可能还存着旧数据（含 7 条种子），删库是运维动作，代码侧必须自己免疫 ——
-		// 否则清库前的每一条消息都还在踩同一个坑。
-		if (row.type === 'username') continue;
+		// username 型指纹只比对账号自身 handle，不扫 haystack（昵称/简介/正文）。
+		// 广告号自己命中 → 封；正常人文字里艾特广告号 → 不命中、不误封。
+		if (row.type === 'username') {
+			const selfHandle = normalizeAdFingerprintValue('@' + (payload?.username || ''));
+			if (selfHandle.length <= 1 || selfHandle !== row.normalized) continue;
+			hits.push(row);
+			if (row.weight > maxWeight) maxWeight = row.weight;
+			if (!row.singleWord && row.weight > nonSingleMaxWeight) nonSingleMaxWeight = row.weight;
+			if (hits.length >= 8) break;
+			continue;
+		}
 		let matched = false;
 		if (row.type === 'domain') {
 			for (const domain of domains) {
@@ -10424,8 +10434,8 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 	// keyword 数量最多、单条最弱（24 字截断短语），理应让位。
 	// 原注释「放在提及扫描之前入库，避免被文本里的引流账号把上限占满」防的是
 	// username 内部互相挤占，没防到 keyword 跨类挤占，这里一并解决。
-	// username 配额已移除（方案 A）：不再抽取任何 username 候选，留 0 是显式声明而非遗漏。
-	const AD_FINGERPRINT_QUOTA = { keyword: 6, bio: 1, domain: 3, username: 0 };
+	// username 配额恢复为 2：只学账号自身 handle，@提及扫描路径保持删除（#143 根因，永不恢复）。
+	const AD_FINGERPRINT_QUOTA = { keyword: 6, bio: 1, domain: 3, username: 2 };
 	const push = (type, value, weight) => {
 		const normalized = normalizeAdFingerprintValue(value);
 		if (!normalized || normalized.length < 2) return;
@@ -10498,26 +10508,14 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 		if (!isAdDomainWhitelisted(domain, whitelistSet)) push('domain', domain, 1);
 	}
 
-	// 【2026-09-10 方案 A：彻底移除 username 维度】主人口径：资料卡只检测昵称 + 简介，
-	// 用户名不检测 —— 用户名本身没有广告语义，检测不出东西，只会造成误封。
-	//
-	// 移除的是两条学习路径，都是线上误封的直接成因：
-	//   1) 账号自身 username 学成指纹（原 `push('username', '@' + selfUsername, 0.8)`）
-	//      → 线上 #135 / #132 的 `@avelix0` 就是这么进库的。得分 5 / 2 分，
-	//        远低于阈值 7，却因 username 权重 0.8 恰好触及 AD_FINGERPRINT_BAN_WEIGHT
-	//        而【单条即定罪】，14 个群全封。
-	//   2) 扫正文 @提及 学成指纹（原 mentionRe 循环）
-	//      → 这条最严重：广告号发言时艾特了主人，主人的 @handle 就被学进指纹库；
-	//        此后【任何人艾特主人】都命中 haystack（含 payload.text），直接封。
-	//        线上 #143 正是如此：判定依据只有一行「+3 指纹库命中：@ym94203」，
-	//        得分 3 分封 14 个群，回滚记录里「受影响指纹：[username] @ym94203」是铁证。
-	//
-	// P1 的单业务词豁免管不到这里 —— 它只挡裸业务词（usdt / 价格表），
-	// username 既不是业务词，权重又刚好达标，是一条完全绕过所有纠错机制的定罪通道。
-	// 从结构上删掉学习路径，才不会 /delword 删完下一次又原样学回来。
-	//
-	// 代价是失去「广告团伙复用 @handle」这一维度的召回，但那正是误封的源头；
-	// 真广告仍由昵称 emoji、交易动词短语、域名、bio、AI 语义、四通道结构查杀六路兜住。
+	// 账号自身 handle 学习：只学 payload.username，不扫正文 @提及（那是 #143 根因，永不恢复）。
+	// matchAdFingerprints 侧只比对 payload.username 字段，正文里艾特同一 handle 不会命中，
+	// 解决「正常人艾特广告号/管理员被误封」问题，同时保留广告号自身 handle 的召回。
+	// Telegram handle 规则：5-32 字符、只含 [a-zA-Z0-9_]，不符合的不是合法账号名，跳过。
+	const selfUsername = String(payload?.username ?? '').replace(/^@+/, '').trim();
+	if (selfUsername.length >= 5 && /^[a-zA-Z0-9_]+$/.test(selfUsername)) {
+		push('username', '@' + selfUsername, 0.8);
+	}
 
 	// 配额之和恰为 12，slice 只是防御性兜底。
 	return candidates.slice(0, 12);
@@ -10615,8 +10613,6 @@ async function addAdFingerprint(env, rawValue, options = {}) {
 		if (normalizeAdDomain(value)) type = 'domain';
 		else type = 'keyword';
 	}
-	// 显式传 type='username' 也一并拒绝：不留后门写入无效数据。
-	if (type === 'username') return { ok: false, reason: 'username_disabled' };
 	const storedValue = type === 'domain' ? normalizeAdDomain(value) : value.slice(0, 200);
 	if (!storedValue) return { ok: false, reason: 'invalid' };
 
