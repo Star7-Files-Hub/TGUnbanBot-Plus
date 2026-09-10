@@ -199,6 +199,10 @@ let DYNAMIC_GROUP_IDS = [];
 let SUPER_ADMINS = [];
 // 主人 TGID 列表:第一个是主人,后续是副主人。空数组 = 未配置,禁用通知
 let OWNER_IDS = [];
+// 静态用户资料表：bot 不在其所在群时作为 /admins 权限名单的兜底显示
+// 格式：TGID 字符串 → { id, first_name, last_name, username }
+// 环境变量 STATIC_USER_PROFILES（JSON 字符串）优先，留空则为空表
+let STATIC_USER_PROFILES = {};
 // 清扫回看上限(/spam 按它决定 moderation_messages 回看多少条)
 let MSG_CACHE_SIZE = 50;
 // 机器人用户名缓存
@@ -219,6 +223,7 @@ function applyRuntimeConfig(config) {
 	GROUP_ID = config.GROUP_ID;
 	SUPER_ADMINS = config.SUPER_ADMINS;
 	OWNER_IDS = config.OWNER_IDS;
+	STATIC_USER_PROFILES = config.STATIC_USER_PROFILES || {};
 	AD_PROTECTED_USERNAMES = config.AD_PROTECTED_USERNAMES || [];
 	MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
 	FLASH_MESSAGE_TTL_MS = config.FLASH_MESSAGE_TTL_MS;
@@ -505,7 +510,8 @@ function loadRequiredConfig(env) {
 		SELF_UNBAN_CONTACT_GROUP: selfUnbanContactGroup,
 		BLACKLIST_PAGE_LIMIT: blacklistPageLimit,
 		BLACKLIST_REASON_LABELS: blacklistReasonLabels,
-		GKY_BANLIST_ENDPOINT: gkyEndpoint
+		GKY_BANLIST_ENDPOINT: gkyEndpoint,
+		STATIC_USER_PROFILES: parseStaticUserProfiles(env.STATIC_USER_PROFILES),
 	};
 }
 
@@ -4134,13 +4140,6 @@ async function formatTargetByTgid(tgid) {
 	}
 	return `<code>${escapeHtml(idStr)}</code>`;
 }
-
-// 静态用户资料表：用于无法从配置群获取到资料的权限名单成员。
-// 格式：TGID 字符串 → { first_name, last_name, username }
-// API 实时查到资料时会覆盖此处，查不到时作为兜底显示。
-const STATIC_USER_PROFILES = {
-	'197282502': { id: 197282502, first_name: '威廉', last_name: '', username: 'RealNeoMan' },
-};
 
 async function resolvePermissionUserProfiles(ids) {
 	const wanted = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(Boolean))];
@@ -9020,6 +9019,32 @@ const AD_FINGERPRINT_TYPES = ['keyword', 'domain', 'username', 'bio'];
 // 留空则只靠方案 A 的结构性移除兜底（已足够，白名单是加固而非必需）。
 const DEFAULT_AD_PROTECTED_USERNAMES = [];
 let AD_PROTECTED_USERNAMES = [];
+
+// 解析静态用户资料表：环境变量 STATIC_USER_PROFILES 格式为 JSON 字符串。
+// 例：{"197282502":{"first_name":"威廉","username":"RealNeoMan"}}
+// 每条 value 可含 first_name / last_name / username，id 字段由 key 自动补全。
+// 解析失败时返回空对象，不中断启动流程。
+function parseStaticUserProfiles(raw) {
+	if (raw == null || String(raw).trim() === '') return {};
+	try {
+		const parsed = JSON.parse(String(raw).trim());
+		if (typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+		const result = {};
+		for (const [tgid, info] of Object.entries(parsed)) {
+			if (!/^\d+$/.test(tgid)) continue;
+			result[tgid] = {
+				id: Number(tgid),
+				first_name: String(info?.first_name ?? ''),
+				last_name: String(info?.last_name ?? ''),
+				username: String(info?.username ?? ''),
+			};
+		}
+		return result;
+	} catch (_) {
+		console.error('[静态用户资料] STATIC_USER_PROFILES 解析失败，格式应为 JSON 字符串');
+		return {};
+	}
+}
 
 // 解析受保护 username 列表：统一小写、去 @ 前缀、过滤非法形态。
 function parseAdProtectedUsernames(raw) {
