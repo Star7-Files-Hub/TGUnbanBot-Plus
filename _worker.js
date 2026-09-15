@@ -250,6 +250,9 @@ export default {
 		// 必须在任何路由分发之前合并 /addgroup 动态群：isConfiguredGroup 及其 26 个调用点
 		// 都依赖 GROUP_IDS，晚于分发会导致动态群被当成"非配置群"直接忽略。
 		await mergeDynamicGroupsFromD1(env);
+		// 关键词豁免的 D1 部分（/exempt 维护）。与动态群同理：必须在任何判定/学习之前刷新，
+		// 否则本次请求里 getAdExemptKeywords() 拿到的还是上一批词。
+		await refreshAdExemptKeywords(env);
 
 		if (url.pathname === "/banlist" && url.searchParams.has('tgid') && url.searchParams.get('tgid') != '') {
 			const tgid = url.searchParams.get('tgid');
@@ -324,6 +327,7 @@ export default {
 		// 重新校验任务里存的 groupIds，此处不合并会把动态群静默丢弃 ——
 		// 任务回执显示成功，但那些群实际没有执行封禁。
 		await mergeDynamicGroupsFromD1(env);
+		await refreshAdExemptKeywords(env);
 
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
@@ -359,6 +363,7 @@ export default {
 		}
 		try {
 			await mergeDynamicGroupsFromD1(env);
+			await refreshAdExemptKeywords(env);
 			const summary = await runAdBioRescan(env);
 			// 顺手清一次过期数据。原先只搭在 detectAdOnJoin 上，
 			// 没人入群的日子就不会剪枝；挂到 cron 上有个稳定节拍。
@@ -584,6 +589,7 @@ async function handleInitialization(request, env) {
 			{ command: "warmup", description: "补齐样本向量" },
 			{ command: "clearsamples", description: "清空AI样本" },
 			{ command: "whitelist", description: "域名白名单管理" },
+			{ command: "exempt", description: "关键词豁免管理" },
 			{ command: "help", description: "查看所有命令" },
 			{ command: "admins", description: "查看权限名单" },
 			{ command: "groups", description: "查看配置群组" },
@@ -7230,6 +7236,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/warmup　补齐样本向量（向量为 0 时第三层 AI 不生效，反复发直到补满）',
 			'/clearsamples　清空全部 AI 样本，需二次确认令牌',
 			'/whitelist [list|add|del] [域名]　维护域名白名单，命中即豁免',
+			'/exempt [list|add|del] [关键词]　维护关键词豁免，命中且无强交易动词时减分',
 		];
 		await sendTelegramMessageChunks(chatId, helpLines.join('\n'));
 		return;
@@ -9045,6 +9052,105 @@ const AD_EXEMPT_KEYWORDS = [
 	'私聊', '代理', '官方中文', 't.me'
 ];
 
+// ===== 关键词豁免的【动态部分】（D1，2026-09-15 主人要求加命令维护）=====
+// 上面那张表是【内置种子】：改它要动代码 + 重新部署。这一段是运行期可改的，
+// 由 /exempt add|del 维护，命中口径与内置种子完全一致，合并成一个数组使用。
+//
+// 【为什么不复用 ad_domain_whitelist】两者语义完全不同 ——
+// 域名白名单是「链接不计分」，关键词豁免是「命中就减分」。
+// 混一张表会让 /whitelist list 把豁免词当域名显示出来。
+//
+// 【为什么必须合并后统一取】所有豁免词命中的调用点（评分 / 学习闸门 / 短语提炼）
+// 一律走 getAdExemptKeywords()。任何一处直接引用 AD_EXEMPT_KEYWORDS 常量，
+// 都会让 /exempt add 加的词在那条路径上静默失效。
+const AD_EXEMPT_KEYWORD_CACHE = new WeakMap();
+const AD_EXEMPT_KEYWORD_CACHE_TTL_MS = 60000;
+// 运行期动态豁免词。每请求由 refreshAdExemptKeywords 重建；空数组 = 只有内置种子。
+let AD_EXEMPT_DYNAMIC = [];
+
+// 合并后的豁免词表。注意每次调用都新建数组（仅当有动态词时），
+// 调用方只读不改，不缓存引用 —— 免得某处把返回值存下来后漏掉后续更新。
+function getAdExemptKeywords() {
+	return AD_EXEMPT_DYNAMIC.length ? [...AD_EXEMPT_KEYWORDS, ...AD_EXEMPT_DYNAMIC] : AD_EXEMPT_KEYWORDS;
+}
+
+// 归一化豁免词：小写 → 去首尾空白 → 去 @ 前缀 → 内部空白压成单空格。
+// 长度上限 64 是防呆：豁免是子串匹配，超长词几乎不可能命中，只会拖慢每次全表扫描。
+function normalizeAdExemptKeyword(raw) {
+	const value = String(raw ?? '').trim().toLowerCase().replace(/^@+/, '').replace(/\s+/g, ' ');
+	if (!value) return '';
+	if (value.length > 64) return '';
+	return value;
+}
+
+async function loadAdExemptKeywords(env) {
+	if (!env?.DB) return [];
+	try {
+		return await loadAdCachedValue(AD_EXEMPT_KEYWORD_CACHE, env.DB, AD_EXEMPT_KEYWORD_CACHE_TTL_MS, async () => {
+			if (!(await adDetectionReady(env))) return [];
+			const { results } = await env.DB.prepare('SELECT keyword FROM ad_exempt_keywords').all();
+			const list = [];
+			for (const row of results || []) {
+				const keyword = normalizeAdExemptKeyword(row?.keyword);
+				if (keyword) list.push(keyword);
+			}
+			return list;
+		});
+	} catch (error) {
+		console.error('[广告检测] 读取关键词豁免失败:', error);
+		return [];
+	}
+}
+
+// 每请求入口调用一次。读失败时【保留上一次的值】而不是清空 ——
+// 清空等于 D1 抖一下就把主人加过的豁免词全部失效，误封会立刻回来。
+async function refreshAdExemptKeywords(env) {
+	const list = await loadAdExemptKeywords(env);
+	if (Array.isArray(list)) AD_EXEMPT_DYNAMIC = list;
+}
+
+async function addAdExemptKeyword(env, rawKeyword, addedBy) {
+	const keyword = normalizeAdExemptKeyword(rawKeyword);
+	if (!keyword) return { ok: false, reason: 'invalid' };
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const result = await env.DB
+			.prepare('INSERT OR IGNORE INTO ad_exempt_keywords (keyword, added_by, source, created_at) VALUES (?, ?, ?, ?)')
+			.bind(keyword, String(addedBy ?? ''), 'manual', Math.floor(Date.now() / 1000)).run();
+		AD_EXEMPT_KEYWORD_CACHE.delete(env.DB);
+		await refreshAdExemptKeywords(env);
+		return {
+			ok: true,
+			keyword,
+			added: Number(result?.meta?.changes || 0) > 0,
+			builtin: AD_EXEMPT_KEYWORDS.includes(keyword)
+		};
+	} catch (error) {
+		console.error('[广告检测] 添加关键词豁免失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
+async function removeAdExemptKeyword(env, rawKeyword) {
+	const keyword = normalizeAdExemptKeyword(rawKeyword);
+	if (!keyword) return { ok: false, reason: 'invalid' };
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const result = await env.DB.prepare('DELETE FROM ad_exempt_keywords WHERE keyword = ?').bind(keyword).run();
+		AD_EXEMPT_KEYWORD_CACHE.delete(env.DB);
+		await refreshAdExemptKeywords(env);
+		return {
+			ok: true,
+			keyword,
+			removed: Number(result?.meta?.changes || 0) > 0,
+			builtin: AD_EXEMPT_KEYWORDS.includes(keyword)
+		};
+	} catch (error) {
+		console.error('[广告检测] 删除关键词豁免失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
 // 回复学习触发词与否定词（第一主人普通回复即可标注广告）
 // 触发词一律要求成词。历史词表里的单字「封」、英文子串「ad」和「学习」都是裸子串匹配，
 // 会把「封面不错」「already done」「学习了」这类正常回复判成封禁指令，而 positive 分支是
@@ -9336,6 +9442,7 @@ async function d1AdDetectionTablesExist(env) {
 		'ad_user_screening',
 		'ad_sample_embeddings',
 		'ad_domain_whitelist',
+		'ad_exempt_keywords',
 		'ad_pending_snapshots',
 		'ad_confirm_tokens',
 		'ad_group_members',
@@ -9366,6 +9473,8 @@ async function ensureAdDetectionTables(env) {
 			await runD1SchemaStatement(env, 'idx_ad_sample_pending', 'CREATE INDEX IF NOT EXISTS idx_ad_sample_pending ON ad_sample_embeddings (dimension)', { optional: true });
 
 			await runD1SchemaStatement(env, 'ad_domain_whitelist', 'CREATE TABLE IF NOT EXISTS ad_domain_whitelist (domain TEXT PRIMARY KEY, added_by TEXT, source TEXT, created_at INTEGER NOT NULL)');
+			// 关键词豁免的 D1 追加表（/exempt 维护）。与内置 AD_EXEMPT_KEYWORDS 合并使用。
+			await runD1SchemaStatement(env, 'ad_exempt_keywords', 'CREATE TABLE IF NOT EXISTS ad_exempt_keywords (keyword TEXT PRIMARY KEY, added_by TEXT, source TEXT, created_at INTEGER NOT NULL)');
 
 			await runD1SchemaStatement(env, 'ad_pending_snapshots', 'CREATE TABLE IF NOT EXISTS ad_pending_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT NOT NULL, chat_id TEXT, score INTEGER NOT NULL DEFAULT 0, reasons TEXT, snapshot TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_pending_owner_seq', 'CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_pending_owner_seq ON ad_pending_snapshots (owner_id, seq)', { optional: true });
@@ -9850,7 +9959,7 @@ function judgeAdIdentityKill(payload) {
 	//   招揽构词（AD_SOLICIT_PATTERNS）= 收购 / 回收 / 求购 / 出售 / 招代理 —— 部分词
 	//     在正常语境成立（垃圾回收、回收站、出售二手显卡），【保留豁免词闸门】+ 技术负向排除。
 	//   宽词表（AD_IDENTITY_KILL_WIDE 打开时）—— 匹配最松，同样保留豁免词闸门。
-	const exemptHits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
+	const exemptHits = countAdKeywordHits(source, getAdExemptKeywords());
 
 	const bizStruct = AD_STRUCT_MATCH(AD_IDENTITY_BIZ_HARD_PATTERNS, source);
 	const solicitStruct = AD_STRUCT_MATCH(AD_SOLICIT_PATTERNS, source)
@@ -10081,7 +10190,7 @@ function judgeAdQuotedKill(payload) {
 	// 引用体命中技术豁免词【且没有强交易动词】才放行 —— 纯技术贴被引用不该定罪；
 	// 一旦出现强动词（收购 / 代付 / 提供设备 / 秒结），塞几个术语也不免死，
 	// 否则「收购 vless 账号 USDT 日结」这种夹带术语的广告会整条溜过去。
-	const exemptHits = countAdKeywordHits(quoted, AD_EXEMPT_KEYWORDS);
+	const exemptHits = countAdKeywordHits(quoted, getAdExemptKeywords());
 	const tradeHits = countAdKeywordHits(quoted, AD_TRADE_VERBS);
 	if (exemptHits.length && !tradeHits.length) {
 		return {
@@ -10179,7 +10288,7 @@ function scoreAdProfile(profile, options = {}) {
 	const privateInvite = hasAdPrivateInviteLink(combined);
 	if (privateInvite) add(AD_PRIVATE_INVITE_SCORE, '资料卡含私有群一次性邀请链接（t.me/+ 或 joinchat）');
 
-	let exemptHits = countAdKeywordHits(combined, AD_EXEMPT_KEYWORDS);
+	let exemptHits = countAdKeywordHits(combined, getAdExemptKeywords());
 	// 私有邀请链接不吃 t.me 豁免 —— 但【只在全文没有公开 telegram 链接时】才剔。
 	// 同时写了 t.me/mychannel（公开频道）和 t.me/+xxx（私有群）的人，公开那条仍是正常用法，
 	// 豁免照给：这是留给技术群群主的缓冲，宁可放过一个也不误封他。
@@ -10243,7 +10352,7 @@ function scoreAdMessageText(text, options = {}) {
 	if (AD_SYMMETRIC_EMOJI_RE.test(source)) add(3, '正文首尾对称 emoji');
 	if (hasAdRepeatedSegment(source)) add(1, '正文重复段落');
 
-	const exemptHits = countAdKeywordHits(source, AD_EXEMPT_KEYWORDS);
+	const exemptHits = countAdKeywordHits(source, getAdExemptKeywords());
 	if (exemptHits.length) {
 		const penalty = tradeHits.length ? AD_EXEMPT_PENALTY_WITH_TRADE : AD_EXEMPT_PENALTY;
 		add(penalty, '正文命中豁免词：' + exemptHits.slice(0, 3).join('/') + (tradeHits.length ? '（含交易动词，减免打折）' : ''));
@@ -10666,7 +10775,7 @@ async function learnAdFingerprints(env, payload, options = {}) {
 	const isExemptOnlyKeyword = (c) => {
 		if (c.type !== 'keyword') return false;
 		const value = String(c.value || '');
-		if (!countAdKeywordHits(value, AD_EXEMPT_KEYWORDS).length) return false;
+		if (!countAdKeywordHits(value, getAdExemptKeywords()).length) return false;
 		if (countAdKeywordHits(value, AD_TRADE_VERBS).length) return false;
 		if (countAdKeywordHits(value, AD_BUSINESS_KEYWORDS).length) return false;
 		return true;
@@ -11427,7 +11536,7 @@ async function enrichAdCommonPhrases(env, config, options = {}) {
 		// 「豁免词 + 强动词/业务词共存」放行（那是真广告夹带技术术语，例「收购 vless 账号」），
 		// 只有【纯豁免词】的碎片才丢弃。
 		const gate = (phrase) => {
-			const exemptHits = countAdKeywordHits(phrase, AD_EXEMPT_KEYWORDS).length;
+			const exemptHits = countAdKeywordHits(phrase, getAdExemptKeywords()).length;
 			const tradeHits = countAdKeywordHits(phrase, AD_TRADE_VERBS).length;
 			const businessHits = countAdKeywordHits(phrase, AD_BUSINESS_KEYWORDS).length;
 			// 闸1：仅豁免词闸 —— 既命中豁免词、又无任何强动词/业务词 → 丢弃
@@ -12974,7 +13083,7 @@ async function detectAdOnMessage(message, env) {
 // 10 条广告检测命令一律走这一个入口，handleMessage 里只挂一个钩子，
 // 不改动任何既有命令分支。返回 true 表示命令已被处理，调用方应立即 return。
 // 【2026-09-08 从 11 条减为 10 条】confirm 已删除，见 handleAdIgnoreCommand 上方的说明。
-const AD_COMMAND_RE = /^\/(pending|ignore|addword|delword|words|addsample|clearsamples|adstats|whitelist|rescreen|warmup)(?:@[^\s]+)?(?:\s|$)/i;
+const AD_COMMAND_RE = /^\/(pending|ignore|addword|delword|words|addsample|clearsamples|adstats|whitelist|exempt|rescreen|warmup)(?:@[^\s]+)?(?:\s|$)/i;
 
 // 快照 → 判定载荷。/ignore 标误判、删 AI 样本都要用同一份载荷，保证两边命中的集合一致。
 function adPayloadFromSnapshot(snapshot) {
@@ -13038,6 +13147,7 @@ async function handleAdDetectionCommands(message, env, ctx) {
 			case 'clearsamples': await handleAdClearSamplesCommand(env, chatId, ownerId, arg); break;
 			case 'adstats': await handleAdStatsCommand(env, chatId); break;
 			case 'whitelist': await handleAdWhitelistCommand(env, chatId, ownerId, arg); break;
+			case 'exempt': await handleAdExemptCommand(env, chatId, ownerId, arg); break;
 			case 'rescreen': await handleAdRescreenCommand(env, chatId, arg); break;
 			case 'warmup': await handleAdWarmupCommand(env, chatId); break;
 		}
@@ -13703,6 +13813,76 @@ async function handleAdWhitelistCommand(env, chatId, ownerId, arg) {
 	}
 	lines.push('');
 	lines.push('支持 <code>*.example.com</code> 形式的泛域名；子域名自动向上匹配父域。');
+	await sendTelegramMessageChunks(chatId, lines.join('\n'));
+}
+
+// /exempt [list|add|del] [关键词]：关键词豁免管理。
+// 与 /whitelist 的分工：/whitelist 管【域名】（白名单内的链接不计分），
+// 这里管【正常用语】（命中且无强交易动词时减分）。
+// 内置种子 AD_EXEMPT_KEYWORDS 改不了（要动代码 + 重新部署），本命令只维护 D1 追加的那部分。
+async function handleAdExemptCommand(env, chatId, ownerId, arg) {
+	const parts = arg ? arg.split(/\s+/) : [];
+	const action = (parts[0] || 'list').toLowerCase();
+	const target = parts.slice(1).join(' ').trim();
+
+	if (action === 'add' || action === 'del') {
+		if (!target) {
+			await sendTelegramMessage(chatId, '用法：<code>/exempt ' + action + ' 机场</code>');
+			return;
+		}
+		const result = action === 'add'
+			? await addAdExemptKeyword(env, target, ownerId)
+			: await removeAdExemptKeyword(env, target);
+		if (!result.ok) {
+			const reasonMap = {
+				invalid: '关键词不合法（空、或超过 64 字）',
+				unavailable: '数据表不可用',
+				error: '写入失败'
+			};
+			await sendTelegramMessage(chatId, '❌ 操作失败：' + (reasonMap[result.reason] || result.reason));
+			return;
+		}
+		// 内置种子里的词删不掉也加不进去（它不在 D1 表里），这里明确告知，免得主人以为没生效。
+		if (result.builtin) {
+			await sendTelegramMessage(chatId, 'ℹ️ <code>' + escapeHtml(result.keyword) + '</code> 已在内置种子表里，无需再维护。');
+			return;
+		}
+		if (action === 'add') {
+			await sendTelegramMessage(chatId, (result.added ? '✅ 已加入豁免：' : 'ℹ️ 已在豁免中：') + '<code>' + escapeHtml(result.keyword) + '</code>');
+		} else {
+			await sendTelegramMessage(chatId, (result.removed ? '✅ 已从豁免移除：' : '⚠️ 豁免中没有：') + '<code>' + escapeHtml(result.keyword) + '</code>');
+		}
+		return;
+	}
+
+	if (action !== 'list') {
+		await sendTelegramMessage(chatId, '用法：<code>/exempt list</code>｜<code>/exempt add 机场</code>｜<code>/exempt del 机场</code>');
+		return;
+	}
+
+	let rows = [];
+	try {
+		const { results } = await env.DB.prepare('SELECT keyword, added_by, created_at FROM ad_exempt_keywords ORDER BY created_at DESC LIMIT 100').all();
+		rows = results || [];
+	} catch (error) {
+		console.error('[广告检测] 读取关键词豁免失败:', error);
+	}
+	const lines = [
+		'<b>🛡 关键词豁免</b>',
+		'生效 <b>' + getAdExemptKeywords().length + '</b> 条（命中且无强交易动词时减分，不是硬放行）',
+		'　内置种子 ' + AD_EXEMPT_KEYWORDS.length + ' 条（改代码才动得了）',
+		'　D1 自定义 ' + rows.length + ' 条',
+		''
+	];
+	if (rows.length) {
+		lines.push('<b>D1 自定义</b>');
+		for (const row of rows) lines.push('· <code>' + escapeHtml(String(row.keyword)) + '</code>');
+	} else {
+		lines.push('D1 自定义：无，当前只用内置种子。');
+	}
+	lines.push('');
+	lines.push('匹配方式是<b>子串包含</b>（<code>机场</code> 会命中 <code>机场推荐</code>）。');
+	lines.push('⚠️ 豁免治不了<b>已学成的指纹</b> —— 指纹层是命中即封、不走减分。若某词已被学成指纹，需另用 <code>/delword 值</code> 删掉。');
 	await sendTelegramMessageChunks(chatId, lines.join('\n'));
 }
 
