@@ -146,6 +146,25 @@ const DEFAULT_OWNER_IDS = [];
 //    环境变量名：SELF_UNBAN_CONTACT_GROUP
 const DEFAULT_SELF_UNBAN_CONTACT_GROUP = '';
 
+// 12) 广告自动判定后的【封禁范围】。这是「渐进式封禁」的总开关。
+//
+//    取值：
+//      'progressive'（默认，本版新增行为）
+//        首次判定为广告 → 只封【触发判定的那个群】，并把这个号记入监控台账；
+//        该号此后在【任意治理群】再发广告 → 升级为【全群封禁】，并标记「已全群封禁」，不再重复升级。
+//        设计意图：广告号在 A 群发广告不必然代表它在 B/C 群也发了 —— 先按孤例处置，
+//        只有在别处再次露头（或同群再犯）才认定是惯犯，届时才动用全群封禁。
+//        ⚠️ 代价：首次判定到升级之间存在时间窗口，该号在【其他】群里若未被 bot 收到消息事件
+//        （如被禁言、或它不是 bot 所在群的成员），就不会触发升级，也就永远只封触发群。
+//      'global'
+//        恢复旧行为：任何一层判定为广告都【立即全群封禁】。用于出问题时一键回退。
+//
+//    环境变量名：AD_BAN_SCOPE_MODE（'progressive' / 'global'，大小写不敏感）
+//    空串 / 非法值 → 回落 'progressive'。
+const AD_BAN_SCOPE_PROGRESSIVE = 'progressive';
+const AD_BAN_SCOPE_GLOBAL = 'global';
+const DEFAULT_AD_BAN_SCOPE_MODE = AD_BAN_SCOPE_PROGRESSIVE;
+
 // =============================================================================
 // =结束= 普通使用者一般无需修改下方任何内容
 // =============================================================================
@@ -175,6 +194,8 @@ let SELF_UNBAN_CONTACT_GROUP;
 let BLACKLIST_PAGE_LIMIT;
 let BLACKLIST_REASON_LABELS;
 let GKY_BANLIST_ENDPOINT;
+// 广告自动判定的封禁范围（'progressive' / 'global'）。见 DEFAULT_AD_BAN_SCOPE_MODE 说明。
+let AD_BAN_SCOPE_MODE = DEFAULT_AD_BAN_SCOPE_MODE;
 // 群内闪屏存活毫秒数。给初值是因为 sendFlashMessage 可能在 getConfig 之前被调用
 // （例如配置解析本身报错时的提示），此时不该因为 undefined 退化成"永不撤回"。
 let FLASH_MESSAGE_TTL_MS = DEFAULT_FLASH_MESSAGE_TTL_MS;
@@ -220,6 +241,7 @@ function applyRuntimeConfig(config) {
 	SUPER_ADMINS = config.SUPER_ADMINS;
 	OWNER_IDS = config.OWNER_IDS;
 	STATIC_USER_PROFILES = config.STATIC_USER_PROFILES || {};
+	PROFILE_LOOKUP_GROUPS = config.PROFILE_LOOKUP_GROUPS || [];
 	AD_PROTECTED_USERNAMES = config.AD_PROTECTED_USERNAMES || [];
 	MSG_CACHE_SIZE = config.MSG_CACHE_SIZE;
 	FLASH_MESSAGE_TTL_MS = config.FLASH_MESSAGE_TTL_MS;
@@ -232,6 +254,7 @@ function applyRuntimeConfig(config) {
 	BLACKLIST_PAGE_LIMIT = config.BLACKLIST_PAGE_LIMIT;
 	BLACKLIST_REASON_LABELS = config.BLACKLIST_REASON_LABELS;
 	GKY_BANLIST_ENDPOINT = config.GKY_BANLIST_ENDPOINT;
+	AD_BAN_SCOPE_MODE = config.AD_BAN_SCOPE_MODE || DEFAULT_AD_BAN_SCOPE_MODE;
 }
 
 export default {
@@ -493,6 +516,20 @@ function loadRequiredConfig(env) {
 		if (Number.isInteger(n) && n >= 0 && n <= 60000) flashTtlMs = n;
 	}
 
+	// 广告判定的封禁范围。只认这两个字面量，其余（含空串）一律回落 progressive。
+	// 【刻意不把 global 之外的任何未知值当 progressive 静默吃掉】—— 打一条日志，
+	// 让「填错了变量名/拼错了值」在 Worker 日志里一眼可见，而不是表现为"明明配了却没生效"。
+	let adBanScopeMode = DEFAULT_AD_BAN_SCOPE_MODE;
+	if (env.AD_BAN_SCOPE_MODE !== undefined && env.AD_BAN_SCOPE_MODE !== null && String(env.AD_BAN_SCOPE_MODE).trim() !== '') {
+		const raw = String(env.AD_BAN_SCOPE_MODE).trim().toLowerCase();
+		if (raw === AD_BAN_SCOPE_PROGRESSIVE || raw === AD_BAN_SCOPE_GLOBAL) {
+			adBanScopeMode = raw;
+		} else {
+			console.warn('[配置] AD_BAN_SCOPE_MODE 取值非法（' + raw + '），已回落 ' + DEFAULT_AD_BAN_SCOPE_MODE
+				+ '。合法值：' + AD_BAN_SCOPE_PROGRESSIVE + ' / ' + AD_BAN_SCOPE_GLOBAL);
+		}
+	}
+
 	return {
 		TOKEN: String(env.TOKEN).trim(),
 		BOT_TOKEN: String(env.BOT_TOKEN).trim(),
@@ -503,6 +540,7 @@ function loadRequiredConfig(env) {
 		AD_PROTECTED_USERNAMES: parseAdProtectedUsernames(env.AD_PROTECTED_USERNAMES),
 		MSG_CACHE_SIZE: msgCacheSize,
 		FLASH_MESSAGE_TTL_MS: flashTtlMs,
+		AD_BAN_SCOPE_MODE: adBanScopeMode,
 		SELF_UNBAN_KEYWORD: selfUnbanKeyword,
 		START_WELCOME: startWelcome,
 		SELF_UNBAN_PROMPT: selfUnbanPrompt,
@@ -513,6 +551,9 @@ function loadRequiredConfig(env) {
 		BLACKLIST_REASON_LABELS: blacklistReasonLabels,
 		GKY_BANLIST_ENDPOINT: gkyEndpoint,
 		STATIC_USER_PROFILES: parseStaticUserProfiles(env.STATIC_USER_PROFILES),
+		// 只读资料群：与 GROUP_ID 同样的逗号分隔格式，但【绝不并入 uniqueGroupIds】。
+		// 已在 GROUP_ID 里的群自动剔除 —— 那些群本来就会被遍历，重复只是白花请求。
+		PROFILE_LOOKUP_GROUPS: parseProfileLookupGroups(env.PROFILE_LOOKUP_GROUPS, uniqueGroupIds),
 	};
 }
 
@@ -781,7 +822,13 @@ async function deleteAuthorizedGroupCommandMessage(message, commandName) {
 // 读取并归一化黑名单
 // === D1 工具函数 ===
 // 首次访问 D1 时建表（幂等），避免人工建表步骤
-const D1_SCHEMA_VERSION = 6;
+// 【7】2026-09-11：moderation_messages 新增 text_hash / text_norm（同款广告连带查杀）。
+// 必须提版本号 —— ensureD1Table 在 version >= D1_SCHEMA_VERSION 时直接短路返回，
+// 不提的话线上已是 6 的库永远不会重跑迁移，两列加不上，
+// 而 cacheModerationMessage 的 INSERT 已经带上了新列 → 每条群消息都写失败，
+// 消息缓存整体停写、/spam 的历史清扫连带失效（上游线上实际发生过）。
+// 后来者新增列时务必同步 +1。
+const D1_SCHEMA_VERSION = 7;
 const D1_CACHE_PRUNE_INTERVAL = 64;
 const D1_RUNTIME_CACHE_TTL_MS = 15000;
 const D1_INIT_PROMISES = new WeakMap();
@@ -949,9 +996,7 @@ async function ensureD1Table(env) {
 				['idx_blacklist_reason_at_id', 'CREATE INDEX IF NOT EXISTS idx_blacklist_reason_at_id ON blacklist(reason, at, id);'],
 				['idx_moderation_chat_from_id', 'CREATE INDEX IF NOT EXISTS idx_moderation_chat_from_id ON moderation_messages(chat_id, from_id, id);'],
 			];
-			for (const [label, sql] of optionalIndexes) {
-				await runD1SchemaStatement(env, label, sql, { optional: true });
-			}
+			// 【必须先加列、再建索引】索引建在新列上，顺序反了 CREATE INDEX 直接报 no such column。
 
 			try {
 				if (!(await d1ColumnExists(env, 'blacklist', 'note'))) {
@@ -962,6 +1007,36 @@ async function ensureD1Table(env) {
 				if (!message.includes('duplicate') && !message.includes('exists')) {
 					throw error;
 				}
+			}
+
+			// ===== 同款广告连带查杀所需的两列（2026-09-11）=====
+			// text_hash：归一化正文的哈希，等值反查用；text_norm：归一化正文，用于
+			// ① 通知里展示原文（纯哈希无法判断这条文案是否真是广告）
+			// ② 拿到候选后二次比对，兜住哈希碰撞（连带是批量不可逆操作，代价不对称）
+			// ③ 日后若扩展成「相似匹配」，算编辑距离必须有原文，否则历史数据补不回来
+			for (const [column, sql] of [
+				['text_hash', 'ALTER TABLE moderation_messages ADD COLUMN text_hash TEXT;'],
+				['text_norm', 'ALTER TABLE moderation_messages ADD COLUMN text_norm TEXT;']
+			]) {
+				try {
+					if (!(await d1ColumnExists(env, 'moderation_messages', column))) {
+						await runD1SchemaStatement(env, 'moderation_messages.' + column, sql);
+					}
+				} catch (error) {
+					const message = formatD1SchemaError(error).toLowerCase();
+					if (!message.includes('duplicate') && !message.includes('exists')) {
+						throw error;
+					}
+				}
+			}
+
+			// 同款广告连带查杀：按正文哈希 + 时间窗口跨群反查，等值查找必须带索引 ——
+			// 追溯 24 小时 × 全部配置群，没索引就是全表扫。
+			optionalIndexes.push(
+				['idx_moderation_text_hash', 'CREATE INDEX IF NOT EXISTS idx_moderation_text_hash ON moderation_messages(text_hash, created_at);']
+			);
+			for (const [label, sql] of optionalIndexes) {
+				await runD1SchemaStatement(env, label, sql, { optional: true });
 			}
 
 			try {
@@ -2473,7 +2548,7 @@ function estimateBulkAuthorizationRequests(message) {
 	return message?.chat?.type !== 'private' && isConfiguredGroup(message?.chat?.id) ? 1 : 0;
 }
 
-function createBulkJobPayload(action, ids, invalid, note, message) {
+function createBulkJobPayload(action, ids, invalid, note, message, options = {}) {
 	const now = new Date().toISOString();
 	const operator = formatMessageActorMention(message);
 	const groupIds = GROUP_IDS.map((id) => String(id));
@@ -2520,6 +2595,9 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 			addFailed: 0,
 			kickOk: 0,
 			kickFailed: 0,
+			// 同款连带专用统计（普通 /ban /spam 批量恒为 0，只在 deleteTargets 存在时展示）。
+			linkedMsgDeleted: 0,
+			linkedMsgDeleteFailed: 0,
 			removed: 0,
 			notFound: 0,
 			removeFailed: 0,
@@ -2545,12 +2623,12 @@ function createBulkJobPayload(action, ids, invalid, note, message) {
 	return job;
 }
 
-async function createBulkJob(env, action, ids, invalid, note, message) {
+async function createBulkJob(env, action, ids, invalid, note, message, options = {}) {
 	if (!env.DB) {
 		throw new Error('大批量任务需要绑定 D1 存储空间');
 	}
 	await ensureD1Table(env);
-	const job = createBulkJobPayload(action, ids, invalid, note, message);
+	const job = createBulkJobPayload(action, ids, invalid, note, message, options);
 	await env.DB
 		.prepare('INSERT INTO batch_jobs (id, type, status, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
 		.bind(job.id, job.action, job.status, JSON.stringify(job), job.createdAt, job.updatedAt)
@@ -2668,6 +2746,13 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 			`群封禁成功:${job.stats?.kickOk || 0}`,
 			`群封禁失败:${job.stats?.kickFailed || 0}`
 		);
+		// 同款连带才有这两项；普通 /ban /spam 批量没有 deleteTargets，不显示以免空行干扰。
+		if (job.deleteTargets) {
+			lines.push(
+				`同款消息已删:${job.stats?.linkedMsgDeleted || 0}`,
+				`同款消息删除失败:${job.stats?.linkedMsgDeleteFailed || 0}`
+			);
+		}
 	}
 	lines.push(
 		`格式错误:${job.totals?.invalid || 0}`,
@@ -2896,6 +2981,25 @@ async function processBulkJobOperationSlice(job, env) {
 				phase: 'kick',
 				error: result.error || '群封禁失败'
 			});
+		}
+
+		// 同款连带：删掉该目标在【这个群】发的那几条同款消息。
+		// 【放在封禁之后、且不看封禁是否成功】封禁失败常见原因是 bot 在该群没有封禁权限，
+		// 但删消息权限是独立的 —— 两者不该互相拖累，能删一条是一条。
+		// 与 revoke_messages 的关系见 createBulkJobPayload 里 deleteTargets 的注释：
+		// 账号冻结 / 已退群时 revoke 完全无效，这条路才是真正兜住消息删除的那一条。
+		const midList = job.deleteTargets?.[String(task.userId)]?.[String(task.groupId)];
+		if (Array.isArray(midList) && midList.length) {
+			for (const mid of midList) {
+				try {
+					const del = await deleteMessage(task.groupId, mid);
+					if (del?.ok) incrementBulkJobStat(job, 'linkedMsgDeleted');
+					else incrementBulkJobStat(job, 'linkedMsgDeleteFailed');
+				} catch (_) {
+					// 删不掉不影响加黑与封禁（那些已经完成），也不阻塞后续目标。
+					incrementBulkJobStat(job, 'linkedMsgDeleteFailed');
+				}
+			}
 		}
 	});
 
@@ -4221,7 +4325,13 @@ async function resolvePermissionUserProfiles(ids) {
 		}
 	}
 
-	for (const groupId of GROUP_IDS) {
+	// 查询范围 = 治理群 + 只读资料群。治理群在前：同一个人在两类群都能查到时，
+	// 来源群优先显示治理群（那是主人更关心的上下文）。
+	// 【只在这个函数里合并】PROFILE_LOOKUP_GROUPS 不进 GROUP_IDS、不进 isConfiguredGroup，
+	// 所以封禁 / 检测 / 命令鉴权 / purge / 投票一个都不会碰到这些群。
+	const lookupGroups = [...GROUP_IDS, ...PROFILE_LOOKUP_GROUPS];
+
+	for (const groupId of lookupGroups) {
 		try {
 			const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatAdministrators`, {
 				method: 'POST',
@@ -4249,9 +4359,18 @@ async function resolvePermissionUserProfiles(ids) {
 		}
 	}
 
+	// 逐个补查：上面 getChatAdministrators 只能查到【管理员】，而只读资料群里的目标人
+	// 通常只是普通成员，必须靠 getChatMember 才查得到 —— 这一轨才是只读资料群的主用途。
+	//
+	// 【2026-09-11 修正跳过条件】原来写 `if (profiles.has(id)) continue`，
+	// 而静态表（STATIC_USER_PROFILES）在函数开头就把兜底资料填进了同一个 Map ——
+	// 于是只要某人在静态表里有一条，这一轨就被整个跳过，实时查询永远不执行。
+	// 后果是「静态表只作兜底、查到实时资料就覆盖」这个承诺根本不成立：
+	// 对方改了昵称永远显示旧值，配了只读资料群也白配。
+	// 改为只跳过【已由 API 查到】的，静态兜底不算已解析。
 	for (const id of wanted) {
-		if (profiles.has(id)) continue;
-		for (const groupId of GROUP_IDS) {
+		if (profiles.get(id)?.source === 'getChatAdministrators') continue;
+		for (const groupId of lookupGroups) {
 			try {
 				const result = await checkUserStatus(id, groupId);
 				const user = result?.result?.user;
@@ -4273,7 +4392,44 @@ async function resolvePermissionUserProfiles(ids) {
 	return profiles;
 }
 
-function renderPermissionUserLine(id, profile, index) {
+// /admins 来源群显示：把群 ID 解析成「群名（可点击）+ ID」。
+// 【为什么要去重缓存】同一批权限人往往集中在少数几个群，逐行调 getChat 会把同一个群查好几遍。
+// /admins 是低频命令，但没理由白花请求。
+// 拿不到资料时回落成纯 ID —— 与改动前的显示完全一致，不会因为查询失败反而更难读。
+async function resolvePermissionGroupLabels(groupIds) {
+	const labels = new Map();
+	const unique = [...new Set((groupIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+	for (const groupId of unique) {
+		try {
+			const info = await fetchConfiguredGroupInfo(groupId);
+			if (!info?.ok) continue;
+			const title = String(info.chat?.title || '').trim();
+			// resolveChatInviteUrl：公开群走 t.me/username（永久稳定），
+			// 私密群只能用 getChat 返回的 invite_link，而那个字段仅当 bot 是管理员时才有。
+			// 刻意不调 exportChatInviteLink —— 那会撤销并重建主邀请链接，
+			// 让群内所有人手上的旧链接失效，代价远大于「让一行字可点击」。
+			const url = resolveChatInviteUrl(info.chat);
+			if (title || url) labels.set(groupId, { title, url });
+		} catch (_) {
+			// 单群查询失败不影响其它群，也不影响名单主体 —— 回落纯 ID 显示。
+		}
+	}
+	return labels;
+}
+
+function renderPermissionGroupText(groupId, label) {
+	const idText = '<code>' + escapeHtml(String(groupId)) + '</code>';
+	const title = String(label?.title || '').trim();
+	if (!title) return idText;
+	const safeTitle = escapeHtml(title);
+	const url = String(label?.url || '').trim();
+	// 有链接就把群名做成超链接，点一下直达；没有则纯文本群名。
+	// ID 始终保留 —— 排查时要复制的是它，不该因为有了链接就省掉。
+	const titleText = url ? '<a href="' + escapeHtml(url) + '">' + safeTitle + '</a>' : safeTitle;
+	return titleText + '（' + idText + '）';
+}
+
+function renderPermissionUserLine(id, profile, index, groupLabels) {
 	const user = profile?.user;
 	const fullName = user
 		? ([user.first_name, user.last_name].filter(Boolean).join(' ') || '未设置')
@@ -4296,7 +4452,7 @@ function renderPermissionUserLine(id, profile, index) {
 		lines.push(`   群内身份:${escapeHtml(statusMap[profile.status] || profile.status)}`);
 	}
 	if (profile?.groupId) {
-		lines.push(`   来源群:<code>${escapeHtml(profile.groupId)}</code>`);
+		lines.push('   来源群:' + renderPermissionGroupText(profile.groupId, groupLabels?.get?.(profile.groupId)));
 	}
 	if (!user) {
 		lines.push('   资料状态:未在配置群中获取到用户资料');
@@ -4304,7 +4460,7 @@ function renderPermissionUserLine(id, profile, index) {
 	return lines;
 }
 
-function renderPermissionSection(title, ids, profiles) {
+function renderPermissionSection(title, ids, profiles, groupLabels) {
 	const cleanIds = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(Boolean))];
 	const lines = [title];
 	if (!cleanIds.length) {
@@ -4313,7 +4469,7 @@ function renderPermissionSection(title, ids, profiles) {
 	}
 	cleanIds.forEach((id, idx) => {
 		if (idx > 0) lines.push('');
-		lines.push(...renderPermissionUserLine(id, profiles.get(id), idx + 1));
+		lines.push(...renderPermissionUserLine(id, profiles.get(id), idx + 1, groupLabels));
 	});
 	return lines;
 }
@@ -4324,16 +4480,22 @@ async function renderPermissionAdminsList() {
 	const superAdmins = SUPER_ADMINS || [];
 	const allIds = [...primaryOwner, ...secondaryOwners, ...superAdmins];
 	const profiles = await resolvePermissionUserProfiles(allIds);
+	// 只查【实际出现在名单里】的来源群，且函数内部去重 ——
+	// 不是遍历全部配置群，那会在群多时白花一堆 getChat。
+	const groupLabels = await resolvePermissionGroupLabels(
+		[...profiles.values()].map((p) => p?.groupId).filter(Boolean)
+	);
 	const lines = [
 		'🔐 <b>权限名单</b>',
 		'',
-		...renderPermissionSection('👑 <b>主人</b>', primaryOwner, profiles),
+		...renderPermissionSection('👑 <b>主人</b>', primaryOwner, profiles, groupLabels),
 		'',
-		...renderPermissionSection('👤 <b>副主人</b>', secondaryOwners, profiles),
+		...renderPermissionSection('👤 <b>副主人</b>', secondaryOwners, profiles, groupLabels),
 		'',
-		...renderPermissionSection('🛡️ <b>超级管理员</b>', superAdmins, profiles),
+		...renderPermissionSection('🛡️ <b>超级管理员</b>', superAdmins, profiles, groupLabels),
 		'',
-		'说明:用户名/昵称来自 Telegram 当前可读取的群成员资料;未获取时仍以 TGID 为准。'
+		'说明:用户名/昵称来自 Telegram 当前可读取的群成员资料;未获取时仍以 TGID 为准。',
+		'来源群名可点击跳转（公开群走 t.me 永久链接；私密群需 bot 为管理员才有邀请链接，否则只显示群名）。'
 	];
 	return lines.join('\n');
 }
@@ -5098,26 +5260,253 @@ function isTelegramServiceMessage(message) {
 	return TELEGRAM_SERVICE_MESSAGE_KEYS.some((key) => message[key] !== undefined && message[key] !== null);
 }
 
+// 同款广告连带查杀：正文归一化 + 哈希。
+// 归一化沿用 normalizeAdFingerprintValue（去零宽字符、压空白、转小写、截 200），
+// 与指纹匹配【同一口径】—— 两边各写一套迟早分叉。
+//
+// 【2026-09-11 长度门槛彻底取消，判据换人】这道门槛调过三轮，每轮都被新样本打穿：
+//   12 字 → 放过「来跑分 一天1万」「来洗钱 挣8千」（都 8 字）
+//    4 字 → 放过「5迁」（2 字）
+// 继续调数字只是换个地方打补丁 —— 广告文案可以短到任意长度，没有任何数字挡得住。
+//
+// 判据错配才是根因：12 字是从「整段正文指纹」照搬的，而那道门槛防的是
+// 【自动学习】误伤（权重 1 单条即定罪、没人审过），连带的前提却是
+// 【第一主人亲自引用回复 /spam】—— 已经过最强的人工判定，不需要代码再怀疑一次。
+//
+// 现在判据只有一条：第一主人 /spam 过就算。长度、内容特征一概不看。
+// 误封风险由两层兜住，都比长度门槛可靠：
+//   ① 仅 OWNER_IDS[0] 可触发（isPrimaryOwner 闸，副主人 / 超管 / 群管理员一律不连带）；
+//   ② 处置结果私聊第一主人，附一条可直接复制的 /unban 全部TGID 一键回滚。
+const MODERATION_TEXT_MIN_LENGTH = 1;
+
+function buildModerationTextKey(message) {
+	const raw = String(message?.text ?? message?.caption ?? '').trim();
+	if (!raw) return null;
+	// 斜杠命令永不参与连带：命令文本是操作指令而非广告内容，
+	// 与 extractAdFingerprintCandidates 里那道过滤同源（管理员 /ban 自噬事故）。
+	if (isTelegramSlashCommand(raw)) return null;
+	const norm = normalizeAdFingerprintValue(raw);
+	if (norm.length < MODERATION_TEXT_MIN_LENGTH) return null;
+	// FNV-1a 32 位：Workers 环境同步可用、无需 crypto.subtle 的 await，
+	// 碰撞概率对本用途足够低，且拿到候选后还会用 text_norm 做二次比对兜底。
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < norm.length; i += 1) {
+		hash ^= norm.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	return { hash: hash.toString(16).padStart(8, '0'), norm };
+}
+
 async function cacheModerationMessage(env, message) {
 	// 双保险：即使调用点漏判，这里也拒绝服务消息进入清扫缓存。
 	if (isTelegramServiceMessage(message)) return;
 	if (!env.DB || !message?.message_id || !message?.from?.id) return;
 	try {
 		await ensureD1Table(env);
-		const insertResult = await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)')
-			.bind(
-				message.message_id,
-				String(message.chat.id),
-				String(message.from.id),
-				new Date().toISOString()
-			)
-			.run();
+		const textKey = buildModerationTextKey(message);
+		const nowIso = new Date().toISOString();
+		// 带新列写入；若库里还没有 text_hash / text_norm（迁移未跑或跑失败），
+		// 降级成旧的四列 INSERT。
+		// 【为什么要这道容错】moderation_messages 承载的是 /spam 历史消息清扫这项【既有基础能力】，
+		// 不该因为「同款连带」这个新功能的 schema 变更而整体停写 ——
+		// 线上就出现过：版本号没提 → 迁移短路不执行 → 两列不存在 → 每条群消息 INSERT 全失败。
+		// 版本号提升治的是「迁移没跑」，这道降级治的是「迁移跑了但失败」（D1 抖动等），两者互补。
+		let insertResult;
+		try {
+			insertResult = await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at, text_hash, text_norm) VALUES (?, ?, ?, ?, ?, ?)')
+				.bind(
+					message.message_id,
+					String(message.chat.id),
+					String(message.from.id),
+					nowIso,
+					textKey?.hash ?? null,
+					textKey?.norm ?? null
+				)
+				.run();
+		} catch (error) {
+			const message0 = formatD1SchemaError(error).toLowerCase();
+			if (!message0.includes('no such column') && !message0.includes('has no column')) throw error;
+			console.warn('[清扫缓存] text_hash/text_norm 列缺失，降级为旧结构写入（同款连带暂不可用，请检查 D1 迁移）');
+			insertResult = await env.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)')
+				.bind(
+					message.message_id,
+					String(message.chat.id),
+					String(message.from.id),
+					nowIso
+				)
+				.run();
+		}
 		const limit = Math.max(MSG_CACHE_SIZE, 200);
 		if (shouldPruneD1Cache(insertResult)) {
 			await pruneAutoincrementCacheTable(env, 'moderation_messages', limit);
 		}
 	} catch (error) {
 		console.error('[清扫缓存] 写 D1 失败:', error);
+	}
+}
+
+// ===== 同款广告连带查杀（2026-09-11 原项目方案一）=====
+// 场景：多个广告号刷同一段文案，主人只 /spam 掉其中一个，其余同款号应一并处置。
+// 此前只能逐个引用回复 /spam —— 现有的「整段正文指纹」只对 /spam 之后【新发】的消息
+// 生效，对已经躺在群里的同款一条都追不到，因为 moderation_messages 原本不存正文。
+//
+// 【子请求预算】这是本功能的硬约束。estimateBulkTaskSubrequests 口径下
+// telegramMutationAttempts = 2 × 号数 × 群数，15 个群时【每个号吃 30 个子请求】：
+//   3 个号  ≈ 106  → 贴着同步安全预算 100，可当场执行
+//   10 个号 ≈ 366  → 远超同步预算，必须走 D1 批量任务 + Queues 分片
+//   30 个号 ≈ 1047 → 撞 Cloudflare 单请求 1000 子请求硬限，会直接失败
+// 所以硬上限取 20（≈707，留 30% 余量），超出部分只列 TGID 交给主人手动处理。
+const LINKED_SPAM_LOOKBACK_MS = 24 * 60 * 60 * 1000; // 追溯窗口：24 小时
+const LINKED_SPAM_MAX_TARGETS = 20;                  // 单次连带硬上限（子请求预算所限）
+
+// 同步 or 转批量：【按子请求预算动态判断，不写死号数】。
+// 离线实测（15 群）：3 个号 = 119 已超同步安全预算 100，10 个号 = 336，20 个号 = 646。
+// 早先写死 LINKED_SPAM_SYNC_MAX = 3 是错的 —— 那条同步分支在 15 群下永远不安全，
+// 而群数还会随 /addgroup 增长，任何写死的号数都会在某个群数下失效。
+// 复用 shouldUseBulkQueue 的同一套口径，与 /ban /spam 手动批量的判定标准完全一致。
+function shouldRunLinkedSpamSync(targetCount) {
+	const budget = shouldUseBulkQueue(targetCount, GROUP_IDS.length, { probeMembership: false });
+	return !budget.useQueue;
+}
+
+// 按正文哈希跨【全部配置群】反查 24 小时内发过同款文案的其他账号。
+// 返回去重后的 { userId, chatIds, messageIds } 列表，不含被 /spam 的当事人。
+async function findLinkedSpamTargets(env, textKey, excludeUserId) {
+	if (!env?.DB || !textKey?.hash) return { targets: [], truncated: 0 };
+	const sinceIso = new Date(Date.now() - LINKED_SPAM_LOOKBACK_MS).toISOString();
+	try {
+		await ensureD1Table(env);
+		// 一次查询覆盖所有群：text_hash + created_at 复合索引走等值 + 范围，不是全表扫。
+		// 不按 chat_id 过滤 —— 同一批广告号通常多群同步刷，跨群才全面（主人口径）。
+		const { results } = await env.DB.prepare(
+			'SELECT mid, chat_id, from_id, text_norm FROM moderation_messages '
+			+ 'WHERE text_hash = ? AND created_at >= ? ORDER BY id DESC LIMIT 400'
+		).bind(String(textKey.hash), sinceIso).all();
+
+		const byUser = new Map();
+		for (const row of results || []) {
+			const uid = String(row.from_id || '');
+			if (!uid || uid === String(excludeUserId)) continue;
+			// 二次比对兜住哈希碰撞：FNV-1a 是 32 位，碰撞概率虽低但连带是批量不可逆操作，
+			// 代价不对称 —— 有 text_norm 就没有理由只信哈希。
+			if (String(row.text_norm || '') !== textKey.norm) continue;
+			if (!byUser.has(uid)) byUser.set(uid, { userId: uid, chatIds: new Set(), messageIds: [] });
+			const entry = byUser.get(uid);
+			entry.chatIds.add(String(row.chat_id || ''));
+			const mid = Number(row.mid);
+			if (Number.isInteger(mid) && mid > 0) entry.messageIds.push({ chatId: String(row.chat_id || ''), mid });
+		}
+		const all = [...byUser.values()];
+		return {
+			targets: all.slice(0, LINKED_SPAM_MAX_TARGETS),
+			truncated: Math.max(0, all.length - LINKED_SPAM_MAX_TARGETS),
+			overflowIds: all.slice(LINKED_SPAM_MAX_TARGETS).map((t) => t.userId)
+		};
+	} catch (error) {
+		console.error('[同款连带] 反查失败:', error);
+		return { targets: [], truncated: 0 };
+	}
+}
+
+// 执行连带处置：删同款消息 + 加黑 + 全群封禁。仅用于同步路径（子请求预算内）。
+async function enforceLinkedSpamTargets(env, targets, options = {}) {
+	const done = [];
+	for (const target of targets) {
+		let deleted = 0;
+		for (const item of target.messageIds) {
+			const r = await deleteMessage(item.chatId, item.mid);
+			if (r?.ok) deleted += 1;
+		}
+		const added = await addToBlacklist(target.userId, env, {
+			reason: 'spam',
+			by: String(options.operatorId ?? 'system'),
+			note: options.note || '同款广告连带查杀'
+		});
+		const banResults = await banUserFromAllGroups(target.userId, { probeMembership: false });
+		const okCount = banResults.filter((r) => r?.ok).length;
+		done.push({
+			userId: target.userId,
+			deleted,
+			blacklistCode: String(added?.code || (added?.success ? 'ADDED' : 'ERROR')),
+			banSummary: okCount + '/' + banResults.length
+		});
+	}
+	return done;
+}
+
+// 把每个目标在每个群里那几条同款消息的 mid 整理成批量 payload 用的
+// { userId: { chatId: [mid, ...] } } 结构。
+// 【为什么必须删这几条而不是靠 revoke_messages】banChatMember 的 revoke_messages 有两个硬限制：
+//   ① 只撤 48 小时内的消息；② 目标必须【仍在群里】—— 已退群 / 已被踢 / 账号已冻结的一条都撤不掉。
+// 线上实测：连带命中的号显示「已注销用户 The account was frozen」，revoke 完全无效，
+// 消息原样留在群里。deleteMessage 走的是另一条路，只要 bot 在该群有删除权限就能删。
+function buildLinkedSpamDeleteTargets(targets) {
+	const map = {};
+	for (const target of targets || []) {
+		const uid = String(target.userId || '');
+		if (!uid) continue;
+		for (const item of target.messageIds || []) {
+			const chatId = String(item.chatId || '');
+			const mid = Number(item.mid);
+			if (!chatId || !Number.isInteger(mid) || mid <= 0) continue;
+			if (!map[uid]) map[uid] = {};
+			if (!map[uid][chatId]) map[uid][chatId] = [];
+			map[uid][chatId].push(mid);
+		}
+	}
+	return Object.keys(map).length ? map : null;
+}
+
+// 连带结果私聊第一主人。核心是【一键回滚】：把连带到的全部 TGID 拼成一条可直接复制的
+// /unban 命令 —— 连带把单次误判乘以 N 倍，回滚入口必须现成，不能让主人回头一个个抄 ID。
+async function notifyLinkedSpamResult(env, info) {
+	const ownerId = getOwnerNotifyTargets()[0] || '';
+	if (!ownerId) return;
+	const done = info.done || [];
+	const pendingIds = info.pendingIds || [];
+	const allIds = done.length ? done.map((d) => d.userId) : pendingIds;
+	const lines = [
+		'<b>🔗 同款广告连带查杀</b>',
+		'',
+		'<b>操作人：</b>' + formatUserReference(info.operatorId, info.message?.from),
+		'<b>触发群：</b>' + escapeHtml(info.message?.chat?.title || '未知')
+			+ '（<code>' + escapeHtml(String(info.message?.chat?.id ?? '')) + '</code>）',
+		'<b>源账号：</b><code>' + escapeHtml(String(info.sourceUserId)) + '</code>（本次 /spam 的目标）',
+		// 展示原文而非哈希：主人要能一眼判断这条文案到底是不是广告。
+		// 这正是 text_norm 存原文的核心价值 —— 纯哈希方案这里只能显示一串十六进制。
+		'<b>同款文案：</b>' + escapeHtml(String(info.textNorm || '').slice(0, 120)),
+		'<b>追溯范围：</b>24 小时内 · 全部配置群',
+		''
+	];
+	if (done.length) {
+		lines.push('<b>已处置 ' + done.length + ' 个账号</b>');
+		for (const d of done) {
+			lines.push('· <code>' + escapeHtml(d.userId) + '</code>　黑名单:'
+				+ (d.blacklistCode === 'ADDED' ? '已加入' : d.blacklistCode === 'EXISTS' ? '此前已在' : d.blacklistCode)
+				+ '　封禁:' + d.banSummary + '　删消息:' + d.deleted + ' 条');
+		}
+	}
+	if (info.jobId) {
+		lines.push('<b>已转批量任务</b>（超出同步子请求预算，由 Queues 分片续接）');
+		lines.push('任务号:<code>' + escapeHtml(String(info.jobId)) + '</code>　目标 ' + pendingIds.length + ' 个');
+		lines.push('进度查询:<code>/job ' + escapeHtml(String(info.jobId)) + '</code>');
+	}
+	if (info.truncated > 0) {
+		lines.push('');
+		lines.push('⚠️ 另有 <b>' + info.truncated + '</b> 个同款账号超出单次上限 '
+			+ LINKED_SPAM_MAX_TARGETS + '（子请求预算所限），未处理：');
+		lines.push('<code>' + escapeHtml((info.overflowIds || []).join(',')) + '</code>');
+		lines.push('可复制上面这串手动执行 <code>/spam</code> 或 <code>/ban</code>。');
+	}
+	if (allIds.length) {
+		lines.push('');
+		lines.push('<b>判错一键回滚</b>（解黑 + 全群解封）：');
+		lines.push('<code>/unban ' + escapeHtml(allIds.join(',')) + '</code>');
+	}
+	try {
+		await sendTelegramMessageChunks(ownerId, lines.join('\n'));
+	} catch (error) {
+		console.error('[同款连带] 通知第一主人失败:', error);
 	}
 }
 
@@ -6525,6 +6914,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 必须先于消息缓存执行，避免已黑用户刷消息继续产生 D1 写入。
 	// 排除 bot 自身 / 私聊 / 群管理员（避免误伤误加黑的管理员）
 	// 命令命中后 return，不进入后续命令分发
+	//
+	// 【渐进式封禁的探测点就在这里】。已黑用户在本群之外发言时，走的正是这条路径，
+	// 而它会 return，根本到不了下面的 detectAdOnMessage —— 所以「该号在其他群再次露头」
+	// 这个信号只能在这里捕获。这比等它再发一条够阈值的广告更早、更可靠：
+	// 黑名单用户【只要开口】就说明它在别的群仍然活跃，这本身就是升级凭据。
 	if (
 		isConfiguredGroup(chatId) &&
 		message.from &&
@@ -6537,8 +6931,16 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			if (!isAdmin) {
 				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+踢人`);
 				await deleteMessage(chatId, message.message_id);
+				// 先按既有语义封当前群，保证「不管升级逻辑是否可用，本群一定封掉」。
 				await banUserFromGroup(chatId, userId);
 				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, null);
+				// 再决定要不要升级为全群封禁。单独 try/catch：升级失败绝不能影响
+				// 上面已经完成的删消息 + 封当前群 + 通知，那三件事才是本条消息的本职。
+				try {
+					await maybeEscalateBlacklistedUser(message, env, userId, chatId);
+				} catch (error) {
+					console.error('[渐进封禁] 黑名单用户升级检查异常:', error);
+				}
 				return;
 			}
 		}
@@ -6865,6 +7267,64 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			if (spamLearned > 0) lines.push('🧬 已学习广告指纹:' + spamLearned + ' 条(来源 /spam 人工判定)');
 			if (spamSampleAdded > 0) lines.push('🧠 已加 AI 语义样本:' + spamSampleAdded + ' 条(来源 /spam 人工判定)');
 			if (spamEnriched > 0) lines.push('🧠 共性提炼:从新样本自动提炼出 ' + spamEnriched + ' 条指纹(共现 ≥2 次)');
+
+			// ===== 同款广告连带查杀（2026-09-11 原项目方案一）=====
+			// 反查 24 小时内、全部配置群里发过同款文案的其他账号，一并删消息 + 加黑 + 全群封禁。
+			// 不做二次确认（主人口径），但【务必】把结果私聊第一主人并附一键回滚命令 ——
+			// 连带是把单次误判乘以 N 倍的操作，回滚入口必须在通知里现成可复制。
+			//
+			// 【仅第一主人可触发】连带的杀伤力是单次封禁的 N 倍，而误封的根源不是
+			// 「代码判得不准」而是「谁有资格触发这个不可逆的批量操作」——
+			// 上游那次误封（管理员回复「广告」封了 14 个群）正是触发权开给群管理员的后果。
+			// 副主人 / 超级管理员 / 群管理员的 /spam 照常执行加黑 + 封禁 + 学指纹，只是不连带。
+			// 非第一主人【完全静默】：不提示、不在群里留任何痕迹，不暴露这个能力的存在。
+			try {
+				const linkedKey = isPrimaryOwner(operatorId) ? buildModerationTextKey(repliedMsg) : null;
+				if (linkedKey) {
+					const found = await findLinkedSpamTargets(env, linkedKey, repliedUserId);
+					if (found.targets.length) {
+						const noteText = '同款广告连带(/spam ' + linkedUserId + ')';
+						if (shouldRunLinkedSpamSync(found.targets.length)) {
+							// 同步路径：仅当子请求估算在安全预算内才当场执行（群少时才可能走到）。
+							const done = await enforceLinkedSpamTargets(env, found.targets, {
+								operatorId, note: noteText
+							});
+							// 【刻意不写进 lines】lines 走 detailText，而 detailText 会同时投给副主人
+							// （notifySecondaryOwners: true）。连带只属于第一主人，结果也只发给他 ——
+							// 由下面的 notifyLinkedSpamResult 单独私聊。
+							// 群内闪屏（flashText）本来就只有「已加黑 + TGID」、不含 lines，天然不暴露。
+							await notifyLinkedSpamResult(env, {
+								operatorId, message, sourceUserId: linkedUserId,
+								textNorm: linkedKey.norm, done,
+								overflowIds: found.overflowIds || [], truncated: found.truncated || 0
+							});
+						} else {
+							// 超过同步预算：转 D1 批量任务 + Queues 分片续接，复用既有机制。
+							// 带上 deleteTargets —— 反查已把每个目标在每个群那几条同款消息的 mid 全查出来了，
+							// 不带进去就得在执行时重查一遍 D1；更重要的是精确性：只删那几条同款，
+							// 不是这个人的全部历史消息（revoke_messages 对已冻结账号完全无效）。
+							const linkedIds = found.targets.map((t) => t.userId);
+							const job = await createBulkJob(env, 'spam', linkedIds, [], noteText, message, {
+								deleteTargets: buildLinkedSpamDeleteTargets(found.targets)
+							});
+							const queueAvailable = Boolean(getBulkQueue(env));
+							if (!queueAvailable) { job.autoContinue = false; await saveBulkJob(env, job); }
+							await notifyLinkedSpamResult(env, {
+								operatorId, message, sourceUserId: linkedUserId,
+								textNorm: linkedKey.norm, jobId: job.id, pendingIds: linkedIds,
+								overflowIds: found.overflowIds || [], truncated: found.truncated || 0
+							});
+							const scheduled = queueAvailable
+								? scheduleBulkJobAutoContinue(job, ctx, requestUrl, env)
+								: false;
+							if (scheduled && typeof scheduled.then === 'function') await scheduled;
+						}
+					}
+				}
+			} catch (error) {
+				// 连带失败绝不影响 /spam 本职（当事人的加黑 + 封禁 + 清扫早已完成）。
+				console.error('[同款连带] 执行失败:', error);
+			}
 
 			await replyToAdmin(message, ctx, {
 				flashText: `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} ${linkedUserId}`,
@@ -7707,6 +8167,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 
 				const d1RecordRemoved = eligibility.d1Removed.includes(targetId);
 				const unbanResults = await unbanUserFromAllGroups(targetId);
+				// 管理层主动解封 = 该号已人工放行，渐进式封禁台账一并清掉。
+				// 不清的话，这个号下次被任何一层判定命中都会【直接升级全群封禁】，
+				// 而它其实已经被管理员明确解封过，等于解封立刻被后续策略架空。
+				if (d1RecordRemoved) await deleteAdBanScope(env, targetId);
 				lines.push(
 					d1RecordRemoved
 						? '✅ <b>目标原在 D1 黑名单，已由管理层移除记录并允许解封</b>'
@@ -7736,6 +8200,10 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				BULK_TASK_CONCURRENCY,
 				async (id) => ({ userId: id, unbanResults: await unbanUserFromAllGroups(id) })
 			);
+			// 批量解封同样要清台账，逐人清（不能用 results.d1Removed 之外的名单）。
+			for (const { userId: unbanId } of perUserUnbanResults) {
+				if (results.d1Removed.includes(unbanId)) await deleteAdBanScope(env, unbanId);
+			}
 			for (const { unbanResults } of perUserUnbanResults) {
 				const okCount = unbanResults.filter((r) => r.ok).length;
 				if (okCount === unbanResults.length) unbanSummary.okAll += 1;
@@ -9157,7 +9625,21 @@ async function removeAdExemptKeyword(env, rawKeyword) {
 // 强制 verdict='ban'（删消息 + 全群封禁 + 拉黑 + 学指纹），误伤不可逆，故一律移除。
 // 英文触发词改走词边界正则，避免 bad / road / download / ready 被 'ad' 命中。
 // 否定词永远先于触发词匹配：「不要封」含「要封」、「取消封禁」含「封禁」，靠顺序保证不误封。
-const AD_REPLY_LEARN_TRIGGERS = ['广告', '垃圾', '封了', '封他', '封她', '封掉', '该封', '要封', '封禁'];
+//
+// 【2026-09-11 收紧为完整判定短语】线上事故：管理员在群里回复一句含「广告」二字的吐槽，
+// 触发全群封禁 14 个群，而被封者本人得分只有 -1（远低于阈值 7）——
+// 确认分支强制 verdict='ban' 不受阈值裁决，得分完全不参与决策。
+// 根因是这张词表配 includes 子串匹配：'广告' 会被「这广告真烦」「广告太多了」命中，
+// '垃圾' 会被「垃圾话」「这游戏真垃圾」命中，而这些都是中文群里最自然的日常用语。
+// 上一轮只移除了英文裸 spam（AD_REPLY_LEARN_TRIGGER_PATTERNS 清空），中文词原样留着，
+// 而中文单词误触发概率远高于英文 —— 这次事故正是它。
+// 现在一律要求【带明确判定意图的完整短语】：光提到「广告」不够，得说「这是广告」。
+// 代价是管理员习惯打单字「广告」的话会失效，需要改口 —— 但误封 14 个群不可逆，成本不对称。
+const AD_REPLY_LEARN_TRIGGERS = [
+	'这是广告', '这条广告', '是广告', '广告号', '广告狗',
+	'这是垃圾', '是垃圾广告', '垃圾广告',
+	'封了他', '封了她', '把他封了', '把她封了', '该封他', '该封她', '封掉他', '封掉她'
+];
 // 【2026-09-10】移除裸 spam 触发：管理员忘带 / 随手打 spam 会触发全群封禁，误操作代价太大。
 // /spam 斜杠命令走命令分发分支（isTelegramSlashCommand 守卫），不受此处影响。
 const AD_REPLY_LEARN_TRIGGER_PATTERNS = [];
@@ -9212,6 +9694,20 @@ function parseStaticUserProfiles(raw) {
 		console.error('[静态用户资料] STATIC_USER_PROFILES 解析失败，格式应为 JSON 字符串');
 		return {};
 	}
+}
+
+// 解析只读资料群列表（PROFILE_LOOKUP_GROUPS）：仅供 /admins 查询资料，不参与任何治理。
+// 只收负数字符串（群 / 频道 ID 都是负数）；正数是用户 ID，传进 getChat 只会白报错。
+// 已在 GROUP_ID 里的群自动剔除：那些群本来就会被遍历，重复只是多花一次请求。
+function parseProfileLookupGroups(raw, configuredGroupIds = []) {
+	if (raw == null || String(raw).trim() === '') return [];
+	const configured = new Set((configuredGroupIds || []).map((id) => String(id)));
+	const list = String(raw)
+		.split(/[,，]/)
+		.map((id) => id.trim())
+		.filter((id) => /^-\d+$/.test(id))
+		.filter((id) => !configured.has(id));
+	return [...new Set(list)];
 }
 
 // 解析受保护 username 列表：统一小写、去 @ 前缀、过滤非法形态。
@@ -9446,7 +9942,8 @@ async function d1AdDetectionTablesExist(env) {
 		'ad_pending_snapshots',
 		'ad_confirm_tokens',
 		'ad_group_members',
-		'ad_scan_state'
+		'ad_scan_state',
+		'ad_ban_scope'
 	]);
 }
 
@@ -9506,6 +10003,25 @@ async function ensureAdDetectionTables(env) {
 			// 【没有游标列】—— 扫描顺序由 bio_checked_at ASC 决定，查过就把时间戳推到现在，
 			// 于是它自动排到队尾。这是自平衡的，不需要显式游标，也不会因为增删行而错位。
 			await runD1SchemaStatement(env, 'ad_scan_state', 'CREATE TABLE IF NOT EXISTS ad_scan_state (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER NOT NULL)');
+
+			// 渐进式封禁台账（AD_BAN_SCOPE_MODE = progressive 时生效）。
+			// 一行一人，记录「首次被判定为广告时被封在哪个群」，以及是否已升级为全群封禁。
+			//
+			// 为什么单独一张表、不塞进 ad_group_members 或 ad_user_screening：
+			//   · ad_group_members 是发言者名册 + bio 冷却台账，随每条消息 upsert、按 bio 时间剪枝，
+			//     语义是「这个人在群里活跃过」；
+			//   · ad_user_screening 是观察窗口（未定罪的可疑分子，24 小时 TTL 后就该消失）；
+			//   而本表语义是「已被定过罪的账号」，生命周期完全相反 —— 它【只能由 /ignore 误判回滚
+			//   或 /unban 主动移除】，绝不能因为过期剪枝或窗口关闭而消失，否则同一个人会被
+			//   反复当成「首次」处置，永远升不到全群封禁。生命周期相反的东西混表是最容易被
+			//   后续改动误伤的形态，故独立成表。
+			//
+			// scope_state 只有两个取值：
+			//   'single' —— 仅封过触发群，正在监控
+			//   'global' —— 已升级全群封禁，不再重复升级（避免每次判定都产生一次全群 API 风暴）
+			// 刻意用文本而非布尔：以后若要加 'manual'（人工加黑也并入监控）不用改 schema。
+			await runD1SchemaStatement(env, 'ad_ban_scope', 'CREATE TABLE IF NOT EXISTS ad_ban_scope (user_id TEXT PRIMARY KEY, scope_state TEXT NOT NULL DEFAULT \'single\', first_chat_id TEXT, first_chat_title TEXT, first_score INTEGER NOT NULL DEFAULT 0, first_reasons TEXT, first_reason TEXT, ban_summary TEXT, trigger_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, escalated_at INTEGER)');
+			await runD1SchemaStatement(env, 'idx_ad_ban_scope_state', 'CREATE INDEX IF NOT EXISTS idx_ad_ban_scope_state ON ad_ban_scope (scope_state)', { optional: true });
 
 			if (!(await d1AdDetectionTablesExist(env))) throw new Error('D1 广告检测表迁移不完整');
 			await seedAdDetectionData(env);
@@ -9755,14 +10271,96 @@ async function removeAdDomainWhitelist(env, rawDomain) {
 // === 第一层：结构化评分 ===
 // 权重全部按真实样本回归而来，命中项同类只计一次，reasons 供快照与私聊通知展示。
 
+// ===== 逐字分隔混淆（2026-09-11 补回实现）=====
+// 词表匹配用 includes 子串比对，广告号只要在每个字之间插一个分隔符就能全身而退：
+//   「pq低.價.出.正.品.水.果.機 pp」——「低價出正品」被点号切碎，任何词表都匹配不到。
+// 线上纯广告群实测这是主流手法，配合首尾随机串还能躲过「同一文案第二次出现即秒杀」。
+//
+// 【关键取舍】不能无条件删掉所有分隔符 —— 那会把相邻词拼起来造成误杀
+//   （「今日 入门」→「今日入门」凭空命中「日入」）。因此只认「逐字分隔」这一种
+//   明确的混淆签名：连续 ≥3 组「单个字符 + 单个分隔符」。正常语句不会长这样。
+// 分隔符【按性质分两级】—— 这是放宽到「1~2 字一组」后必须做的区分。
+// 顿号与逗号是中文列举的正规标点：「苹果、香蕉、橘子、西瓜」「上海、北京、广州、深圳」
+// 天然就是「2 字 + 分隔符」重复三次以上，离线实测这类正常句子会被整片误伤。
+// 所以两级拆开：
+//   STRICT —— 点号、间隔号、下划线、星号、破折号、波浪号、空白。中文写作【不用】它们
+//             逐字断句，出现即是混淆信号，允许 1~2 字分组。
+//   LOOSE  —— 顿号、逗号。正规列举标点，只在【严格逐字】（每组恰好 1 字）时才算混淆，
+//             「联、系、我、们」这种一个字一个顿号确实反常，但「苹果、香蕉」完全正常。
+const AD_CHAR_SPLIT_SEP_STRICT = '.·・･｡‧∙⋅•_\\-—–~～*\\s';
+const AD_CHAR_SPLIT_SEP_LOOSE = '。､、,，';
+// 两条签名，任一命中即算混淆。都要求【≥3 组连续】—— 偶发一两处不算。
+// 用 CJK 限定字符类，避免英文缩写（「U.S.A」「a.m.」）与版本号（「1.2.3.4」）被当成混淆。
+//
+// 签名一（宽分组 + 严格分隔符）：1~2 个 CJK + STRICT 分隔符。
+//   打「低.價.出.正.品」，也打「sh最新.17水.果僅.需五.千.多 kn」这种多字分组变体 ——
+//   后者在只认单字时整条漏检，而广告号并不严格逐字切，够躲词表就行。
+// 签名二（严格逐字 + 全部分隔符）：恰好 1 个 CJK + STRICT 或 LOOSE 分隔符。
+//   打「联、系、我、们」这类拿顿号逐字切的，同时不碰「苹果、香蕉、橘子」。
+const AD_CHAR_SPLIT_RE_STRICT = new RegExp(
+	'(?:[\\u4e00-\\u9fff]{1,2}[' + AD_CHAR_SPLIT_SEP_STRICT + ']){3,}[\\u4e00-\\u9fff]',
+	'u'
+);
+const AD_CHAR_SPLIT_RE_PERCHAR = new RegExp(
+	'(?:[\\u4e00-\\u9fff][' + AD_CHAR_SPLIT_SEP_STRICT + AD_CHAR_SPLIT_SEP_LOOSE + ']){3,}[\\u4e00-\\u9fff]',
+	'u'
+);
+
+// 是否含逐字分隔混淆签名。用于结构化评分加分（A1）。
+function hasAdCharSplitObfuscation(text) {
+	const source = String(text ?? '');
+	if (!source) return false;
+	return AD_CHAR_SPLIT_RE_STRICT.test(source) || AD_CHAR_SPLIT_RE_PERCHAR.test(source);
+}
+
+// 去混淆：只在命中签名的片段内部剥掉分隔符，签名之外的文本【一个字符都不动】。
+// 这样「今日 入门」（不成签名）保持原样，而「低.價.出.正.品」还原成「低價出正品」。
+// 两条签名各自替换：严格逐字那条只剥它自己匹配到的片段，不会顺手动列举标点。
+function deobfuscateAdCharSplit(text) {
+	const source = String(text ?? '');
+	if (!source) return '';
+	let result = source;
+	const strictSepRe = new RegExp('[' + AD_CHAR_SPLIT_SEP_STRICT + ']+', 'gu');
+	const allSepRe = new RegExp('[' + AD_CHAR_SPLIT_SEP_STRICT + AD_CHAR_SPLIT_SEP_LOOSE + ']+', 'gu');
+	if (AD_CHAR_SPLIT_RE_STRICT.test(result)) {
+		result = result.replace(new RegExp(AD_CHAR_SPLIT_RE_STRICT.source, 'gu'),
+			(segment) => segment.replace(strictSepRe, ''));
+	}
+	if (AD_CHAR_SPLIT_RE_PERCHAR.test(result)) {
+		result = result.replace(new RegExp(AD_CHAR_SPLIT_RE_PERCHAR.source, 'gu'),
+			(segment) => segment.replace(allSepRe, ''));
+	}
+	return result === source ? '' : result;
+}
+
+// 参与词表匹配的文本变体：原文永远在第一项，行为完全向后兼容；
+// 命中混淆签名时追加一份去混淆文本，让【现有全部词表】对这类变体立即生效，
+// 无需为每种变体往词表里加字面量（词表每加一倍就多一倍误封面）。
+function buildAdMatchTexts(text) {
+	const source = String(text ?? '');
+	if (!source) return [];
+	const deobfuscated = deobfuscateAdCharSplit(source);
+	return deobfuscated && deobfuscated !== source ? [source, deobfuscated] : [source];
+}
+
 function countAdKeywordHits(text, keywords) {
 	const source = String(text ?? '');
 	if (!source) return [];
-	const lower = source.toLowerCase();
 	const hits = [];
-	for (const word of keywords) {
-		const needle = String(word).toLowerCase();
-		if (needle && lower.includes(needle)) hits.push(word);
+	// 命中词只计一次：先扫原文，再扫去混淆文本 —— 同一词在两份文本里都可能出现，
+	// 用 Set 去重后按首次出现顺序返回，避免「低.價.出.正.品」把「正品」记两次。
+	const seen = new Set();
+	for (const variant of buildAdMatchTexts(source)) {
+		const lower = variant.toLowerCase();
+		for (const word of keywords) {
+			const needle = String(word).toLowerCase();
+			if (!needle || seen.has(word)) continue;
+			if (lower.includes(needle)) {
+				seen.add(word);
+				hits.push(word);
+			}
+			if (hits.length >= 6) break;
+		}
 		if (hits.length >= 6) break;
 	}
 	return hits;
@@ -10148,10 +10746,17 @@ const AD_QUOTED_KILL_MAX_OWN_TEXT = 4;
 const AD_QUOTED_KILL_MAX_OWN_TEXT_ASCII = 8;
 
 // 举报 / 吐槽语义。命中即放行本通道。
-// 前半段复用回复学习触发词（广告 / 垃圾 / 封了 / 封他 / 该封 …），
-// 后半段补的是「不说封、只表态」的常见短回复 —— 举报的人未必用得上「封」字。
+// 【2026-09-11 与 AD_REPLY_LEARN_TRIGGERS 解耦】这里原本写 ...AD_REPLY_LEARN_TRIGGERS 展开复用，
+// 但两张表的语义【方向相反】，共用一张必然有一边出错：
+//   AD_REPLY_LEARN_TRIGGERS 是【封禁指令】，误触发的代价是封错人 → 必须【严】，只认完整短语；
+//   本表是【举报者保护名单】，用于识别「引用广告 + 回一句『广告』警示他人」的群友并放行，
+//   漏收词的代价是把举报者当广告号杀掉 → 必须【宽】，单词、短语都要收。
+// 收紧触发词那次连带把本表也收窄了，直接打穿举报者保护（测试里 4 条门槛二断言当场变红）。
+// 现在本表独立维护、刻意保留全部单词形态，与触发词表各自演进、互不影响。
 const AD_QUOTED_KILL_NEGATORS = [
-	...AD_REPLY_LEARN_TRIGGERS,
+	// 举报语义单词与短语：与封禁触发词刻意重叠，但这里【只用于放行】，不会导致任何封禁。
+	'广告', '垃圾', '封了', '封他', '封她', '封掉', '该封', '要封', '封禁',
+	'这是广告', '这条广告', '是广告', '广告号', '广告狗', '垃圾广告',
 	'骗子', '骗人', '诈骗', '假的', '割韭菜', '别信', '不要信', '小心', '警惕', '注意',
 	'举报', '拉黑', '屏蔽', '踢了', '踢他', '什么鬼', '什么玩意', '傻逼', '滚'
 ];
@@ -10230,6 +10835,9 @@ function scoreAdProfile(profile, options = {}) {
 
 	if (displayName && AD_SYMMETRIC_EMOJI_RE.test(displayName)) add(3, '名称首尾对称 emoji');
 	if (displayName && AD_NUMERIC_PREFIX_RE.test(displayName)) add(1, '名称数字+emoji 前缀');
+	// 昵称同样用逐字分隔躲词表（线上见「✨水果专卖店搞 nyh米点我付叶 ⭐」这类）。
+	// 给 3 分而非正文的 4 分：昵称短、样本少，留一分余量给结构判据组合定罪。
+	if (displayName && hasAdCharSplitObfuscation(displayName)) add(3, '名称逐字分隔混淆（规避词表匹配）');
 
 	// ===== 关键词计分：两类词同现才给分，单类命中一律 0 分 =====
 	// 规则与理由见 AD_KEYWORD_COMBO_SCORE。命中仍然全部写进 reasons ——
@@ -10350,6 +10958,10 @@ function scoreAdMessageText(text, options = {}) {
 
 	if (hasAdSuspiciousLink(source, whitelistSet, { businessHit: businessHits.length > 0 })) add(2, '正文含非白名单引流链接');
 	if (AD_SYMMETRIC_EMOJI_RE.test(source)) add(3, '正文首尾对称 emoji');
+	// 逐字分隔混淆（A1）：这是【规避行为本身】的特征，不依赖任何广告词汇 ——
+	// 广告内容随便换，只要还想躲词表匹配就必须用这个手法。正常人不会在汉字间插点号，
+	// 所以给到接近定罪的分量；配合 A2 的去混淆匹配，两条同时命中基本就是 7 分阈值。
+	if (hasAdCharSplitObfuscation(source)) add(4, '正文逐字分隔混淆（规避词表匹配）');
 	if (hasAdRepeatedSegment(source)) add(1, '正文重复段落');
 
 	const exemptHits = countAdKeywordHits(source, getAdExemptKeywords());
@@ -10677,7 +11289,12 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 	const name = String(payload?.name ?? '').trim();
 	if (name && (AD_SYMMETRIC_EMOJI_RE.test(name) || AD_NUMERIC_PREFIX_RE.test(name))) push('keyword', name, 1);
 
-	const combined = [payload?.name, payload?.bio, payload?.text].filter(Boolean).join('\n');
+	// 正文是斜杠命令时整体剔除，不参与任何抽取（短语截取、域名扫描都吃 combined）。
+	// 与下面「整段正文兜底」那道过滤同源：命令文本是操作指令而非广告内容，
+	// 只挡整段兜底不挡短语路径的话，`/ban 收购账号 联系我` 仍会截出 24 字片段入库。
+	const rawText = String(payload?.text ?? '').trim();
+	const textForLearning = isTelegramSlashCommand(rawText) ? '' : payload?.text;
+	const combined = [payload?.name, payload?.bio, textForLearning].filter(Boolean).join('\n');
 	// 交易动词与业务关键词【两类】周边都截短语。
 	// 此前只截交易动词周边，于是「操逼赚钱，招探花9000一单，提供设备」这种一个交易动词都不命中的
 	// 正文抽不出任何候选，learnAdFingerprints 直接返回 no_candidate —— 线上表现为「指纹 +0」，
@@ -10705,8 +11322,15 @@ function extractAdFingerprintCandidates(payload, whitelistSet) {
 	// （normalizeAdFingerprintValue 归一化后完全相等才算命中），只会命中复制同一文案的号，
 	// 误伤面极小，但能让「同一段广告文案第二次出现即被秒杀」成立。
 	// 长度下限 12 是为了避开「有需要私聊」这类过短的通用句式。
+	// 【2026-09-11 斜杠命令永不入库】线上事故：管理员发 /ban 1919451354 封人，
+	// 而 bot 在该群没有管理员权限、删不掉命令消息（deleteAuthorizedGroupCommandMessage 报
+	// message can't be deleted），命令文本于是留在群里被当成普通发言走完广告检测，
+	// 事后 /ignore 回滚时看到学入的指纹正是 [keyword] /ban 1919451354。
+	// 这条指纹权重 1（>= AD_FINGERPRINT_BAN_WEIGHT 0.8），单条命中即定罪、绕过总分与豁免词，
+	// 构成一个自噬循环：管理员用 /ban 封人 → 命令文本入库 → 下次任何人（含管理员自己）
+	// 发相同命令即被秒封全群。命令文本是操作指令、不是广告内容，任何路径都不该学。
 	const text = String(payload?.text ?? '').trim().replace(/\s+/g, ' ');
-	if (text.length >= 12) push('keyword', text.slice(0, 60), 1);
+	if (text.length >= 12 && !isTelegramSlashCommand(text)) push('keyword', text.slice(0, 60), 1);
 
 	const bio = String(payload?.bio ?? '').trim();
 	if (bio.length >= 6) push('bio', bio.slice(0, 60), 0.8);
@@ -12098,7 +12722,7 @@ async function rescanAdMember(env, row, options = {}) {
 		chatId,
 		chatTitle: '',
 		messageId: null
-	}, evaluation, { config: options.config, whitelist: options.whitelist });
+	}, evaluation, { config: options.config, whitelist: options.whitelist, forceGlobal: true });
 	console.log('[广告检测·扫描] 封禁 user=' + userId + ' score=' + evaluation.score + '/' + evaluation.threshold);
 	return { scanned: true, banned: result?.banned !== false, seq: result?.seq ?? null };
 }
@@ -12557,6 +13181,243 @@ function renderAdDetectionNotice(evaluation, context) {
 	return lines.join('\n');
 }
 
+// === 渐进式封禁台账（AD_BAN_SCOPE_MODE = progressive）===
+// 对外只有三个概念，全部收在这里，避免「同一个判断抄两份」：
+//   · 读台账 decideAdBanScope() —— 决定这次封【当前群】还是【全群】
+//   · 记台账 recordSingleGroupBan() —— 首次判定后落一行监控记录
+//   · 标升级 markAdBanScopeEscalated() —— 升级为全群封禁后置 state='global'
+// 台账读失败【必须降级为旧行为（全群封禁）】：安全侧优先 —— 台账不可用时宁可多封，
+// 也不能因为读不到记录就把一个正在刷广告的号放进「只封当前群」的宽松路径。
+async function readAdBanScope(env, userId) {
+	if (!env?.DB) return null;
+	const uid = String(userId || '');
+	if (!uid) return null;
+	try {
+		if (!(await adDetectionReady(env))) return null;
+		const row = await env.DB
+			.prepare('SELECT user_id, scope_state, first_chat_id, first_chat_title, first_score, first_reasons, first_reason, ban_summary, trigger_count, created_at, updated_at, escalated_at FROM ad_ban_scope WHERE user_id = ?')
+			.bind(uid)
+			.first();
+		if (!row) return null;
+		return {
+			userId: uid,
+			scopeState: String(row.scope_state || 'single'),
+			firstChatId: String(row.first_chat_id || ''),
+			firstChatTitle: String(row.first_chat_title || ''),
+			firstScore: Number(row.first_score) || 0,
+			firstReason: String(row.first_reason || ''),
+			banSummary: String(row.ban_summary || ''),
+			triggerCount: Number(row.trigger_count) || 0,
+			createdAt: Number(row.created_at) || 0,
+			escalatedAt: Number(row.escalated_at) || 0
+		};
+	} catch (error) {
+		console.error('[渐进封禁] 读取台账失败:', error);
+		return null;
+	}
+}
+
+// 封禁范围决策。返回 { mode: 'single' | 'global', reason, previous, isFirst }。
+//
+// mode = 'single'   → 只封 input.chatId，并落监控记录（首次判定）
+// mode = 'global'   → 全群封禁。三种来源：
+//                      ① 开关是 global（旧行为）
+//                      ② 台账里已有记录且未升级（本次是第二次露头 → 升级）
+//                      ③ 台账读取失败（安全侧降级）
+// 注意「同群再犯也升级」—— 主人口径：任何第二次判定都视为惯犯，不再区分是不是同群。
+async function decideAdBanScope(env, input, options = {}) {
+	// ① 开关为 global：完全走旧路径，一次 D1 查询都不做。
+	if (AD_BAN_SCOPE_MODE !== AD_BAN_SCOPE_PROGRESSIVE) {
+		return { mode: 'global', reason: 'mode_global', previous: null, isFirst: false };
+	}
+	// ② 调用点显式要求全群封禁。用于两类场景：
+	//    · cron 主动扫描（runAdBioRescan）—— 它封的是「不发言但资料就是广告」的号，
+	//      chatId 只是名册里记的最近发言群，【不是】触发判定的当前群，
+	//      拿它当「当前群」去只封一个群，等于主动扫描几乎不产生威慑；
+	//    · /rescreen 批量复查 —— 同理，没有单一时点、单一群的语义。
+	if (options.forceGlobal === true) {
+		return { mode: 'global', reason: 'forced_global', previous: null, isFirst: false };
+	}
+	const userId = String(input?.userId ?? '');
+	const chatId = input?.chatId != null ? String(input.chatId) : '';
+
+	// 没有 chatId 的调用点（例如 /rescreen 批量复查、cron 扫描）本来就没有「当前群」语义，
+	// 无法执行「只封当前群」—— 一律回落到全群封禁，与旧行为一致。
+	if (!userId || !chatId) {
+		return { mode: 'global', reason: 'no_chat_context', previous: null, isFirst: false };
+	}
+
+	const previous = await readAdBanScope(env, userId);
+	// 台账不可用（D1 异常 / 广告检测表没建起来）→ 安全侧降级为全群封禁。
+	// 用一个独立信号区分「读不到」与「没有记录」：adDetectionReady 为假就是前者。
+	// 【必须放在 `if (!previous)` 之前】—— 否则 D1 抖动导致读空会被误判成「首次判定」，
+	// 从而把一个本该全群封禁的号放进只封单群的宽松路径，这是安全侧不能接受的降级方向。
+	if (!(await adDetectionReady(env))) {
+		return { mode: 'global', reason: 'ledger_unavailable', previous: null, isFirst: false };
+	}
+	if (!previous) {
+		return { mode: 'single', reason: 'first_detection', previous: null, isFirst: true };
+	}
+	// ② 已有记录且未升级 → 本次是第二次露头，升级全群封禁。
+	if (previous.scopeState !== AD_BAN_SCOPE_GLOBAL) {
+		return { mode: 'global', reason: 'escalated', previous, isFirst: false };
+	}
+	// 已升级过 → 保持全群封禁，但不产生新的升级动作（通知文案也据 reason 区分）。
+	return { mode: 'global', reason: 'already_global', previous, isFirst: false };
+}
+
+// 首次判定后落一行监控记录。upsert 语义：
+//   · 已有行 → 只累加 trigger_count 并刷新 updated_at，【不覆盖】首次群与首次时间，
+//     否则升级后回查历史时「他第一次是在哪被封的」就丢了。
+//   · 无行 → 写入首次群信息。
+async function recordSingleGroupBan(env, input, evaluation) {
+	if (!env?.DB) return false;
+	const userId = String(input?.userId ?? '');
+	const chatId = input?.chatId != null ? String(input.chatId) : '';
+	if (!userId || !chatId) return false;
+	try {
+		if (!(await adDetectionReady(env))) return false;
+		const now = Math.floor(Date.now() / 1000);
+		const reasons = JSON.stringify(Array.isArray(evaluation?.reasons) ? evaluation.reasons.slice(0, 10) : []).slice(0, 2000);
+		await env.DB.prepare(
+			'INSERT INTO ad_ban_scope (user_id, scope_state, first_chat_id, first_chat_title, first_score, first_reasons, first_reason, trigger_count, created_at, updated_at) '
+			+ 'VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?) '
+			+ 'ON CONFLICT(user_id) DO UPDATE SET trigger_count = trigger_count + 1, updated_at = excluded.updated_at'
+		).bind(
+			userId,
+			'single',
+			chatId,
+			String(input?.chatTitle || '').slice(0, 200),
+			Math.max(0, Number(evaluation?.score) || 0),
+			reasons,
+			String(evaluation?.reason || '').slice(0, 100),
+			now,
+			now
+		).run();
+		return true;
+	} catch (error) {
+		console.error('[渐进封禁] 写入监控记录失败:', error);
+		return false;
+	}
+}
+
+// 升级为全群封禁后把状态置为 'global'（幂等）。
+// 必须在【封禁动作成功之后】才标 —— 先标后封若封禁失败，记录会显示「已全群封禁」
+// 而实际只封了一个群，监控语义就断了，后续也不会再重试升级。
+async function markAdBanScopeEscalated(env, userId, banSummary = '') {
+	if (!env?.DB) return false;
+	const uid = String(userId || '');
+	if (!uid) return false;
+	try {
+		if (!(await adDetectionReady(env))) return false;
+		const now = Math.floor(Date.now() / 1000);
+		await env.DB.prepare(
+			'UPDATE ad_ban_scope SET scope_state = ?, ban_summary = ?, escalated_at = ?, updated_at = ?, trigger_count = trigger_count + 1 '
+			+ 'WHERE user_id = ?'
+		).bind(AD_BAN_SCOPE_GLOBAL, String(banSummary || '').slice(0, 500), now, now, uid).run();
+		return true;
+	} catch (error) {
+		console.error('[渐进封禁] 标记升级失败:', error);
+		return false;
+	}
+}
+
+// 误判回滚或人工解封时清掉监控记录。必须与 deleteAdScreening 一起调用 ——
+// 留着一行 'single' 会让这个号下次被判定时【直接升级全群封禁】，
+// 而它其实已经被证明是误判了（主人 /ignore 过），等于让一次误判永久抬高后续处置强度。
+async function deleteAdBanScope(env, userId) {
+	if (!env?.DB) return false;
+	const uid = String(userId || '');
+	if (!uid) return false;
+	try {
+		if (!(await adDetectionReady(env))) return false;
+		await env.DB.prepare('DELETE FROM ad_ban_scope WHERE user_id = ?').bind(uid).run();
+		return true;
+	} catch (error) {
+		console.error('[渐进封禁] 删除监控记录失败:', error);
+		return false;
+	}
+}
+
+// 只封一个群（当期触发群）。结构与 banUserFromAllGroups 的返回项完全一致，
+// 让两个函数的结果可以直接拼成同一个 banResults 数组交给既有渲染逻辑，避免另造一套文案。
+async function banUserFromSingleGroup(userId, chatId, options = {}) {
+	const results = [];
+	const memberProbe = options.probeMembership
+		? await probeTargetMemberBeforeBan(chatId, userId)
+		: null;
+	const r = await banUserFromGroup(chatId, userId, { revokeMessages: options.revokeMessages !== false });
+	results.push({ groupId: String(chatId), userId: String(userId), ok: r.ok, error: r.error, retried: r.retried === true, memberProbe });
+	return results;
+}
+
+// 已黑用户在配置群里发言时的升级检查。
+//
+// 触发条件（三个都要满足）：
+//   ① 开关是 progressive；
+//   ② 台账里有一行且 state='single'（= 这个号是【广告自动判定】单群封禁的，还没升级）；
+//   ③ 本次发言的群 ≠ 首次被封的那个群   ——  或者相等（同群再犯，主人口径也升级）。
+//     即：条件 ③ 实际上恒真，写出来只是为了说明语义 —— 任何再次露头都升级。
+//
+// 【为什么必须以台账为门槛】：手工 /ban、/spam、/ad 投票加黑的号【没有台账记录】，
+// 它们的历史语义就是「管理员明确判定」，本来封的时候就已经走过全群封禁了。
+// 若不加这道门槛，任何一个被 /ban 的号在群里冒泡都会触发一次全群封禁风暴 ——
+// 那是纯粹的浪费，且会让主人收到一堆莫名其妙的升级通知。
+async function maybeEscalateBlacklistedUser(message, env, userId, chatId) {
+	if (AD_BAN_SCOPE_MODE !== AD_BAN_SCOPE_PROGRESSIVE) return false;
+	const uid = String(userId || '');
+	const cid = String(chatId || '');
+	if (!uid || !cid) return false;
+
+	const ledger = await readAdBanScope(env, uid);
+	// 没有台账 → 不是广告自动判定的号（手工加黑 / 投票加黑 / 历史数据），不升级。
+	if (!ledger) return false;
+	// 已经升级过了 → 不再重复升级。它每次冒泡都会被上面的黑名单拦截封当前群，
+	// 而全群封禁在升级那次已经做过；重复做只会白烧 API 配额与通知条数。
+	if (ledger.scopeState === AD_BAN_SCOPE_GLOBAL) return false;
+
+	// 升级：全群封禁。
+	const results = await banUserFromAllGroups(uid, { probeMembership: true, revokeMessages: true });
+	const okCount = results.filter((r) => r.ok).length;
+	const failed = results.filter((r) => !r.ok);
+	let summary = '🌐 全群封禁：' + okCount + '/' + results.length + ' 个群成功';
+	if (failed.length) {
+		summary += '；失败群：' + failed.slice(0, 3).map((r) => r.groupId + '(' + (r.error || '未知') + ')').join('、');
+	}
+
+	// 全失败时不标升级，留待下次重试（与 enforceAdDetection 的口径一致）。
+	if (okCount <= 0) {
+		console.warn('[渐进封禁] 升级全群封禁全部失败，保留监控状态 user=' + uid);
+		return false;
+	}
+	await markAdBanScopeEscalated(env, uid, summary);
+	console.log('[渐进封禁] 已升级全群封禁 user=' + uid + ' 触发群=' + cid + ' 首次群=' + ledger.firstChatId);
+
+	// 通知第一主人（仅主人，与广告判定通知同一收件人口径）。
+	const ownerId = getOwnerNotifyTargets()[0] || '';
+	if (!ownerId) return true;
+	const sameAsFirst = ledger.firstChatId && ledger.firstChatId === cid;
+	const lines = [
+		'🚨 <b>广告号升级为全群封禁</b>',
+		'',
+		'👤 账号：<code>' + escapeHtml(uid) + '</code>',
+		'📍 本次露头：' + escapeHtml(message?.chat?.title || cid) + '（<code>' + escapeHtml(cid) + '</code>）',
+		'📌 首次封禁：' + escapeHtml(ledger.firstChatTitle || ledger.firstChatId || '未知'),
+		sameAsFirst ? '（同群再犯）' : '（换群投放）',
+		'',
+		'该号首次被判广告时仅封了触发群，现已确认在' + (sameAsFirst ? '原群继续投放' : '其他治理群活动') + '，',
+		'按渐进式封禁策略升级为<b>全群封禁</b>。',
+		'',
+		'封禁结果：' + escapeHtml(summary)
+	];
+	try {
+		await sendTelegramMessageChunks(ownerId, lines.join('\n'));
+	} catch (error) {
+		console.error('[渐进封禁] 升级通知推送失败:', error);
+	}
+	return true;
+}
+
 // === 处置执行 ===
 // 判定为广告后的统一处置链：加黑 → 全群封禁 → 删触发消息 → 自动学指纹 → 存快照 → 推私聊 → 清观察记录。
 // 每一步独立容错：加黑失败仍继续封禁，封禁部分失败仍推送通知，
@@ -12583,20 +13444,64 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		blacklistCode = 'ERROR';
 	}
 
+	// ===== 封禁范围决策（AD_BAN_SCOPE_MODE）=====
+	// 必须在封禁动作【之前】决定范围，且范围决策只在这里做一次 ——
+	// 它是「封当前群还是封全群」的唯一真源，任何调用点都不得自行判断。
+	const banScope = await decideAdBanScope(env, input, options);
+
 	let banResults = [];
 	try {
-		banResults = await banUserFromAllGroups(userId, { probeMembership: true, revokeMessages: true });
+		// 双保险：single 模式必须真的有 chatId，否则绝不能去调 banChatMember(undefined)。
+		// decideAdBanScope 已在无 chatId 时回落 global，这里再判一次是因为
+		// 封禁是【不可逆的外部动作】，宁可多写一行也不接受「拿 undefined 去封人」。
+		banResults = (banScope.mode === 'single' && input.chatId)
+			? await banUserFromSingleGroup(userId, input.chatId, { probeMembership: true, revokeMessages: true })
+			: await banUserFromAllGroups(userId, { probeMembership: true, revokeMessages: true });
 	} catch (error) {
-		console.error('[广告检测] 全群封禁失败:', error);
+		console.error('[广告检测] 封禁失败:', error);
 	}
 	const okCount = banResults.filter((r) => r.ok).length;
 	const failedBans = banResults.filter((r) => !r.ok);
-	let banSummary = okCount + '/' + banResults.length + ' 个群成功';
+	// 文案里必须写明范围。否则主人看到「1/1 个群成功」会以为是全群封禁时只成了一半，
+	// 而实际那是「按新策略只封了触发群」的正常结果。
+	let banSummary = (banScope.mode === 'single' ? '📌 仅封触发群：' : '🌐 全群封禁：')
+		+ okCount + '/' + banResults.length + ' 个群成功';
 	if (failedBans.length) {
 		banSummary += '；失败群：' + failedBans.slice(0, 3)
 			.map((r) => r.groupId + '(' + (r.error || '未知') + ')')
 			.join('、');
 	}
+
+	// ===== 台账写入 =====
+	// 两条路径互斥，且都【只在封禁动作已尝试之后】写：
+	//   · 首次判定（mode=single）→ 落监控记录，供下次露头时升级
+	//   · 升级封禁（reason=escalated）→ 标 state='global'，防止重复升级
+	// 刻意不处理 already_global / mode_global / no_chat_context / ledger_unavailable：
+	// 那四种情况要么不该产生记录，要么根本没有「首次群」可记。
+	let scopeNote = '';
+	try {
+		if (banScope.mode === 'single') {
+			await recordSingleGroupBan(env, input, evaluation);
+			scopeNote = '｜已进入监控，再次判定将升级全群封禁';
+		} else if (banScope.reason === 'escalated') {
+			// 只有至少封成功一个群才标升级：全失败说明网络/权限问题，标了会让下次
+			// 直接走 already_global 而不重试全群封禁，等于升级被静默吞掉。
+			if (okCount > 0) {
+				await markAdBanScopeEscalated(env, userId, banSummary);
+				scopeNote = '｜已升级全群封禁（此前仅封 ' + (banScope.previous?.firstChatId || '?') + '）';
+			} else {
+				scopeNote = '｜升级封禁全部失败，保留监控状态待下次重试';
+			}
+		} else if (banScope.reason === 'already_global') {
+			// 已升级过的号再来广告：仍然全群封禁（保持收紧，不再退回单群），
+			// 但只累加触发次数，不重复产生升级通知。
+			await recordSingleGroupBan(env, input, evaluation);
+			scopeNote = '｜此前已升级全群封禁';
+		}
+	} catch (error) {
+		console.error('[广告检测] 台账写入失败:', error);
+	}
+	banSummary += scopeNote;
 
 	// 触发消息再单独删一次：revoke_messages 只对该群自己生效，服务消息也偶发残留。
 	if (chatId && input?.messageId) {
@@ -13221,6 +14126,9 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	// 而 AI 层是硬命中即封、不看豁免词也不看总分的，一条错样本比一条错指纹更危险。
 	const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
 	await deleteAdScreening(env, targetId);
+	// 同一并清掉渐进式封禁台账。留着它会让这个号下次被判定时【直接升级全群封禁】，
+	// 而它已被主人证明是误判 —— 等于一次误判永久提高了它后续的处置强度。
+	await deleteAdBanScope(env, targetId);
 	await deleteAdPendingSnapshot(env, ownerId, seq);
 	return { targetId, removed, unbanSummary, fp, sampleRemoved };
 }
@@ -13926,9 +14834,9 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 		try { snapshot = JSON.parse(String(row.snapshot || '{}')); } catch { snapshot = {}; }
 		const targetChatId = String(row.chat_id || '') || String(GROUP_IDS[0] || '');
 		try {
-			if (isPrivilegedManager(userId)) { cleared.push(userId); await deleteAdScreening(env, userId); continue; }
+			if (isPrivilegedManager(userId)) { cleared.push(userId); await deleteAdScreening(env, userId); await deleteAdBanScope(env, userId); continue; }
 			const already = await checkBlacklist(userId, env);
-			if (already.isBlacklisted) { cleared.push(userId); await deleteAdScreening(env, userId); continue; }
+			if (already.isBlacklisted) { cleared.push(userId); await deleteAdScreening(env, userId); await deleteAdBanScope(env, userId); continue; }
 
 			const profile = await fetchAdUserProfile(userId, {});
 			if (targetChatId) profile.status = await fetchAdMemberStatus(targetChatId, userId);
@@ -13940,12 +14848,14 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 			);
 
 			if (evaluation.verdict === 'ban') {
+				// forceGlobal：/rescreen 是批量复查，没有「单一时点的当前群」语义，
+				// 且它是主人主动发起的深度清理，按全群封禁处理。
 				await enforceAdDetection(env, {
 					userId,
 					chatId: targetChatId,
 					chatTitle: '',
 					messageId: null
-				}, evaluation, { config, whitelist });
+				}, evaluation, { config, whitelist, forceGlobal: true });
 				banned.push(userId + '(' + evaluation.score + ')');
 			} else if (evaluation.verdict === 'observe') {
 				await upsertAdScreening(env, userId, {
@@ -13960,6 +14870,7 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 				kept.push(userId + '(' + evaluation.score + ')');
 			} else {
 				await deleteAdScreening(env, userId);
+				await deleteAdBanScope(env, userId);
 				cleared.push(userId);
 			}
 		} catch (error) {
@@ -14094,6 +15005,8 @@ async function handleAdReplyLearning(message, env, ctx) {
 		// 错样本会永久留在库里继续把相似的正常用户往高相似度上拉（AI 层是硬命中即封）。
 		const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
 		await deleteAdScreening(env, targetId);
+		// 与 /ignore 同一口径：管理员声明是误判，台账一并清掉，避免下次判定被直接升级。
+		await deleteAdBanScope(env, targetId);
 		await sendTelegramMessage(chat.id, [
 			'<b>♻️ 已按误判处理</b>',
 			'用户：<code>' + escapeHtml(targetId) + '</code>',
@@ -14110,7 +15023,13 @@ async function handleAdReplyLearning(message, env, ctx) {
 	profile.status = await fetchAdMemberStatus(chat.id, targetId);
 	const evaluation = await evaluateAdSuspect(env, { profile, text: targetText, quotedText: targetQuotedText, forwardChat }, { config, whitelist });
 	evaluation.verdict = 'ban';
-	evaluation.reasons.push('管理员 ' + operatorId + ' 回复判定为广告');
+	// 【2026-09-11 记录触发原文】触发回复在下面会被 deleteMessage 删掉，被举报消息也一起删，
+	// 于是群里两条痕迹全无，而 Telegram 后台只记管理员动作、不记普通聊天 ——
+	// 线上排查一次误封要翻 Cloudflare 日志逐条展开 update 才能找出谁说了哪句话，
+	// 且日志只留 7 天，过期后彻底无法追溯。把原文写进 reasons 后它随快照进 D1，
+	// /pending 直接可见，追责与复盘不再依赖外部日志。
+	const triggerText = String(message.text ?? '').trim().slice(0, 60);
+	evaluation.reasons.push('管理员 ' + operatorId + ' 回复判定为广告（原文:' + (triggerText || '（空）') + '）');
 
 	// ===== 语义样本取材：正文太短时改用引用体（2026-09-08 项 6）=====
 	// 原实现固定用 name + bio + text。碰上「本人正文只有一个字母 c、广告全在引用块里」
@@ -14170,6 +15089,9 @@ async function handleAdReplyLearning(message, env, ctx) {
 			'',
 			'<b>操作人：</b>' + formatUserReference(operatorId, from),
 			'<b>群组：</b>' + escapeHtml(chat.title || '未知') + '（<code>' + escapeHtml(String(chat.id)) + '</code>）',
+			// 触发原文：这条回复马上会被删除，群内不留痕迹。放在通知顶部而非埋进命中依据里，
+			// 是因为「谁说了哪句话导致封禁」是追责第一现场，比得分和依据更需要一眼看到。
+			'<b>触发原文：</b>' + (triggerText ? escapeHtml(triggerText) : '（空）'),
 			'',
 			'<b>目标：</b><code>' + escapeHtml(targetId) + '</code>',
 			// 不脱敏，与自动判定通知 renderAdDetectionNotice 的口径一致：

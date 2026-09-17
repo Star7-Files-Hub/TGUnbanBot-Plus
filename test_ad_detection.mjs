@@ -456,9 +456,11 @@ section('[1] 结构化评分层（纯函数，零网络）');
 	assert('回复学习：/kick 备注含「封了」不触发', W.classifyAdReplyIntent('/kick 封了他') === '', W.classifyAdReplyIntent('/kick 封了他'));
 	assert('回复学习：/unban 备注含「误封」不触发', W.classifyAdReplyIntent('/unban 误封了') === '', W.classifyAdReplyIntent('/unban 误封了'));
 	// 反向钉死：说人话那条路不能被这个特例带走。斜杠必须在【开头】才算命令，
-	// 句中出现的斜杠（「广告/垃圾」这种写法）仍要正常判定。
+	// 句中出现的斜杠仍要正常判定。
 	assert('回复学习：说人话仍触发（特例没伤到主路径）', W.classifyAdReplyIntent('这是广告') === 'positive');
-	assert('回复学习：句中斜杠不算命令', W.classifyAdReplyIntent('广告/垃圾号') === 'positive', W.classifyAdReplyIntent('广告/垃圾号'));
+	// 只有【开头】的斜杠才算命令；句中出现斜杠不影响判定。
+	// 触发词收紧为完整短语后，这里改用「广告号」测同一个语义（原用例的「广告」「垃圾号」已不触发）。
+	assert('回复学习：句中斜杠不算命令', W.classifyAdReplyIntent('广告号/骗子') === 'positive', W.classifyAdReplyIntent('广告号/骗子'));
 	assert('回复学习：单独一个斜杠不算命令也不触发', W.classifyAdReplyIntent('/') === '', W.classifyAdReplyIntent('/'));
 }
 
@@ -1569,7 +1571,22 @@ section('[11] 回归：既有功能不被广告层吞掉');
 
 	// 核心表与广告表共存：广告建表不能影响既有 schema 版本，也不能挤掉核心 5 表。
 	// ad_votes / ad_vote_allowlist 属投票功能的按需建表，本文件不触发投票流程，故不在必存清单里。
-	assert('核心表 schema 版本保持 6', Number(env.DB.query('SELECT version FROM schema_meta WHERE id = 1')[0]?.version) === 6, JSON.stringify(env.DB.query('SELECT * FROM schema_meta')));
+	// 【7】2026-09-11：moderation_messages 加 text_hash / text_norm（同款广告连带查杀）。
+	// 版本号必须随新增列同步 +1 —— ensureD1Table 在 version >= 目标值时短路返回，
+	// 不提的话存量库永远不重跑迁移，新列加不上，而 INSERT 已带新列 → 每条消息写失败。
+	// 上游线上真实发生过（每条群消息 INSERT 全失败、消息缓存整体停写）。
+	// 写死数字而非引用常量：_worker.js 里 D1_SCHEMA_VERSION 是 const，不挂 vm 沙箱全局，
+	// 取出来是 undefined。写死的好处是「改了常量必须回来改这里」，
+	// 迫使后来者正面确认一次迁移影响，而不是让断言跟着常量静默滑过去。
+	assert('核心表 schema 版本为 7（moderation_messages 新增 text_hash/text_norm）',
+		Number(env.DB.query('SELECT version FROM schema_meta WHERE id = 1')[0]?.version) === 7,
+		JSON.stringify(env.DB.query('SELECT * FROM schema_meta')));
+	// 新列必须真的存在 —— 版本号写对但列没加上，正是上游那次故障的形态。
+	{
+		const modCols = env.DB.query('PRAGMA table_info(moderation_messages)').map((c) => c.name);
+		assert('moderation_messages 已含 text_hash 列', modCols.includes('text_hash'), modCols.join(','));
+		assert('moderation_messages 已含 text_norm 列', modCols.includes('text_norm'), modCols.join(','));
+	}
 	const tables = env.DB.query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").map((r) => r.name);
 	for (const t of ['schema_meta', 'blacklist', 'moderation_messages', 'batch_jobs', 'dynamic_groups', 'ad_fingerprints', 'ad_user_screening', 'ad_sample_embeddings', 'ad_domain_whitelist', 'ad_pending_snapshots', 'ad_confirm_tokens']) {
 		assert('表存在：' + t, tables.includes(t), JSON.stringify(tables));
@@ -1645,9 +1662,19 @@ section('[12] 修复项专项：manual 提权 / 自身 username / 回复学习�
 	// 真正的封禁意图仍要判为 positive。
 	assert('C1 「这是广告」仍触发', W.classifyAdReplyIntent('这是广告') === 'positive');
 	assert('C1 「封了他」触发', W.classifyAdReplyIntent('封了他') === 'positive');
-	assert('C1 「该封」触发', W.classifyAdReplyIntent('该封') === 'positive');
-	assert('C1 「封禁吧」触发', W.classifyAdReplyIntent('封禁吧') === 'positive');
-	assert('C1 「垃圾消息」触发', W.classifyAdReplyIntent('垃圾消息') === 'positive');
+	assert('C1 「该封他」触发', W.classifyAdReplyIntent('该封他') === 'positive');
+	assert('C1 「广告号」触发', W.classifyAdReplyIntent('广告号') === 'positive');
+	assert('C1 「垃圾广告」触发', W.classifyAdReplyIntent('垃圾广告') === 'positive');
+	// 【2026-09-11 收紧为完整短语】线上事故：管理员回复一句含「广告」的吐槽，
+	// 把得分 -1（远低于阈值 7）的人封了 14 个群 —— 确认分支强制 ban 不受阈值裁决。
+	// 以下单词/半短语在日常中文对话里出现频率极高，一律不得再触发封禁。
+	assert('C1 裸词「广告」不触发', W.classifyAdReplyIntent('广告') === '');
+	assert('C1 「这广告真烦」不触发', W.classifyAdReplyIntent('这广告真烦') === '');
+	assert('C1 裸词「垃圾」不触发', W.classifyAdReplyIntent('垃圾') === '');
+	assert('C1 「这游戏真垃圾」不触发', W.classifyAdReplyIntent('这游戏真垃圾') === '');
+	assert('C1 「垃圾消息」不再触发', W.classifyAdReplyIntent('垃圾消息') === '');
+	assert('C1 半短语「该封」不触发', W.classifyAdReplyIntent('该封') === '');
+	assert('C1 半短语「封禁吧」不触发', W.classifyAdReplyIntent('封禁吧') === '');
 	// 【2026-09-10】裸 spam / spammer 不再触发：忘带 / 的误操作代价太大，/spam 斜杠命令不受影响。
 	assert('C1 英文 spam 裸词不触发', W.classifyAdReplyIntent('this is spam') === '');
 	assert('C1 spammer 裸词不触发', W.classifyAdReplyIntent('spammer') === '');
@@ -3421,6 +3448,199 @@ section('[19] 方案 E · 短语自我泛化（共现提炼成指纹 + 三重闸
 	}, {});
 	assert('召回未丢：种子铁证「招代理日结」仍封', stillBan2.verdict === 'ban',
 		JSON.stringify({ verdict: stillBan2.verdict, score: stillBan2.score, layer: stillBan2.layer }));
+}
+
+section('[20] 渐进式封禁（AD_BAN_SCOPE_MODE：首次只封当前群 → 再次露头升级全群）');
+{
+	// 本节全部用【多群】配置。前面的所有场景都只有一个 GROUP_ID，
+	// 「只封当前群」与「全群封禁」在那里结果恰好相同 —— 那个配置根本区分不出两者，
+	// 所以渐进式封禁必须独占一节、用 3 个群来测，否则这段逻辑等于没被验证过。
+	const G1 = '-1001111111111';
+	const G2 = '-1002222222222';
+	const G3 = '-1003333333333';
+	const AD_ID = '60001';
+	const AD_NAME = '💚高价收网赚号💚';
+	const AD_BIO = '长期收购网 du 商宝账号，老账号优先加价';
+
+	const makeMultiEnv = (extra = {}) => makeEnv({ GROUP_ID: `${G1},${G2},${G3}`, ...extra });
+
+	// 多群场景的消息构造：前面的 groupMessage 把 chat 写死成 GROUP_ID，这里另起一个。
+	const msgIn = (chatId, chatTitle, from, text, extra = {}) => ({
+		message_id: 700 + Math.floor(Math.random() * 1000),
+		date: Math.floor(Date.now() / 1000),
+		text,
+		chat: { id: Number(chatId), type: 'supergroup', title: chatTitle },
+		from: { is_bot: false, ...from },
+		...extra
+	});
+	const joinIn = (chatId, chatTitle, members) => ({
+		message_id: 800 + Math.floor(Math.random() * 1000),
+		date: Math.floor(Date.now() / 1000),
+		chat: { id: Number(chatId), type: 'supergroup', title: chatTitle },
+		from: { id: members[0].id, is_bot: false, first_name: members[0].first_name || '新人' },
+		new_chat_members: members.map((m) => ({ is_bot: false, ...m }))
+	});
+	const bannedChats = () => calls.filter((c) => c.method === 'banChatMember').map((c) => String(c.body?.chat_id));
+	const ownerText = () => calls
+		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(OWNER_ID))
+		.map((c) => String(c.body?.text || '')).join('\n');
+
+	// ===== 20.1 首次判定：只封触发群（1 个群），并落监控记录 =====
+	const envA = makeMultiEnv();
+	resetCalls();
+	setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: AD_NAME, bio: AD_BIO } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: AD_ID, first_name: AD_NAME }, '招代理日结佣金 无需经验 加微详聊') }, envA);
+
+	const firstBans = bannedChats();
+	assert('首次判定：只封了 1 个群', firstBans.length === 1, JSON.stringify(firstBans));
+	assert('首次判定：封的是触发群 G2', firstBans[0] === G2, JSON.stringify(firstBans));
+	assert('首次判定：未封 G1', !firstBans.includes(G1), JSON.stringify(firstBans));
+	assert('首次判定：未封 G3', !firstBans.includes(G3), JSON.stringify(firstBans));
+	assert('首次判定：仍然写入黑名单（黑名单始终是全局的）',
+		envA.DB.query(`SELECT reason FROM blacklist WHERE id = '${AD_ID}'`)[0]?.reason === 'ad_auto',
+		JSON.stringify(envA.DB.query('SELECT id, reason FROM blacklist')));
+	const ledgerA = envA.DB.query(`SELECT * FROM ad_ban_scope WHERE user_id = '${AD_ID}'`);
+	assert('首次判定：写入监控台账 1 行', ledgerA.length === 1, JSON.stringify(ledgerA));
+	assert('首次判定：台账状态为 single', ledgerA[0]?.scope_state === 'single', JSON.stringify(ledgerA));
+	assert('首次判定：记录首次群 = G2', String(ledgerA[0]?.first_chat_id) === G2, JSON.stringify(ledgerA));
+	assert('首次判定：通知注明「仅封触发群」', ownerText().includes('仅封触发群'), ownerText().slice(0, 600));
+	assert('首次判定：通知说明已进入监控', ownerText().includes('再次判定将升级全群封禁'), ownerText().slice(0, 600));
+
+	// ===== 20.2 该号在其他群再发广告 → 升级全群封禁 =====
+	resetCalls();
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: AD_ID, first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envA);
+
+	// 已黑用户在本群发言会先撞黑名单拦截（封当前群 + return），再走升级检查。
+	// 所以这里断言的是【升级动作把三个群全封了一遍】，用「每个群都被封过」来判定。
+	const escalateBans = bannedChats();
+	assert('升级：至少封到了另外两个群',
+		escalateBans.includes(G1) && escalateBans.includes(G3),
+		JSON.stringify(escalateBans));
+	const ledgerA2 = envA.DB.query(`SELECT * FROM ad_ban_scope WHERE user_id = '${AD_ID}'`);
+	assert('升级：台账状态变为 global', ledgerA2[0]?.scope_state === 'global', JSON.stringify(ledgerA2));
+	assert('升级：记录 escalated_at', Number(ledgerA2[0]?.escalated_at) > 0, JSON.stringify(ledgerA2));
+	assert('升级：保留首次群信息不被覆盖', String(ledgerA2[0]?.first_chat_id) === G2, JSON.stringify(ledgerA2));
+
+	// ===== 20.3 已升级后再次露头 → 不重复升级（不产生第二次全群封禁风暴） =====
+	resetCalls();
+	await sendUpdate({ message: msgIn(G3, '第三治理群', { id: AD_ID, first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envA);
+	const afterEscalateBans = bannedChats();
+	// 已升级的号再冒泡：黑名单拦截仍然封【当前群】一次，这是既有语义，保留。
+	// 但绝不该再出现一次「三群全封」，否则每个群冒泡都会触发一轮全群 API 风暴。
+	assert('已升级：不再重复全群封禁（只封当前群）',
+		afterEscalateBans.length === 1 && afterEscalateBans[0] === G3,
+		JSON.stringify(afterEscalateBans));
+
+	// ===== 20.4 台账被误判回滚清掉后，该号重新从「首次」开始 =====
+	// /ignore 会调 deleteAdBanScope。这里直接验语义：记录没了 → 下次判定回到单群。
+	const envB = makeMultiEnv();
+	resetCalls();
+	setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: AD_NAME, bio: AD_BIO } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	const AD2 = '60002';
+	// 先触发一次检测，让广告检测那批表（含 ad_ban_scope）建起来 ——
+	// 建表是懒加载的，在第一次真正走到检测逻辑时才执行。
+	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: AD2, first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envB);
+	const seededBans = bannedChats();
+	assert('前置：第一次判定只封当前群', seededBans.length === 1 && seededBans[0] === G2, JSON.stringify(seededBans));
+	assert('前置：台账已建表并写入 single',
+		envB.DB.query(`SELECT scope_state FROM ad_ban_scope WHERE user_id = '${AD2}'`)[0]?.scope_state === 'single');
+	// 模拟升级，验证「已升级 → 回滚 → 回到单群」这条完整回路
+	envB.DB.prepare("UPDATE ad_ban_scope SET scope_state = 'global' WHERE user_id = ?").bind(AD2).run();
+	assert('前置：台账已置为 global', envB.DB.query(`SELECT scope_state FROM ad_ban_scope WHERE user_id = '${AD2}'`)[0]?.scope_state === 'global');
+	// 模拟 /ignore：删掉台账行
+	envB.DB.prepare('DELETE FROM ad_ban_scope WHERE user_id = ?').bind(AD2).run();
+	assert('回滚后：台账已清空', envB.DB.query(`SELECT COUNT(*) AS c FROM ad_ban_scope WHERE user_id = '${AD2}'`)[0].c === 0);
+	// 黑名单也要一起清掉，模拟 /ignore 的完整副作用（否则会先撞黑名单拦截）
+	envB.DB.prepare('DELETE FROM blacklist WHERE id = ?').bind(AD2).run();
+	resetCalls();
+	setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: AD_NAME, bio: AD_BIO } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: AD2, first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envB);
+	const afterRollbackBans = bannedChats();
+	assert('回滚后：重新按首次判定只封当前群',
+		afterRollbackBans.length === 1 && afterRollbackBans[0] === G2,
+		JSON.stringify(afterRollbackBans));
+
+	// ===== 20.5 AD_BAN_SCOPE_MODE=global → 完全恢复旧行为（一键回退开关） =====
+	const envC = makeMultiEnv({ AD_BAN_SCOPE_MODE: 'global' });
+	resetCalls();
+	setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: AD_NAME, bio: AD_BIO } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: '60003', first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envC);
+	const globalModeBans = bannedChats();
+	assert('global 模式：首次判定即全群封禁（3 个群）',
+		globalModeBans.length === 3 && [G1, G2, G3].every((g) => globalModeBans.includes(g)),
+		JSON.stringify(globalModeBans));
+	assert('global 模式：不写监控台账',
+		envC.DB.query("SELECT COUNT(*) AS c FROM ad_ban_scope WHERE user_id = '60003'")[0].c === 0,
+		JSON.stringify(envC.DB.query('SELECT * FROM ad_ban_scope')));
+	assert('global 模式：通知标注「全群封禁」', ownerText().includes('全群封禁'), ownerText().slice(0, 400));
+
+	// ===== 20.6 非法取值回落 progressive（配置健壮性） =====
+	const envD = makeMultiEnv({ AD_BAN_SCOPE_MODE: 'PROGRESSIVE' });
+	resetCalls();
+	setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: AD_NAME, bio: AD_BIO } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: '60004', first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envD);
+	const upperBans = bannedChats();
+	assert('大小写不敏感：PROGRESSIVE 被识别为 progressive（只封当前群）',
+		upperBans.length === 1 && upperBans[0] === G2,
+		JSON.stringify(upperBans));
+
+	const envE = makeMultiEnv({ AD_BAN_SCOPE_MODE: 'banana' });
+	resetCalls();
+	setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: AD_NAME, bio: AD_BIO } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: '60005', first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envE);
+	const invalidBans = bannedChats();
+	assert('非法取值：回落 progressive（只封当前群，不是全群）',
+		invalidBans.length === 1 && invalidBans[0] === G2,
+		JSON.stringify(invalidBans));
+
+	// ===== 20.7 手工 /ban 的号不会触发升级（台账是门槛） =====
+	// 手工加黑的号【没有】台账记录。若升级逻辑不加这道门槛，
+	// 任何一个被 /ban 的号在群里冒泡都会引发一次全群封禁风暴 + 一条无谓的主人通知。
+	const envF = makeMultiEnv();
+	resetCalls();
+	const MANUAL_ID = '60006';
+	// 先发一条无害消息，让 D1 核心表建起来（建表是懒加载的，直接 INSERT 会撞 no such table）。
+	// 这条消息本身不会被封（正常内容 + 不在黑名单），只是建表副作用。
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: '60007', first_name: '路人' }, '大家早上好') }, envF);
+	envF.DB.prepare("INSERT INTO blacklist (id, reason, by_user, at, note) VALUES (?, 'manual', 'admin', '2026-09-18T00:00:00Z', '')")
+		.bind(MANUAL_ID).run();
+	assert('前置：手工加黑已生效',
+		envF.DB.query(`SELECT reason FROM blacklist WHERE id = '${MANUAL_ID}'`)[0]?.reason === 'manual',
+		JSON.stringify(envF.DB.query('SELECT id, reason FROM blacklist')));
+	resetCalls();
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: MANUAL_ID, first_name: '某人' }, '正常聊天内容') }, envF);
+	const manualBans = bannedChats();
+	assert('手工 /ban 的号：只封当前群，不升级全群',
+		manualBans.length === 1 && manualBans[0] === G1,
+		JSON.stringify(manualBans));
+	assert('手工 /ban 的号：不产生升级台账', envF.DB.query("SELECT COUNT(*) AS c FROM ad_ban_scope").length >= 0 && envF.DB.query(`SELECT COUNT(*) AS c FROM ad_ban_scope WHERE user_id = '${MANUAL_ID}'`)[0].c === 0);
+	assert('手工 /ban 的号：不发升级通知给主人',
+		!ownerText().includes('升级为全群封禁'),
+		ownerText().slice(0, 400));
 }
 
 console.log('');
