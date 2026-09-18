@@ -3526,6 +3526,49 @@ section('[20] 渐进式处置（AD_BAN_SCOPE_MODE：首次只禁言当前群 →
 	assert('首次判定：通知写明未踢出', ownerText().includes('未踢出'), ownerText().slice(0, 600));
 	assert('首次判定：通知说明已进入监控', ownerText().includes('再次判定将升级全群封禁'), ownerText().slice(0, 600));
 
+	// ===== 20.1b 首次禁言必须补「本群近期消息清扫」 =====
+	// 【为什么必须补】`banChatMember` 的 `revoke_messages` 由 Telegram 服务端一次撤回
+	// 该号在该群近 48 小时的全部消息；`restrictChatMember` 没有这个能力。不补清扫，
+	// 首次命中就只删掉触发那一条，前面几条广告原样留在群里 —— 与「删消息范围跟随
+	// 处置范围」的既有口径不符。
+	// ⚠️ 不能靠「先发几条消息再触发判定」来测：消息缓存走 `ctx.waitUntil`，而测试里的
+	// waitUntil 是空实现（Promise 虽已启动，完成时机不确定），那样写出来是竞态用例。
+	// 直接往 `moderation_messages` 种数据才是确定性的。
+	const CLEAN_ID = '60009';
+	const envClean = makeMultiEnv();
+	resetCalls();
+	setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: AD_NAME, bio: AD_BIO } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	await W.ensureD1Table(envClean);
+	// 种 25 条：既验证「确实删了」，也验证 AD_MUTE_CLEANUP_LIMIT = 20 的上限生效。
+	const seededMids = [];
+	for (let i = 0; i < 25; i++) {
+		const mid = 90000 + i;
+		seededMids.push(mid);
+		await envClean.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)')
+			.bind(mid, G2, CLEAN_ID, new Date().toISOString()).run();
+	}
+	// 同一用户在【别的群】的缓存不能被误删 —— 清扫必须严格限定在触发群。
+	await envClean.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)')
+		.bind(77777, G1, CLEAN_ID, new Date().toISOString()).run();
+
+	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: CLEAN_ID, first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envClean);
+
+	const deleteCalls = calls.filter((c) => c.method === 'deleteMessage');
+	const deletedMids = deleteCalls.map((c) => Number(c.body?.message_id));
+	const cleanedCount = seededMids.filter((m) => deletedMids.includes(m)).length;
+	assert('★ 首次禁言后清扫本群缓存消息（取最新 20 条，AD_MUTE_CLEANUP_LIMIT 上限生效）',
+		cleanedCount === 20, JSON.stringify({ cleanedCount, deletedTotal: deletedMids.length }));
+	assert('★ 清扫严格限定在触发群（同一用户在其他群的缓存一条都不碰）',
+		!deletedMids.includes(77777), JSON.stringify(deletedMids.slice(0, 30)));
+	assert('★ 清扫的 deleteMessage 全部指向触发群 G2',
+		deleteCalls.length > 0 && deleteCalls.every((c) => String(c.body?.chat_id) === G2),
+		JSON.stringify(deleteCalls.map((c) => String(c.body?.chat_id)).slice(0, 5)));
+	assert('清扫结果写进主人通知', ownerText().includes('本群清扫'), ownerText().slice(0, 900));
+
 	// ===== 20.2 该号在其他群再发广告 → 升级全群封禁 =====
 	// 首次不拉黑之后，他在别的群发言【不会】撞黑名单兜底拦截，而是走完整检测链：
 	// detectAdOnMessage → decideAdBanScope 读到台账 single → reason='escalated' → 全群封禁。

@@ -5521,7 +5521,11 @@ async function notifyLinkedSpamResult(env, info) {
 	}
 }
 
-async function cleanupCurrentChatUserMessages(env, chatId, userId, fallbackMessageIds = []) {
+async function cleanupCurrentChatUserMessages(env, chatId, userId, fallbackMessageIds = [], limit = 0) {
+	// limit > 0 时用它，否则沿用 /ban /spam 的历史口径 max(MSG_CACHE_SIZE, 200)。
+	// 【为什么是可选的】自动检测热路径需要更小的上限（见 AD_MUTE_CLEANUP_LIMIT 的说明），
+	// 但 /ban 与 /spam 是主人手工触发的低频路径，改它们的口径属于无谓的行为变更。
+	const cap = Number.isInteger(limit) && limit > 0 ? limit : Math.max(MSG_CACHE_SIZE, 200);
 	const messageIds = [];
 	const addMessageId = (mid) => {
 		const n = Number(mid);
@@ -5532,7 +5536,7 @@ async function cleanupCurrentChatUserMessages(env, chatId, userId, fallbackMessa
 		try {
 			await ensureD1Table(env);
 			const { results } = await env.DB.prepare('SELECT mid FROM moderation_messages WHERE chat_id = ? AND from_id = ? ORDER BY id DESC LIMIT ?')
-				.bind(String(chatId), String(userId), Math.max(MSG_CACHE_SIZE, 200))
+				.bind(String(chatId), String(userId), cap)
 				.all();
 			for (const row of results || []) addMessageId(row.mid);
 			await env.DB.prepare('DELETE FROM moderation_messages WHERE chat_id = ? AND from_id = ?')
@@ -13487,6 +13491,20 @@ const AD_ACTION_LABELS = {
 	ban_global: '🌐 全群封禁：'
 };
 
+// 首次禁言后「清扫本群近期消息」的单次上限。
+//
+// 【为什么必须补这一步】`banChatMember` 的 `revoke_messages: true` 由 Telegram 服务端
+// 撤回该号在该群近 48 小时的全部消息，**1 个子请求**就够；`restrictChatMember` 没有这个能力。
+// 不补清扫，首次命中就只删掉触发的那一条，前面几条广告会原样留在群里 ——
+// 与「删消息范围跟随处置范围」的既有口径不符（`/ban` 群内路径、`/spam` 都是这么补的）。
+//
+// 【为什么上限比 /ban 的 max(MSG_CACHE_SIZE, 200) 小得多】`/ban` 是主人手工触发、
+// 低频；这里是**自动检测热路径**，逐条 `deleteMessage` 都是子请求。
+// 拿 200 去删会把子请求预算烧在善后上，一旦撞上限整个请求抛异常 ——
+// 处置本身已经生效却因为清扫失败而报错，比留几条消息更糟。20 条足以覆盖
+// 「广告号连发几条」的真实形态，剩下的靠 48 小时内的后续露头再清。
+const AD_MUTE_CLEANUP_LIMIT = 20;
+
 // 渲染推送给第一主人的判定通知。序号是 /ignore 的唯一入口。
 function renderAdDetectionNotice(evaluation, context) {
 	const lines = [];
@@ -13844,6 +13862,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	let action = singleScope ? 'mute_single' : 'ban_global';
 	let fallbackNote = '';
 	let banResults = [];
+	let cleanupResult = null;
 	try {
 		if (singleScope) {
 			banResults = await muteUserFromSingleGroup(userId, input.chatId, { probeMembership: true });
@@ -13856,6 +13875,18 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 					+ '，已退回本群封禁）';
 				action = 'ban_single_fallback';
 				banResults = await banUserFromSingleGroup(userId, input.chatId, { probeMembership: true, revokeMessages: true });
+			} else {
+				// 【禁言没有 revoke_messages，必须自己补清扫】
+				// `banChatMember` 的 revoke 由 Telegram 服务端一次撤回该号在该群近 48 小时的
+				// 全部消息；`restrictChatMember` 没有这个能力 —— 不补这一步，首次命中就只删掉
+				// 触发的那一条，前面几条广告原样留在群里，与「删消息范围跟随处置范围」的口径不符。
+				// 逐条 deleteMessage 是子请求，所以用 AD_MUTE_CLEANUP_LIMIT 严格设上限；
+				// 失败只记日志，**绝不改变处置结果**（处置已经生效，清扫只是善后）。
+				try {
+					cleanupResult = await cleanupCurrentChatUserMessages(env, input.chatId, userId, [], AD_MUTE_CLEANUP_LIMIT);
+				} catch (error) {
+					console.error('[广告检测] 首次禁言后的本群清扫失败:', error);
+				}
 			}
 		} else {
 			banResults = await banUserFromAllGroups(userId, { probeMembership: true, revokeMessages: true });
@@ -13869,6 +13900,11 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	// 而实际那是「按新策略只在本群禁言」的正常结果；禁言与封禁的后果差别更大，更不能含混。
 	let banSummary = (AD_ACTION_LABELS[action] || AD_ACTION_LABELS.ban_global)
 		+ okCount + '/' + banResults.length + ' 个群成功' + fallbackNote;
+	// 清扫结果单独报。禁言路径没有 revoke_messages，主人需要知道「除了触发那条还删掉了几条」——
+	// 否则会以为前几条广告还留在群里。0 条时不写，避免每次都在通知里塞一句废话。
+	if (cleanupResult && cleanupResult.total > 0) {
+		banSummary += '｜🧹 本群清扫 ' + cleanupResult.ok + '/' + cleanupResult.total + ' 条';
+	}
 	if (failedBans.length) {
 		banSummary += '；失败群：' + failedBans.slice(0, 3)
 			.map((r) => r.groupId + '(' + (r.error || '未知') + ')')
