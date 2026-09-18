@@ -220,6 +220,11 @@ let OWNER_IDS = [];
 // 格式：TGID 字符串 → { id, first_name, last_name, username }
 // 环境变量 STATIC_USER_PROFILES（JSON 字符串）优先，留空则为空表
 let STATIC_USER_PROFILES = {};
+// 只读资料群：仅用于 /admins 查询用户昵称/用户名/来源群，【完全不参与治理】。
+// 刻意【不并入 GROUP_IDS】—— isConfiguredGroup 看不到这个名单，
+// 因此广告检测、封禁、命令鉴权、/purge、/ad 投票全都不会碰这些群。
+// bot 在里面不需要任何权限，普通成员即可（getChatMember 只要求 bot 在群内）。
+let PROFILE_LOOKUP_GROUPS = [];
 // 清扫回看上限(/spam 按它决定 moderation_messages 回看多少条)
 let MSG_CACHE_SIZE = 50;
 // 机器人用户名缓存
