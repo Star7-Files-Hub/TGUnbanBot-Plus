@@ -694,15 +694,19 @@ section('[6] 入群检测端到端（webhook → 封禁 → 快照 → 私聊通
 		getChatAdministrators: () => ({ ok: true, result: [] })
 	});
 	await sendUpdate({ message: joinMessage([{ id: 50001, first_name: '💚高价收网赚号💚' }]) }, env);
-	assert('广告号进群：触发全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
-	assert('广告号进群：写入黑名单', env.DB.query("SELECT id, reason FROM blacklist WHERE id = '50001'").length === 1, JSON.stringify(env.DB.query('SELECT id, reason FROM blacklist')));
-	assert('广告号进群：黑名单 reason = ad_auto', env.DB.query("SELECT reason FROM blacklist WHERE id = '50001'")[0]?.reason === 'ad_auto');
+	// 【2026-09-18 起首次命中改成本群禁言】不再是 banChatMember（踢出+拉黑），
+	// 而是 restrictChatMember（留在群里、只掐发言权）。见 [20] 节的完整推演。
+	assert('广告号进群：触发本群禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('广告号进群：不踢出（首次命中禁用 banChatMember）', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+	assert('广告号进群：不写黑名单（拉黑会让别的群被兜底拦截封掉，等于跳过渐进式）',
+		env.DB.query("SELECT id FROM blacklist WHERE id = '50001'").length === 0,
+		JSON.stringify(env.DB.query('SELECT id, reason FROM blacklist')));
 	assert('广告号进群：生成待确认快照 seq=1', env.DB.query('SELECT seq, user_id FROM ad_pending_snapshots')[0]?.seq === 1, JSON.stringify(env.DB.query('SELECT seq, user_id FROM ad_pending_snapshots')));
 	assert('广告号进群：快照绑定该用户', env.DB.query('SELECT user_id FROM ad_pending_snapshots')[0]?.user_id === '50001');
 	assert('广告号进群：自动学入指纹', env.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c > 0);
 	assert('广告号进群：观察窗口不留残留', env.DB.query('SELECT COUNT(*) AS c FROM ad_user_screening')[0].c === 0);
 	assert('私聊通知发给第一主人', ownerNoticeText().length > 0, JSON.stringify(calls.filter((c) => c.method === 'sendMessage').map((c) => c.body?.chat_id)));
-	assert('通知含标题「广告号自动封禁」', ownerNoticeText().includes('广告号自动封禁'), ownerNoticeText());
+	assert('通知含标题「广告号自动禁言」', ownerNoticeText().includes('广告号自动禁言'), ownerNoticeText());
 	// /confirm 已于 2026-09-08 删除（定罪即自动学指纹与 AI 样本，判定正确无需任何操作）。
 	// 通知里只留 /ignore 一个出口，并明确写「判定正确：无需任何操作」。
 	assert('通知不再出现 /confirm', !ownerNoticeText().includes('/confirm'), ownerNoticeText());
@@ -717,7 +721,7 @@ section('[6] 入群检测端到端（webhook → 封禁 → 快照 → 私聊通
 	assert('通知含 /ignore 1', ownerNoticeText().includes('/ignore 1'), ownerNoticeText());
 	assert('通知含判定层与得分', ownerNoticeText().includes('判定层：') && ownerNoticeText().includes('得分：'), ownerNoticeText());
 	assert('通知含来源群标题', ownerNoticeText().includes('测试治理群'), ownerNoticeText());
-	assert('通知含封禁结果统计', ownerNoticeText().includes('封禁结果：'), ownerNoticeText());
+	assert('通知含处置结果统计', ownerNoticeText().includes('处置结果：'), ownerNoticeText());
 
 	// 正常新人：零封禁、零快照，且既有进群逻辑照旧。
 	const env2 = makeEnv();
@@ -798,9 +802,9 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 	// 所以【刻意不查 bio】：已经确定要封的人，简介写什么都不影响结论。
 	// 断言从「查了资料」翻转成「没查资料」，考察点是「明显广告号零请求即封」。
 	assert('广告消息：闸一零成本定罪，不拉资料', countCalls('getChat') === 0, JSON.stringify(calls.map((c) => c.method)));
-	assert('广告消息：触发全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('广告消息：触发本群禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
 	assert('广告消息：删除触发消息', countCalls('deleteMessage') >= 1, JSON.stringify(calls.map((c) => c.method)));
-	assert('广告消息：写入黑名单', env2.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '60002'")[0].c === 1);
+	assert('广告消息：不写黑名单（首次命中不拉黑）', env2.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '60002'")[0].c === 0);
 	assert('广告消息：生成快照', env2.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c === 1);
 	assert('广告消息：通知含消息正文', ownerNoticeText().includes('长期收购网赚账号'), ownerNoticeText());
 
@@ -822,8 +826,8 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 	resetCalls();
 	setApi(plainProfile);
 	await sendUpdate({ message: groupMessage({ id: 60003, first_name: '路人' }, MID_TEXT) }, env3);
-	assert('中间分数：通道 body 直接封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
-	assert('中间分数：写入黑名单', env3.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '60003'")[0].c === 1, JSON.stringify(env3.DB.query('SELECT id FROM blacklist')));
+	assert('中间分数：通道 body 直接禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('中间分数：不写黑名单（首次命中不拉黑）', env3.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '60003'")[0].c === 0, JSON.stringify(env3.DB.query('SELECT id FROM blacklist')));
 	assert('中间分数：封禁后不留观察窗口', env3.DB.query('SELECT COUNT(*) AS c FROM ad_user_screening')[0].c === 0, JSON.stringify(env3.DB.query('SELECT user_id, score, layer FROM ad_user_screening')));
 	assert('中间分数：生成待确认快照', env3.DB.query('SELECT COUNT(*) AS c FROM ad_pending_snapshots')[0].c === 1);
 	assert('中间分数：由正文查杀定罪而非评分过线', ownerNoticeText().includes('正文查杀'), ownerNoticeText());
@@ -834,7 +838,7 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 	resetCalls();
 	setApi(plainProfile);
 	await sendUpdate({ message: groupMessage({ id: 60013, first_name: '路人' }, AD_TEXT) }, env3b);
-	assert('协同分端到端：三类判据同现直接封禁', env3b.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '60013'")[0].c === 1, JSON.stringify(env3b.DB.query('SELECT id FROM blacklist')));
+	assert('协同分端到端：三类判据同现直接处置（首次不拉黑）', countCalls('restrictChatMember') >= 1 && env3b.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '60013'")[0].c === 0, JSON.stringify(env3b.DB.query('SELECT id FROM blacklist')));
 	assert('协同分端到端：得分越过封禁线', (env3b.DB.query("SELECT score FROM ad_pending_snapshots WHERE user_id = '60013'")[0]?.score || 0) >= 7, JSON.stringify(env3b.DB.query('SELECT user_id, score FROM ad_pending_snapshots')));
 
 	// 观察窗口历史分累加：本条正文只有 3 分，叠加历史 4 分正好到 7 分封禁线。
@@ -847,7 +851,7 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 	resetCalls();
 	setApi(plainProfile);
 	await sendUpdate({ message: groupMessage({ id: 60004, first_name: '路人' }, '💚青山落日💚') }, env4);
-	assert('历史分累加：触发封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('历史分累加：触发本群禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
 	assert('历史分累加：判定依据写明历史分', ownerNoticeText().includes('观察窗口历史分'), ownerNoticeText());
 	assert('历史分累加：最终得分 7', ownerNoticeText().includes('得分：<b>7</b>'), ownerNoticeText());
 	assert('历史分累加：处置后清空观察记录', env4.DB.query('SELECT COUNT(*) AS c FROM ad_user_screening')[0].c === 0);
@@ -879,7 +883,7 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 	// 而是把「同一份资料卡被重算」与「又干了一次」区分开。
 	resetCalls();
 	await sendUpdate({ message: groupMessage({ id: 60024, first_name: 'Lov1900', username: 'MiLov1900' }, AD_TEXT) }, env4b);
-	assert('误封回归：真发广告则历史分全额参与并封禁', env4b.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '60024'")[0].c === 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('误封回归：真发广告则历史分全额参与并处置（首次不拉黑）', countCalls('restrictChatMember') >= 1 && env4b.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '60024'")[0].c === 0, JSON.stringify(calls.map((c) => c.method)));
 
 	// 方案 A 回归：随机 username 只认「字母与数字交替」的机器批量生成形态。
 	// 「单词 + 数字」（名字 + 生日 / 年份）是全世界最常见的正常取名法，必须放行 ——
@@ -909,7 +913,7 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 			forward_from_chat: { id: -1009999, type: 'channel', title: '💚高价收网赚号💚', username: 'aaa_channel' }
 		})
 	}, env5);
-	assert('转发广告频道：触发封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('转发广告频道：触发本群禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
 	assert('转发广告频道：通知含转发来源', ownerNoticeText().includes('转发来源：'), ownerNoticeText());
 
 	// ---- 分享名片（contact）通道：2026-09-09 方案 1+4 ----
@@ -929,16 +933,16 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 	};
 
 	await runCard(60071, { phone_number: '+98 993 238 8241', first_name: CARD_AD_NAME });
-	assert('名片通道：显示名带广告触发封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('名片通道：显示名带广告触发本群禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
 
 	// 国内号一视同仁 —— 主人口径原话：「昵称带广告 就无需管是国内手机号还是国外手机号了。」
 	// 判定链只读 first_name / last_name，phone_number 与 vcard 在链上是【零读取点】。
 	await runCard(60072, { phone_number: '+8613800138000', first_name: CARD_AD_NAME });
-	assert('名片通道：国内号同样封禁（不看号码国别）', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('名片通道：国内号同样处置（不看号码国别）', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
 
 	// last_name 也要拼进显示名，否则广告拆到姓氏字段就能整条绕过。
 	await runCard(60073, { phone_number: '+8613800138000', first_name: '假钞玩妹交流群🔥', last_name: '快递面交都可' });
-	assert('名片通道：first_name + last_name 拼接后判定', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('名片通道：first_name + last_name 拼接后判定', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
 
 	// 方案 4 反向白名单：正常人分享名片，显示名就是人名 —— 即便电话是外国号也不得封。
 	await runCard(60074, { phone_number: '+98 993 238 8241', first_name: '张三' });
@@ -1050,7 +1054,7 @@ section('[8] 命令层端到端（权限、快照闭环、指纹与样本维护�
 	// 自动封禁本身就该把现场沉淀成指纹与 AI 样本（项 3 拆闸门 + 项 7 自动加样本），
 	// 不再需要人工 /confirm 补一刀。
 	assert('自动封禁已学入指纹', env.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE source = 'auto'")[0].c > 0, JSON.stringify(env.DB.query("SELECT type, value, match_count, source FROM ad_fingerprints WHERE source = 'auto' LIMIT 8")));
-	assert('封禁后用户仍在黑名单', env.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '70001'")[0].c === 1);
+	assert('首次处置后不在黑名单（渐进式：首次不拉黑）', env.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '70001'")[0].c === 0);
 
 	// 70001 的「昵称 + bio」撞了内置种子第一条、走 text_hash 去重，验不到新增路径。
 	// 换一份不在种子库里的现场资料（bio 沿用已入库指纹，保证照样被判为广告），
@@ -1089,14 +1093,14 @@ section('[8] 命令层端到端（权限、快照闭环、指纹与样本维护�
 	// 所以这条必须拿到 #3。旧实现 MAX(seq) 会随行被删除而回退，
 	// 主人照着旧通知发 /ignore 就会解封错人。
 	assert('序号单调递增不复用', seq70002 === 3, JSON.stringify(env.DB.query('SELECT seq, user_id, expires_at FROM ad_pending_snapshots')));
-	assert('第二次封禁已入黑名单', env.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '70002'")[0].c === 1);
+	assert('本段第二次处置同样不入黑名单（70002 也是首次）', env.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '70002'")[0].c === 0);
 	const autoFpBefore = env.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE source = 'auto'")[0].c;
 	assert('回滚前存在自动学入的指纹', autoFpBefore > 0, String(autoFpBefore));
 	const ignoreText = await cmd(env, '/ignore ' + seq70002);
 	assert('/ignore 回执标题正确', ignoreText.includes('已按误判回滚'), ignoreText);
 	assert('/ignore 调用全群解封', countCalls('unbanChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
 	assert('/ignore 移出黑名单', env.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '70002'")[0].c === 0);
-	assert('/ignore 回执写明黑名单已移除', ignoreText.includes('已移除'), ignoreText);
+	assert('/ignore 回执写明黑名单本就不在（首次命中不拉黑）', ignoreText.includes('本就不在黑名单'), ignoreText);
 	assert('/ignore 标记指纹误判', ignoreText.includes('指纹修正：'), ignoreText);
 	assert('/ignore 回执报告 AI 样本处理结果', ignoreText.includes('AI 样本：'), ignoreText);
 	// purge 档（项 4）：主人已明确表态是误判 → 命中的指纹【当次即删】，不再攒 3 次误报。
@@ -1483,6 +1487,9 @@ section('[10] 状态、白名单与观察窗口复判（adstats / whitelist / re
 	assert('/rescreen 调用了全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
 
 	// 已在黑名单的人不重复处置：复判时直接解除观察。
+	// 【必须显式插黑名单】首次命中改成本群禁言且不拉黑之后，70009 的自动处置不再写黑名单，
+	// 这条用例就测不到「已拉黑 → 跳过复判」那条分支了。手动插一行把前提补回来。
+	envRs.DB.prepare("INSERT OR REPLACE INTO blacklist (id, reason, by_user, at, note) VALUES ('70009', 'ad_auto', 'system', '2026-09-18T00:00:00Z', '')").run();
 	await W.upsertAdScreening(envRs, '70009', {
 		chatId: GROUP_ID, score: 6, reasons: ['已封禁用户'], snapshot: { name: '已封禁用户' }, layer: 'score'
 	}, rsConfig);
@@ -1731,8 +1738,8 @@ section('[13] 回复学习端到端（管理层回复即判定，误触发必须
 
 	// 场景 1：管理层回复「这是广告」→ 强制判定为广告并走完整处置链。
 	const p1 = await sendReply(OWNER_ID, '这是广告', 72002);
-	assert('回复学习 positive：被举报者入黑名单', env13.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '72002'")[0].c === 1, JSON.stringify(env13.DB.query('SELECT id FROM blacklist')));
-	assert('回复学习 positive：执行了全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('回复学习 positive：被举报者不入黑名单（首次命中不拉黑）', env13.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '72002'")[0].c === 0, JSON.stringify(env13.DB.query('SELECT id FROM blacklist')));
+	assert('回复学习 positive：执行了本群禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
 	assert('回复学习 positive：删了被举报消息与操作消息', countCalls('deleteMessage') >= 2, JSON.stringify(calls.map((c) => c.method)));
 	assert('回复学习 positive：学入了指纹', env13.DB.query('SELECT COUNT(*) AS c FROM ad_fingerprints')[0].c > 0);
 	assert('回复学习 positive：指纹记为 manual', env13.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE source = 'manual'")[0].c > 0, JSON.stringify(env13.DB.query('SELECT value, source FROM ad_fingerprints')));
@@ -1841,8 +1848,8 @@ section('[14] 两道闸真实场景回归（用线上真实指纹与漏放案例
 	resetCalls();
 	setApi(adProfileApi({ first_name: '项目对接', bio: REAL_BIO }));
 	await sendUpdate({ message: joinMessage([{ id: 80001, first_name: '项目对接' }]) }, envJoin);
-	assert('第一道闸：bio 命中指纹的号进群即加黑', envJoin.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80001'")[0].c === 1, JSON.stringify(envJoin.DB.query('SELECT id FROM blacklist')));
-	assert('第一道闸：bio 命中后执行全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('第一道闸：bio 命中指纹的号进群即处置（首次不拉黑）', countCalls('restrictChatMember') >= 1 && envJoin.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80001'")[0].c === 0, JSON.stringify(envJoin.DB.query('SELECT id FROM blacklist')));
+	assert('第一道闸：bio 命中后执行本群禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
 	assert('第一道闸：bio 命中生成待确认快照', envJoin.DB.query("SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE user_id = '80001'")[0].c === 1);
 
 	resetCalls();
@@ -1864,8 +1871,8 @@ section('[14] 两道闸真实场景回归（用线上真实指纹与漏放案例
 	resetCalls();
 	setApi(adProfileApi({ first_name: '高价收网赚号', bio: '长期收购网 du 商宝账号，老账号优先加价' }));
 	await sendUpdate({ message: joinMessage([{ id: 80003, first_name: '高价收网赚号' }]) }, envJoin);
-	assert('第一道闸：资料卡查杀让漏放案例进群即加黑', envJoin.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80003'")[0].c === 1, JSON.stringify(envJoin.DB.query('SELECT id FROM blacklist')));
-	assert('第一道闸：资料卡查杀执行全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('第一道闸：资料卡查杀让漏放案例进群即处置（首次不拉黑）', envJoin.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80003'")[0].c === 0, JSON.stringify(envJoin.DB.query('SELECT id FROM blacklist')));
+	assert('第一道闸：资料卡查杀执行本群禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
 	assert('第一道闸：资料卡查杀不留观察窗口', envJoin.DB.query("SELECT COUNT(*) AS c FROM ad_user_screening WHERE user_id = '80003'")[0].c === 0, JSON.stringify(envJoin.DB.query('SELECT user_id, score FROM ad_user_screening')));
 	assert('第一道闸：资料卡查杀生成待确认快照', envJoin.DB.query("SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE user_id = '80003'")[0].c === 1);
 
@@ -1887,8 +1894,8 @@ section('[14] 两道闸真实场景回归（用线上真实指纹与漏放案例
 	resetCalls();
 	setApi(adProfileApi({ first_name: '小李', bio: '' }));
 	await sendUpdate({ message: groupMessage({ id: 80011, first_name: '小李' }, '高价收网赚账号 长期收购 USDT 日结秒到 需要的私我') }, envMsg);
-	assert('第二道闸：正文查杀让漏放正文首条即加黑', envMsg.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80011'")[0].c === 1, JSON.stringify(envMsg.DB.query('SELECT id FROM blacklist')));
-	assert('第二道闸：正文查杀首条即执行全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('第二道闸：正文查杀让漏放正文首条即处置（首次不拉黑）', envMsg.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '80011'")[0].c === 0, JSON.stringify(envMsg.DB.query('SELECT id FROM blacklist')));
+	assert('第二道闸：正文查杀首条即执行本群禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
 	assert('第二道闸：正文查杀不留观察窗口', envMsg.DB.query("SELECT COUNT(*) AS c FROM ad_user_screening WHERE user_id = '80011'")[0].c === 0, JSON.stringify(envMsg.DB.query('SELECT user_id, score FROM ad_user_screening')));
 
 	// 已在黑名单的号再发广告：不重复加黑、消息照删。原用例考察「窗口内二次累加过线」，
@@ -1942,7 +1949,7 @@ section('[15] 方案 6 · 三道闸的 bio 检测（双轨：首发查 bio + 定
 	resetCalls();
 	setApi(api({ first_name: '💚高价收网赚号💚', bio: '长期收购网 du 商宝账号' }));
 	await sendUpdate({ message: groupMessage({ id: 90001, first_name: '💚高价收网赚号💚' }, '收U秒结 私聊我') }, envG1);
-	assert('闸一：昵称即广告直接封禁', envG1.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '90001'")[0].c === 1, JSON.stringify(envG1.DB.query('SELECT id FROM blacklist')));
+	assert('闸一：昵称即广告直接处置（首次不拉黑）', envG1.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '90001'")[0].c === 0, JSON.stringify(envG1.DB.query('SELECT id FROM blacklist')));
 	assert('闸一：定罪时不花 getChat', countCalls('getChat') === 0, JSON.stringify(calls.map((c) => c.method)));
 	// 判定阶段确实一个 Telegram 请求都没花。此处出现的 getChatMember 来自
 	// banUserFromAllGroups({ probeMembership: true }) 的封禁前预检
@@ -1959,7 +1966,7 @@ section('[15] 方案 6 · 三道闸的 bio 检测（双轨：首发查 bio + 定
 	resetCalls();
 	setApi(api({ first_name: '小李', bio: '长期收购微信老号 支付宝实名号 高价收 秒结 私聊' }));
 	await sendUpdate({ message: groupMessage({ id: 90002, first_name: '小李' }, '在吗') }, envG2);
-	assert('闸二：广告只在 bio 里也能封禁', envG2.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '90002'")[0].c === 1, JSON.stringify(envG2.DB.query('SELECT id FROM blacklist')));
+	assert('闸二：广告只在 bio 里也能处置（首次不拉黑）', envG2.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '90002'")[0].c === 0, JSON.stringify(envG2.DB.query('SELECT id FROM blacklist')));
 	assert('闸二：首次发言查了一次 bio', countCalls('getChat') === 1, JSON.stringify(calls.map((c) => c.method)));
 
 	// ---- 闸二冷却：同一人 3 天内不再查 bio ----
@@ -2296,9 +2303,9 @@ section('[15] 方案 6 · 三道闸的 bio 检测（双轨：首发查 bio + 定
 		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } })
 	});
 	await sendUpdate({ message: groupMessage({ id: 70001, first_name: '♻网赌账号回收h🀄', username: 'w743flrute' }, '在吗') }, envS);
-	assert('端到端：事故号发「在吗」即被全群封禁', countCalls('banChatMember') > 0, JSON.stringify(calls.map((c) => c.method)));
-	assert('端到端：事故号进全局黑名单',
-		envS.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '70001'")[0].c === 1);
+	assert('端到端：事故号发「在吗」即被本群禁言', countCalls('restrictChatMember') > 0, JSON.stringify(calls.map((c) => c.method)));
+	assert('端到端：事故号首次处置不入黑名单（渐进式）',
+		envS.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '70001'")[0].c === 0);
 	const structNotice = () => calls
 		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(OWNER_ID))
 		.map((c) => String(c.body?.text || '')).join('\n');
@@ -2366,8 +2373,8 @@ section('[15] 方案 6 · 三道闸的 bio 检测（双轨：首发查 bio + 定
 		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } })
 	});
 	await sendUpdate({ message: groupMessage({ id: 70004, first_name: '♻网赌账号回收h🀄', username: 'w743flrute' }, '在吗') }, envOffSeed);
-	assert('开关 off 也管不到指纹种子：图 28 号仍被封', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
-	assert('开关 off 也管不到指纹种子：图 28 号仍入黑名单', envOffSeed.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '70004'")[0].c === 1);
+	assert('开关 off 也管不到指纹种子：图 28 号仍被禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('开关 off 也管不到指纹种子：图 28 号仍被处置且不入黑名单（首次）', envOffSeed.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '70004'")[0].c === 0);
 }
 
 section('[16] 指纹种子库（35 图特征下移到第二层）+ /spam 人工判定自动学习');
@@ -2483,8 +2490,8 @@ section('[16] 指纹种子库（35 图特征下移到第二层）+ /spam 人工�
 		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } })
 	});
 	await sendUpdate({ message: groupMessage({ id: 92001, first_name: '兼职小助手', username: 'parttime_help_x' }, '在吗') }, envE2E);
-	assert('端到端：种子命中执行全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
-	assert('端到端：种子命中写入黑名单', envE2E.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '92001'")[0].c === 1, JSON.stringify(envE2E.DB.query('SELECT id FROM blacklist')));
+	assert('端到端：种子命中执行本群禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('端到端：种子命中不入黑名单（首次命中不拉黑）', envE2E.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '92001'")[0].c === 0, JSON.stringify(envE2E.DB.query('SELECT id FROM blacklist')));
 	assert('端到端：种子命中不留观察窗口', envE2E.DB.query("SELECT COUNT(*) AS c FROM ad_user_screening WHERE user_id = '92001'")[0].c === 0, JSON.stringify(envE2E.DB.query('SELECT user_id, score, layer FROM ad_user_screening')));
 	assert('端到端：种子命中生成待确认快照', envE2E.DB.query("SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE user_id = '92001'")[0].c === 1);
 	assert('端到端：种子命中累加 match_count',
@@ -2633,7 +2640,7 @@ section('[16] 指纹种子库（35 图特征下移到第二层）+ /spam 人工�
 		getChatAdministrators: () => ({ ok: true, result: [] })
 	});
 	await sendUpdate({ message: groupMessage({ id: 92004, first_name: '另一个号', username: 'spam_learn_clone' }, '在吗') }, envSpam);
-	assert('/spam 学习：学到的域名指纹对同伙立即生效', envSpam.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '92004'")[0].c === 1, JSON.stringify(envSpam.DB.query('SELECT id FROM blacklist')));
+	assert('/spam 学习：学到的域名指纹对同伙立即生效（首次处置不拉黑）', countCalls('restrictChatMember') >= 1 && envSpam.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '92004'")[0].c === 0, JSON.stringify(envSpam.DB.query('SELECT id FROM blacklist')));
 
 	// ---- 重复部署不重灌 ----
 	// 判空条件是 WHERE source='seed' 而不是「整表为空」：指纹表会被自动学习持续写入，
@@ -2942,8 +2949,8 @@ section('[18] 方案 C · 私有群邀请链接单独计分（不动主人指定
 		getChatAdministrators: () => ({ ok: true, result: [] })
 	});
 	await sendUpdate({ message: joinMessage([{ id: 60002, first_name: '小美' }]) }, envP);
-	assert('端到端 · 纯私有链接进群即封', countCalls('banChatMember') >= 1, JSON.stringify(calls.filter((c) => c.method === 'banChatMember').map((c) => c.body)));
-	assert('端到端 · 写入黑名单 reason = ad_auto', envP.DB.query("SELECT reason FROM blacklist WHERE id = '60002'")[0]?.reason === 'ad_auto', JSON.stringify(envP.DB.query('SELECT id, reason FROM blacklist')));
+	assert('端到端 · 纯私有链接进群即禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.filter((c) => c.method === 'restrictChatMember').map((c) => c.body)));
+	assert('端到端 · 首次命中不入黑名单（渐进式）', envP.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '60002'")[0].c === 0, JSON.stringify(envP.DB.query('SELECT id, reason FROM blacklist')));
 	assert('端到端 · 观察窗口不留残留（命中即封不写筛查表）', envP.DB.query('SELECT COUNT(*) AS c FROM ad_user_screening')[0].c === 0);
 	// 对照组：技术群主（bio 带 cdn 撑豁免）进群不封 —— 分流器端到端活着。
 	const envQ = makeEnv();
@@ -3450,7 +3457,7 @@ section('[19] 方案 E · 短语自我泛化（共现提炼成指纹 + 三重闸
 		JSON.stringify({ verdict: stillBan2.verdict, score: stillBan2.score, layer: stillBan2.layer }));
 }
 
-section('[20] 渐进式封禁（AD_BAN_SCOPE_MODE：首次只封当前群 → 再次露头升级全群）');
+section('[20] 渐进式处置（AD_BAN_SCOPE_MODE：首次只禁言当前群 → 再次判定升级全群封禁）');
 {
 	// 本节全部用【多群】配置。前面的所有场景都只有一个 GROUP_ID，
 	// 「只封当前群」与「全群封禁」在那里结果恰好相同 —— 那个配置根本区分不出两者，
@@ -3481,11 +3488,14 @@ section('[20] 渐进式封禁（AD_BAN_SCOPE_MODE：首次只封当前群 → �
 		new_chat_members: members.map((m) => ({ is_bot: false, ...m }))
 	});
 	const bannedChats = () => calls.filter((c) => c.method === 'banChatMember').map((c) => String(c.body?.chat_id));
+	// 禁言走 restrictChatMember。本节里不会有别的调用点碰这个接口
+	//（新机器人入群静音走 joinMessage，本节只用 msgIn）。
+	const mutedChats = () => calls.filter((c) => c.method === 'restrictChatMember').map((c) => String(c.body?.chat_id));
 	const ownerText = () => calls
 		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(OWNER_ID))
 		.map((c) => String(c.body?.text || '')).join('\n');
 
-	// ===== 20.1 首次判定：只封触发群（1 个群），并落监控记录 =====
+	// ===== 20.1 首次判定：只在本群禁言（不踢出、不拉黑），并落监控记录 =====
 	const envA = makeMultiEnv();
 	resetCalls();
 	setApi({
@@ -3495,35 +3505,47 @@ section('[20] 渐进式封禁（AD_BAN_SCOPE_MODE：首次只封当前群 → �
 	});
 	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: AD_ID, first_name: AD_NAME }, '招代理日结佣金 无需经验 加微详聊') }, envA);
 
+	const firstMutes = mutedChats();
 	const firstBans = bannedChats();
-	assert('首次判定：只封了 1 个群', firstBans.length === 1, JSON.stringify(firstBans));
-	assert('首次判定：封的是触发群 G2', firstBans[0] === G2, JSON.stringify(firstBans));
-	assert('首次判定：未封 G1', !firstBans.includes(G1), JSON.stringify(firstBans));
-	assert('首次判定：未封 G3', !firstBans.includes(G3), JSON.stringify(firstBans));
-	assert('首次判定：仍然写入黑名单（黑名单始终是全局的）',
-		envA.DB.query(`SELECT reason FROM blacklist WHERE id = '${AD_ID}'`)[0]?.reason === 'ad_auto',
+	assert('首次判定：只禁言了 1 个群', firstMutes.length === 1, JSON.stringify(firstMutes));
+	assert('首次判定：禁言的是触发群 G2', firstMutes[0] === G2, JSON.stringify(firstMutes));
+	assert('首次判定：未禁言 G1', !firstMutes.includes(G1), JSON.stringify(firstMutes));
+	assert('首次判定：未禁言 G3', !firstMutes.includes(G3), JSON.stringify(firstMutes));
+	// 本轮改动的两条核心语义，缺一条就退回旧行为：
+	assert('★ 首次判定：一个群都没封（禁用 banChatMember，人不被踢走）',
+		firstBans.length === 0, JSON.stringify(firstBans));
+	assert('★ 首次判定：不写黑名单（拉黑会让别的群被兜底拦截封掉，等于跳过渐进式）',
+		envA.DB.query(`SELECT COUNT(*) AS c FROM blacklist WHERE id = '${AD_ID}'`)[0].c === 0,
 		JSON.stringify(envA.DB.query('SELECT id, reason FROM blacklist')));
 	const ledgerA = envA.DB.query(`SELECT * FROM ad_ban_scope WHERE user_id = '${AD_ID}'`);
 	assert('首次判定：写入监控台账 1 行', ledgerA.length === 1, JSON.stringify(ledgerA));
 	assert('首次判定：台账状态为 single', ledgerA[0]?.scope_state === 'single', JSON.stringify(ledgerA));
 	assert('首次判定：记录首次群 = G2', String(ledgerA[0]?.first_chat_id) === G2, JSON.stringify(ledgerA));
-	assert('首次判定：通知注明「仅封触发群」', ownerText().includes('仅封触发群'), ownerText().slice(0, 600));
+	assert('首次判定：通知标题写明「自动禁言」', ownerText().includes('广告号自动禁言'), ownerText().slice(0, 600));
+	assert('首次判定：通知注明「仅本群禁言」', ownerText().includes('仅本群禁言'), ownerText().slice(0, 600));
+	assert('首次判定：通知写明未踢出', ownerText().includes('未踢出'), ownerText().slice(0, 600));
 	assert('首次判定：通知说明已进入监控', ownerText().includes('再次判定将升级全群封禁'), ownerText().slice(0, 600));
 
 	// ===== 20.2 该号在其他群再发广告 → 升级全群封禁 =====
+	// 首次不拉黑之后，他在别的群发言【不会】撞黑名单兜底拦截，而是走完整检测链：
+	// detectAdOnMessage → decideAdBanScope 读到台账 single → reason='escalated' → 全群封禁。
+	// 这比原先「一冒头就升级」更精确：只有真的再发广告才升级。
 	resetCalls();
 	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: AD_ID, first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envA);
 
-	// 已黑用户在本群发言会先撞黑名单拦截（封当前群 + return），再走升级检查。
-	// 所以这里断言的是【升级动作把三个群全封了一遍】，用「每个群都被封过」来判定。
 	const escalateBans = bannedChats();
-	assert('升级：至少封到了另外两个群',
-		escalateBans.includes(G1) && escalateBans.includes(G3),
+	assert('★ 升级：三个群全部封禁',
+		escalateBans.length === 3 && [G1, G2, G3].every((g) => escalateBans.includes(g)),
 		JSON.stringify(escalateBans));
+	// 升级才拉黑 —— 黑名单始终是全局的，这一步不能提前到首次。
+	assert('升级：此时才写入黑名单',
+		envA.DB.query(`SELECT reason FROM blacklist WHERE id = '${AD_ID}'`)[0]?.reason === 'ad_auto',
+		JSON.stringify(envA.DB.query('SELECT id, reason FROM blacklist')));
 	const ledgerA2 = envA.DB.query(`SELECT * FROM ad_ban_scope WHERE user_id = '${AD_ID}'`);
 	assert('升级：台账状态变为 global', ledgerA2[0]?.scope_state === 'global', JSON.stringify(ledgerA2));
 	assert('升级：记录 escalated_at', Number(ledgerA2[0]?.escalated_at) > 0, JSON.stringify(ledgerA2));
 	assert('升级：保留首次群信息不被覆盖', String(ledgerA2[0]?.first_chat_id) === G2, JSON.stringify(ledgerA2));
+	assert('升级：通知注明已升级全群封禁', ownerText().includes('已升级全群封禁'), ownerText().slice(0, 600));
 
 	// ===== 20.3 已升级后再次露头 → 不重复升级（不产生第二次全群封禁风暴） =====
 	resetCalls();
@@ -3548,8 +3570,11 @@ section('[20] 渐进式封禁（AD_BAN_SCOPE_MODE：首次只封当前群 → �
 	// 先触发一次检测，让广告检测那批表（含 ad_ban_scope）建起来 ——
 	// 建表是懒加载的，在第一次真正走到检测逻辑时才执行。
 	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: AD2, first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envB);
+	const seededMutes = mutedChats();
 	const seededBans = bannedChats();
-	assert('前置：第一次判定只封当前群', seededBans.length === 1 && seededBans[0] === G2, JSON.stringify(seededBans));
+	assert('前置：第一次判定只禁言当前群',
+		seededMutes.length === 1 && seededMutes[0] === G2 && seededBans.length === 0,
+		JSON.stringify({ mutes: seededMutes, bans: seededBans }));
 	assert('前置：台账已建表并写入 single',
 		envB.DB.query(`SELECT scope_state FROM ad_ban_scope WHERE user_id = '${AD2}'`)[0]?.scope_state === 'single');
 	// 模拟升级，验证「已升级 → 回滚 → 回到单群」这条完整回路
@@ -3558,8 +3583,11 @@ section('[20] 渐进式封禁（AD_BAN_SCOPE_MODE：首次只封当前群 → �
 	// 模拟 /ignore：删掉台账行
 	envB.DB.prepare('DELETE FROM ad_ban_scope WHERE user_id = ?').bind(AD2).run();
 	assert('回滚后：台账已清空', envB.DB.query(`SELECT COUNT(*) AS c FROM ad_ban_scope WHERE user_id = '${AD2}'`)[0].c === 0);
-	// 黑名单也要一起清掉，模拟 /ignore 的完整副作用（否则会先撞黑名单拦截）
-	envB.DB.prepare('DELETE FROM blacklist WHERE id = ?').bind(AD2).run();
+	// 黑名单本来就没写（首次命中不拉黑），这里不用清 —— 顺带验证这条语义在多群场景下同样成立，
+	// 否则下面这一轮会先撞黑名单兜底拦截，把当前群封掉，断言就测不到「首次只禁言」了。
+	assert('前置：首次命中确实没进黑名单（多群场景同样成立）',
+		envB.DB.query(`SELECT COUNT(*) AS c FROM blacklist WHERE id = '${AD2}'`)[0].c === 0,
+		JSON.stringify(envB.DB.query('SELECT id, reason FROM blacklist')));
 	resetCalls();
 	setApi({
 		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: AD_NAME, bio: AD_BIO } }),
@@ -3567,10 +3595,11 @@ section('[20] 渐进式封禁（AD_BAN_SCOPE_MODE：首次只封当前群 → �
 		getChatAdministrators: () => ({ ok: true, result: [] })
 	});
 	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: AD2, first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envB);
+	const afterRollbackMutes = mutedChats();
 	const afterRollbackBans = bannedChats();
-	assert('回滚后：重新按首次判定只封当前群',
-		afterRollbackBans.length === 1 && afterRollbackBans[0] === G2,
-		JSON.stringify(afterRollbackBans));
+	assert('回滚后：重新按首次判定只禁言当前群',
+		afterRollbackMutes.length === 1 && afterRollbackMutes[0] === G2 && afterRollbackBans.length === 0,
+		JSON.stringify({ mutes: afterRollbackMutes, bans: afterRollbackBans }));
 
 	// ===== 20.5 AD_BAN_SCOPE_MODE=global → 完全恢复旧行为（一键回退开关） =====
 	const envC = makeMultiEnv({ AD_BAN_SCOPE_MODE: 'global' });
@@ -3600,9 +3629,10 @@ section('[20] 渐进式封禁（AD_BAN_SCOPE_MODE：首次只封当前群 → �
 	});
 	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: '60004', first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envD);
 	const upperBans = bannedChats();
-	assert('大小写不敏感：PROGRESSIVE 被识别为 progressive（只封当前群）',
-		upperBans.length === 1 && upperBans[0] === G2,
-		JSON.stringify(upperBans));
+	const upperMutes = mutedChats();
+	assert('大小写不敏感：PROGRESSIVE 被识别为 progressive（只禁言当前群）',
+		upperBans.length === 0 && upperMutes.length === 1 && upperMutes[0] === G2,
+		JSON.stringify({ bans: upperBans, mutes: upperMutes }));
 
 	const envE = makeMultiEnv({ AD_BAN_SCOPE_MODE: 'banana' });
 	resetCalls();
@@ -3613,9 +3643,10 @@ section('[20] 渐进式封禁（AD_BAN_SCOPE_MODE：首次只封当前群 → �
 	});
 	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: '60005', first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envE);
 	const invalidBans = bannedChats();
-	assert('非法取值：回落 progressive（只封当前群，不是全群）',
-		invalidBans.length === 1 && invalidBans[0] === G2,
-		JSON.stringify(invalidBans));
+	const invalidMutes = mutedChats();
+	assert('非法取值：回落 progressive（只禁言当前群，不是全群）',
+		invalidBans.length === 0 && invalidMutes.length === 1 && invalidMutes[0] === G2,
+		JSON.stringify({ bans: invalidBans, mutes: invalidMutes }));
 
 	// ===== 20.7 手工 /ban 的号不会触发升级（台账是门槛） =====
 	// 手工加黑的号【没有】台账记录。若升级逻辑不加这道门槛，

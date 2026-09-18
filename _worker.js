@@ -281,6 +281,9 @@ export default {
 		// 关键词豁免的 D1 部分（/exempt 维护）。与动态群同理：必须在任何判定/学习之前刷新，
 		// 否则本次请求里 getAdExemptKeywords() 拿到的还是上一批词。
 		await refreshAdExemptKeywords(env);
+		// 误判放行库（/ignore 登记、/allowlist 维护）。同样必须在判定之前刷新，
+		// 否则主人刚 /allowlist del 掉的那条记录本次请求仍然生效。
+		await refreshAdAllowlist(env);
 
 		if (url.pathname === "/banlist" && url.searchParams.has('tgid') && url.searchParams.get('tgid') != '') {
 			const tgid = url.searchParams.get('tgid');
@@ -356,6 +359,7 @@ export default {
 		// 任务回执显示成功，但那些群实际没有执行封禁。
 		await mergeDynamicGroupsFromD1(env);
 		await refreshAdExemptKeywords(env);
+		await refreshAdAllowlist(env);
 
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
@@ -392,6 +396,7 @@ export default {
 		try {
 			await mergeDynamicGroupsFromD1(env);
 			await refreshAdExemptKeywords(env);
+			await refreshAdAllowlist(env);
 			const summary = await runAdBioRescan(env);
 			// 顺手清一次过期数据。原先只搭在 detectAdOnJoin 上，
 			// 没人入群的日子就不会剪枝；挂到 cron 上有个稳定节拍。
@@ -626,6 +631,7 @@ async function handleInitialization(request, env) {
 			{ command: "blacklist", description: "查看当前黑名单" },
 			{ command: "pending", description: "列出待复核快照" },
 			{ command: "ignore", description: "误判回滚" },
+			{ command: "allowlist", description: "误判放行库管理" },
 			{ command: "rescreen", description: "重新筛查可疑用户" },
 			{ command: "adstats", description: "指纹库统计" },
 			{ command: "words", description: "翻看指纹库" },
@@ -7687,6 +7693,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/pending [N]　列出待复核的自动判定快照，默认 10 条（最新在前）',
 			'/ignore 序号　判定错误：解黑 + 全群解封 + 删掉学到的指纹与 AI 样本',
 			'　　支持批量 /ignore 3 5 7 与区间 /ignore 3-8',
+			'　　同时把这条消息/昵称/@用户名/简介登记为「正常」，下次不再因此封禁',
+			'/allowlist [del 序号]　查看/撤销误判放行记录，按命中次数升序（0 命中的可清理）',
 			'/rescreen [N]　重新筛查观察窗口里的可疑用户，默认 10 人',
 			'/adstats　指纹库规模、分类占比、Top 命中、观察窗口与配置总览',
 			'',
@@ -8476,52 +8484,107 @@ async function sendTelegramMessage(chatId, text, replyMarkup, replyToMessageId =
 }
 
 // Telegram moderation helpers
-async function muteChatMember(chatId, userId) {
+// 全静音权限集。三处使用（新机器人入群静音 / 广告首次命中本群禁言 / 自助解封的兜底），
+// 必须共用一份 ——「同一个判断抄两份」在本项目已经踩过多次，
+// 权限位少抄一位就是一条静默漏放的通道（人还在群里，只是某个类型的消息能发）。
+const MUTE_CHAT_PERMISSIONS = {
+	can_send_messages: false,
+	can_send_audios: false,
+	can_send_documents: false,
+	can_send_photos: false,
+	can_send_videos: false,
+	can_send_video_notes: false,
+	can_send_voice_notes: false,
+	can_send_polls: false,
+	can_send_other_messages: false,
+	can_add_web_page_previews: false,
+	can_change_info: false,
+	can_invite_users: false,
+	can_pin_messages: false,
+	can_manage_topics: false
+};
+
+// 解除静音权限集。Telegram 文档明确支持「全部传 true 即解除该用户的全部限制」这种写法。
+// 【逐字写全，不用 Object.fromEntries 生成】这份载荷是安全敏感的：
+// 生成式写法一旦哪天有人在 MUTE 里加个字段而语义不是布尔，这里会静默变成 truthy。
+const UNMUTE_CHAT_PERMISSIONS = {
+	can_send_messages: true,
+	can_send_audios: true,
+	can_send_documents: true,
+	can_send_photos: true,
+	can_send_videos: true,
+	can_send_video_notes: true,
+	can_send_voice_notes: true,
+	can_send_polls: true,
+	can_send_other_messages: true,
+	can_add_web_page_previews: true,
+	can_change_info: true,
+	can_invite_users: true,
+	can_pin_messages: true,
+	can_manage_topics: true
+};
+
+// 单群禁言 / 解禁的唯一实现。返回与 banUserFromGroup 同构的结果对象（ok/error/attempts/retried），
+// 让上层「N/M 个群成功」的文案与失败原因收集逻辑可以原样复用，不必为禁言再写一套。
+//
+// 【为什么必须带 use_independent_chat_permissions】不带这个参数时，Telegram 只允许 bot
+// 「撤销默认权限」，不允许逐个授予 —— 也就是只能禁言、不能精确解禁。
+// 广告首次命中禁言之后，/ignore 必须能把人真正放开，所以这一位不能省。
+async function restrictUserInGroup(chatId, userId, options = {}) {
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/restrictChatMember`;
 	const body = {
 		chat_id: chatId,
 		user_id: Number(userId),
 		use_independent_chat_permissions: true,
-		permissions: {
-			can_send_messages: false,
-			can_send_audios: false,
-			can_send_documents: false,
-			can_send_photos: false,
-			can_send_videos: false,
-			can_send_video_notes: false,
-			can_send_voice_notes: false,
-			can_send_polls: false,
-			can_send_other_messages: false,
-			can_add_web_page_previews: false,
-			can_change_info: false,
-			can_invite_users: false,
-			can_pin_messages: false,
-			can_manage_topics: false
-		}
+		permissions: options.mute === false ? UNMUTE_CHAT_PERMISSIONS : MUTE_CHAT_PERMISSIONS
 	};
+	let lastFailure = null;
+	let attempts = 0;
 
-	const response = await fetch(url, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(body)
-	});
-
-	const result = await response.json();
-	logBotModeration('telegram-api:restrictChatMember:response', {
-		聊天ID: chatId,
-		用户ID: userId,
-		HTTP状态码: response.status,
-		是否成功: result.ok,
-		返回说明: result.description
-	});
-
-	if (!response.ok || !result.ok) {
-		throw new Error(`HTTP error! status: ${response.status}, body: ${JSON.stringify(result)}`);
+	for (let attempt = 1; attempt <= 2; attempt += 1) {
+		attempts = attempt;
+		try {
+			const response = await fetch(url, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(body)
+			});
+			const result = await response.json();
+			logBotModeration('telegram-api:restrictChatMember:response', {
+				聊天ID: chatId,
+				用户ID: userId,
+				动作: options.mute === false ? '解除禁言' : '禁言',
+				HTTP状态码: response.status,
+				是否成功: result.ok,
+				返回说明: result.description
+			});
+			if (response.ok && result?.ok) {
+				return { ok: true, attempts: attempt, retried: attempt > 1, userId };
+			}
+			lastFailure = {
+				ok: false,
+				error: result?.description || `HTTP ${response.status}`,
+				httpStatus: response.status,
+				errorCode: result?.error_code,
+				retryAfterSeconds: result?.parameters?.retry_after,
+				userId
+			};
+		} catch (error) {
+			lastFailure = { ok: false, error: error.message || String(error), networkError: true, userId };
+			console.error(`[restrictChatMember] chat=${chatId} user=${userId} attempt=${attempt} 异常:`, error);
+		}
 	}
+	return { ...lastFailure, attempts, retried: attempts > 1 };
+}
 
-	console.log(`Muted user ${userId} in chat ${chatId}, response: ${JSON.stringify(result)}`);
-
-	return result;
+async function muteChatMember(chatId, userId) {
+	const r = await restrictUserInGroup(chatId, userId);
+	// 保持原有的「失败即抛」契约：调用方（新机器人入群静音）是按异常处理失败的。
+	if (!r.ok) {
+		throw new Error(`HTTP error! status: ${r.httpStatus ?? 'network'}, body: ${r.error}`);
+	}
+	console.log(`Muted user ${userId} in chat ${chatId}`);
+	return r;
 }
 
 // 把用户踢出群（Telegram banChatMember API）
@@ -8798,40 +8861,22 @@ async function unbanUser(userId, groupId = GROUP_ID) {
 	};
 }
 
-// 解除用户禁言（恢复发言权限）
+// 解除用户禁言（恢复发言权限）。自助解封流程用。
+// 【2026-09-18 收敛到唯一实现】原来这里自己拼了一份 permissions，而且：
+//   · 用的是已废弃的 can_send_media_messages（Telegram 早已拆成 audios/photos/videos/...）；
+//   · 没带 use_independent_chat_permissions，等于只能撤销默认权限、无法逐个授予；
+//   · 与 muteChatMember 各写一份，权限位少一个就是一条静默漏放通道。
+// 现在一律走 restrictUserInGroup，语义与 Telegram 文档的「全 true 即解除限制」一致。
+// 注意这比旧载荷更宽松（旧的在 can_change_info / can_pin_messages 上留了 false）——
+// 但这两位对非管理员本来就不生效，且旧写法漏掉了 audios/photos/videos 等新拆分的权限位，
+// 真正的「解除」反而做不到。
 async function restrictUser(userId, groupId = GROUP_ID) {
-	const url = `https://api.telegram.org/bot${BOT_TOKEN}/restrictChatMember`;
-	const body = {
-		chat_id: groupId,
-		user_id: Number(userId),
-		permissions: {
-			can_send_messages: true,
-			can_send_media_messages: true,
-			can_send_polls: true,
-			can_send_other_messages: true,
-			can_add_web_page_previews: true,
-			can_change_info: false,
-			can_invite_users: true,
-			can_pin_messages: false
-		}
-	};
-
-	const response = await fetch(url, {
-		method: 'POST',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify(body)
-	});
-
-	const result = await response.json();
-
-	if (!response.ok) {
-		throw new Error(`HTTP error! status: ${response.status}, body: ${JSON.stringify(result)}`);
+	const r = await restrictUserInGroup(groupId, userId, { mute: false });
+	// 保持原有的「失败即抛」契约：自助解封的三处调用点都靠 catch 做兜底链。
+	if (!r.ok) {
+		throw new Error(`HTTP error! status: ${r.httpStatus ?? 'network'}, body: ${r.error}`);
 	}
-
-	// 添加调试日志
-	console.log(`执行 restrictUser，状态: ${response.status}, 响应: ${JSON.stringify(result)}`);
-
-	return result;
+	return r;
 }
 
 // 检查用户在群组中的状态
@@ -9624,6 +9669,223 @@ async function removeAdExemptKeyword(env, rawKeyword) {
 	}
 }
 
+// ===== 误判放行库（D1，2026-09-18 主人要求）=====
+// 主人的原话：「但是 ignore 是误判才会用，应该告诉 AI 这条消息或资料卡/用户名是正常的，
+// 不应该再次封禁」。在那之前 /ignore 只做【减法】—— 把学错的东西删掉（指纹、AI 样本、
+// 观察记录、封禁台账）；删完之后同一份素材再出现，检测链会把它当成全新输入从头判一遍，
+// 于是又被封一次。本段补的是【加法】：把误判过的素材记成负例，下次出现时该素材不再参与判定。
+//
+// 【与 ad_exempt_keywords 的区别，别混】
+//   · 豁免词 =「命中就减 3 分」，是【软减分】+【子串匹配】，仍在评分链里；
+//   · 放行库 =「该素材整条不再进入判定」，是【硬跳过】+【归一化后逐字相等】。
+//   一个治「词太敏感」，一个治「这条已经被人工证明是误判」。所以刻意不合并成一张表：
+//   合并会让 /exempt list 把「收二手手机」这种长句当关键词显示出来，两边的维护入口也会打架。
+//
+// 【放行的粒度是维度，不是整条消息】命中 text 只让正文失效，昵称/简介照旧参与判定。
+// 这样主人说「这个资料卡是正常的」时，同一个人后面真发广告正文仍会被封 ——
+// 整体跳过会把放行库变成万能免死金牌，那是拿一次误判换永久失明。
+const AD_ALLOWLIST_CACHE = new WeakMap();
+const AD_ALLOWLIST_CACHE_TTL_MS = 60000;
+// /allowlist list 的默认条数。
+const AD_ALLOWLIST_LIST_LIMIT = 50;
+// /allowlist del 单次最多删几个 id。
+const AD_ALLOWLIST_DELETE_MAX = 20;
+// 归一化后短于 2 个字符的素材不记 —— 单字符做精确匹配没有信息量，
+// 只会让某个常用字（「好」「嗯」）被永久放行。
+const AD_ALLOWLIST_MIN_LENGTH = 2;
+// 四个维度与 evaluateAdSuspect 里的 payload 字段一一对应。
+// 【加维度必须同时改 evaluateAdSuspect 的置空分支】，否则新维度只登记不生效。
+const AD_ALLOWLIST_DIMENSIONS = ['text', 'name', 'username', 'bio'];
+const AD_ALLOWLIST_DIMENSION_LABELS = {
+	text: '消息正文', name: '昵称', username: '@用户名', bio: '简介'
+};
+
+// 运行期放行键集合（已归一化，形如 'text:xxx'）。每请求由 refreshAdAllowlist 重建；
+// 空集合 = 没有放行记录，检测链零成本（matchAdAllowlist 首行就返回 null）。
+let AD_ALLOWLIST_DYNAMIC = new Set();
+
+// 归一化放行素材。剥 @ 前缀是必需的：payload.username 带 @（'@foo'），
+// 而主人手工 /allowlist add 时多半不带，两边不统一就会「加了不生效」。
+function normalizeAdAllowlistValue(raw) {
+	return normalizeAdFingerprintValue(String(raw ?? '').replace(/^@+/, ''));
+}
+
+// 放行键 = 维度 + ':' + 归一化值。维度前缀防「跨维度误放行」：
+// 昵称恰好等于某条被放行的正文时，不该因为正文被放行就连昵称一起放掉。
+function buildAdAllowlistKey(dimension, rawValue) {
+	if (!AD_ALLOWLIST_DIMENSIONS.includes(dimension)) return '';
+	const value = normalizeAdAllowlistValue(rawValue);
+	if (value.length < AD_ALLOWLIST_MIN_LENGTH) return '';
+	return dimension + ':' + value;
+}
+
+async function loadAdAllowlist(env) {
+	if (!env?.DB) return null;
+	try {
+		return await loadAdCachedValue(AD_ALLOWLIST_CACHE, env.DB, AD_ALLOWLIST_CACHE_TTL_MS, async () => {
+			if (!(await adDetectionReady(env))) return null;
+			const { results } = await env.DB.prepare('SELECT allow_key FROM ad_allowlist').all();
+			const set = new Set();
+			for (const row of results || []) {
+				const key = String(row?.allow_key || '');
+				if (key) set.add(key);
+			}
+			return set;
+		});
+	} catch (error) {
+		console.error('[广告检测] 读取误判放行库失败:', error);
+		return null;
+	}
+}
+
+// 每请求入口调用一次。读失败时【保留上一次的值】而不是清空 ——
+// 与 refreshAdExemptKeywords 同理：清空等于 D1 抖一下就把主人标过的误判全部忘掉，
+// 同一个人立刻会被再封一次，而这正是本功能要消灭的现象。
+async function refreshAdAllowlist(env) {
+	const set = await loadAdAllowlist(env);
+	if (set instanceof Set) AD_ALLOWLIST_DYNAMIC = set;
+}
+
+// 检测链第 0 层：这份载荷里有哪些维度已被放行。
+// 未命中路径【零 D1 查询】—— 纯内存 Set 查找；只有真正命中才回写命中计数。
+// 返回 null 表示一个维度都没命中（绝大多数消息走这条，成本可忽略）。
+function matchAdAllowlist(payload) {
+	const set = AD_ALLOWLIST_DYNAMIC;
+	if (!set || !set.size) return null;
+	const hit = {};
+	const keys = [];
+	for (const dimension of AD_ALLOWLIST_DIMENSIONS) {
+		const key = buildAdAllowlistKey(dimension, payload?.[dimension]);
+		if (!key) continue;
+		if (!set.has(key)) continue;
+		hit[dimension] = true;
+		keys.push(key);
+	}
+	return keys.length ? { hit, keys } : null;
+}
+
+// 命中计数回写。命中是【罕见事件】（只有被人工标过误判的素材再次出现才会走到这里），
+// 所以直接 await 一次 batch 是可接受的；未命中路径完全不碰 D1。
+// 计数的用途只有一个：让主人能在 /allowlist 里看出「这条记录还有没有在用」——
+// 长期 0 命中的就是可以删掉的残留。
+async function bumpAdAllowlistHits(env, keys) {
+	if (!env?.DB || !Array.isArray(keys) || !keys.length) return;
+	try {
+		const now = Math.floor(Date.now() / 1000);
+		await env.DB.batch(keys.map((key) => env.DB
+			.prepare('UPDATE ad_allowlist SET hit_count = hit_count + 1, last_hit_at = ? WHERE allow_key = ?')
+			.bind(now, key)));
+	} catch (error) {
+		// 计数失败绝不能影响判定结果 —— 放行已经生效，这里只是台账。
+		console.error('[广告检测] 放行库命中计数失败:', error);
+	}
+}
+
+async function addAdAllowlistEntry(env, dimension, rawValue, meta = {}) {
+	const key = buildAdAllowlistKey(dimension, rawValue);
+	if (!key) return { ok: false, reason: 'invalid', dimension };
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable', dimension };
+	const value = normalizeAdAllowlistValue(rawValue);
+	try {
+		const result = await env.DB.prepare(
+			'INSERT OR IGNORE INTO ad_allowlist (allow_key, dimension, value, user_id, added_by, source, hit_count, created_at, last_hit_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 0)'
+		).bind(
+			key, dimension, value,
+			String(meta.userId ?? ''), String(meta.addedBy ?? ''),
+			String(meta.source ?? 'manual'),
+			Math.floor(Date.now() / 1000)
+		).run();
+		// 【写入必须清缓存】loadAdCachedValue 会把空集合缓存 60 秒，不清的话
+		// 同一个请求里后续的判定仍然用着「还没有这条记录」的旧集合 ——
+		// 表现就是主人刚 /ignore 完，紧接着的判定照样封。与 addAdExemptKeyword 同款处理。
+		AD_ALLOWLIST_CACHE.delete(env.DB);
+		return { ok: true, key, dimension, value, added: Number(result?.meta?.changes || 0) > 0 };
+	} catch (error) {
+		console.error('[广告检测] 写入误判放行库失败:', error);
+		return { ok: false, reason: 'error', dimension };
+	}
+}
+
+// /ignore 的负例登记：把这次误判涉及的四个维度全部记下。
+// 四个都记是主人的原话「这条消息或资料卡/用户名是正常的」——他不想去分辨到底哪一项误伤了，
+// 所以一次全标；事后嫌哪条太宽，用 /allowlist del <id> 单独撤。
+async function allowlistAdPayload(env, payload, meta = {}) {
+	const added = [];
+	const skipped = [];
+	for (const dimension of AD_ALLOWLIST_DIMENSIONS) {
+		const raw = payload?.[dimension];
+		if (!String(raw ?? '').trim()) continue;
+		const result = await addAdAllowlistEntry(env, dimension, raw, meta);
+		if (result.ok) added.push({ dimension, value: result.value, added: result.added });
+		else skipped.push(dimension);
+	}
+	AD_ALLOWLIST_CACHE.delete(env?.DB);
+	await refreshAdAllowlist(env);
+	return { added, skipped };
+}
+
+async function listAdAllowlist(env, limit = AD_ALLOWLIST_LIST_LIMIT) {
+	if (!(await adDetectionReady(env))) return { ok: false, rows: [], total: 0, byDimension: {} };
+	try {
+		const totalRow = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_allowlist').first();
+		// 【排序即用途】hit_count 升序 —— 长期 0 命中的排在最前面，它们就是可以删的残留。
+		// 按创建时间倒序会把这些残留压在列表底部，主人永远翻不到。
+		const { results } = await env.DB.prepare(
+			'SELECT id, dimension, value, hit_count, created_at, last_hit_at FROM ad_allowlist ORDER BY hit_count ASC, id ASC LIMIT ?'
+		).bind(Math.max(1, Number(limit) || AD_ALLOWLIST_LIST_LIMIT)).all();
+		const dimRows = await env.DB.prepare('SELECT dimension, COUNT(*) AS c FROM ad_allowlist GROUP BY dimension').all();
+		const byDimension = {};
+		for (const row of dimRows?.results || []) byDimension[String(row.dimension)] = Number(row.c) || 0;
+		return {
+			ok: true,
+			rows: (results || []).map((row) => ({
+				id: Number(row.id) || 0,
+				dimension: String(row.dimension || ''),
+				value: String(row.value || ''),
+				hitCount: Number(row.hit_count) || 0,
+				createdAt: Number(row.created_at) || 0,
+				lastHitAt: Number(row.last_hit_at) || 0
+			})),
+			total: Number(totalRow?.c) || 0,
+			byDimension
+		};
+	} catch (error) {
+		console.error('[广告检测] 读取误判放行库失败:', error);
+		return { ok: false, rows: [], total: 0, byDimension: {} };
+	}
+}
+
+// 按 id 删除。删除后必须清缓存并重建 —— 否则本请求剩下的判定还用着旧集合，
+// 主人会看到「已删除」但那条记录其实还在生效。
+async function removeAdAllowlistByIds(env, ids) {
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable', removed: 0, rows: [] };
+	const list = [...new Set(ids.map((n) => Number(n)).filter((n) => Number.isInteger(n) && n > 0))];
+	if (!list.length) return { ok: false, reason: 'invalid', removed: 0, rows: [] };
+	try {
+		const placeholders = list.map(() => '?').join(', ');
+		const { results } = await env.DB.prepare(
+			'SELECT id, dimension, value FROM ad_allowlist WHERE id IN (' + placeholders + ')'
+		).bind(...list).all();
+		const result = await env.DB.prepare(
+			'DELETE FROM ad_allowlist WHERE id IN (' + placeholders + ')'
+		).bind(...list).run();
+		AD_ALLOWLIST_CACHE.delete(env.DB);
+		await refreshAdAllowlist(env);
+		return {
+			ok: true,
+			removed: Number(result?.meta?.changes || 0),
+			rows: (results || []).map((row) => ({
+				id: Number(row.id) || 0,
+				dimension: String(row.dimension || ''),
+				value: String(row.value || '')
+			}))
+		};
+	} catch (error) {
+		console.error('[广告检测] 删除误判放行记录失败:', error);
+		return { ok: false, reason: 'error', removed: 0, rows: [] };
+	}
+}
+
 // 回复学习触发词与否定词（第一主人普通回复即可标注广告）
 // 触发词一律要求成词。历史词表里的单字「封」、英文子串「ad」和「学习」都是裸子串匹配，
 // 会把「封面不错」「already done」「学习了」这类正常回复判成封禁指令，而 positive 分支是
@@ -9944,6 +10206,7 @@ async function d1AdDetectionTablesExist(env) {
 		'ad_sample_embeddings',
 		'ad_domain_whitelist',
 		'ad_exempt_keywords',
+		'ad_allowlist',
 		'ad_pending_snapshots',
 		'ad_confirm_tokens',
 		'ad_group_members',
@@ -9952,9 +10215,11 @@ async function d1AdDetectionTablesExist(env) {
 	]);
 }
 
-// 建立广告检测的 8 张 D1 表。范式与 ensureAdVoteTables 一致：
+// 建立广告检测所需的全部 D1 表。范式与 ensureAdVoteTables 一致：
 // promise 去重 → 核心表先行 → 逐条建表/建索引 → 存在性复验 → 失败删缓存并冷却 60 秒。
 // 冷却是为了避免 D1 抖动时每条消息都重试一次迁移，把子请求预算耗光。
+// 【刻意不写死张数】：早期注释写的是「8 张」，加到 11 张之后就成了错误信息，
+// 张数以 d1AdDetectionTablesExist 的清单为唯一真源。
 async function ensureAdDetectionTables(env) {
 	if (!env.DB) return false;
 	const cached = D1_AD_DETECTION_INIT_PROMISES.get(env.DB);
@@ -9977,6 +10242,15 @@ async function ensureAdDetectionTables(env) {
 			await runD1SchemaStatement(env, 'ad_domain_whitelist', 'CREATE TABLE IF NOT EXISTS ad_domain_whitelist (domain TEXT PRIMARY KEY, added_by TEXT, source TEXT, created_at INTEGER NOT NULL)');
 			// 关键词豁免的 D1 追加表（/exempt 维护）。与内置 AD_EXEMPT_KEYWORDS 合并使用。
 			await runD1SchemaStatement(env, 'ad_exempt_keywords', 'CREATE TABLE IF NOT EXISTS ad_exempt_keywords (keyword TEXT PRIMARY KEY, added_by TEXT, source TEXT, created_at INTEGER NOT NULL)');
+
+			// 误判放行库（/ignore 自动登记 + /allowlist 维护）。
+			// allow_key = 维度 + ':' + 归一化素材（如 'bio:收二手手机'），维度前缀防止跨维度误放行。
+			// 【刻意用 allow_key 而不是 key】：KEY 在 SQLite 里是关键字，虽然当列名能用
+			// （ad_scan_state 就这么写的），但 WHERE 子句里裸写 key 迟早有人读成语法错误。
+			// hit_count / last_hit_at 是「这条记录还有没有在用」的唯一凭据 ——
+			// 长期 0 命中的就是可以删掉的残留，所以计数必须落库，不能只放内存。
+			await runD1SchemaStatement(env, 'ad_allowlist', 'CREATE TABLE IF NOT EXISTS ad_allowlist (id INTEGER PRIMARY KEY AUTOINCREMENT, allow_key TEXT NOT NULL UNIQUE, dimension TEXT NOT NULL, value TEXT NOT NULL, user_id TEXT, added_by TEXT, source TEXT, hit_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_hit_at INTEGER NOT NULL DEFAULT 0)');
+			await runD1SchemaStatement(env, 'idx_ad_allowlist_dimension', 'CREATE INDEX IF NOT EXISTS idx_ad_allowlist_dimension ON ad_allowlist (dimension)', { optional: true });
 
 			await runD1SchemaStatement(env, 'ad_pending_snapshots', 'CREATE TABLE IF NOT EXISTS ad_pending_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT NOT NULL, chat_id TEXT, score INTEGER NOT NULL DEFAULT 0, reasons TEXT, snapshot TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_pending_owner_seq', 'CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_pending_owner_seq ON ad_pending_snapshots (owner_id, seq)', { optional: true });
@@ -12985,15 +13259,56 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	const config = options.config || loadAdDetectionConfig(env);
 	const whitelist = options.whitelist instanceof Set ? options.whitelist : await loadAdDomainWhitelist(env);
 
-	const profile = input?.profile || {};
-	const displayName = [profile.firstName, profile.lastName].filter(Boolean).join(' ').trim();
-	const text = String(input?.text ?? '').trim();
+	const rawProfile = input?.profile || {};
+	const rawDisplayName = [rawProfile.firstName, rawProfile.lastName].filter(Boolean).join(' ').trim();
+	const rawText = String(input?.text ?? '').trim();
 	// 引用体正文。调用方不传就是空串 —— cron 那一轨没有消息上下文，天然没有引用体。
-	const quotedText = String(input?.quotedText ?? '').trim();
+	const rawQuotedText = String(input?.quotedText ?? '').trim();
+	// username 在载荷与快照里都是带 @ 的形态（'@foo'），空则空串。抽出来是因为
+	// 载荷要用【放行后】的值、快照要用【原始】的值，两处各写一遍必然分叉。
+	const rawUsername = rawProfile.username ? '@' + String(rawProfile.username).replace(/^@/, '') : '';
+
+	// ===== 第 0 层：误判放行库 =====
+	// 必须排在所有评分 / 查杀之前。它的语义是「这份素材已被主人用 /ignore 证明是误判」，
+	// 让放行过的素材先进评分链再靠减分抵消，等于没放行 —— 指纹层与结构查杀都是
+	// 命中即封、根本不走减分。所以这里的做法是【把该维度从输入里拿掉】，而不是扣分。
+	//
+	// 【为什么不是整条短路】命中 text 只让正文失效，昵称/简介照旧参与判定。
+	// 整体跳过会把放行库变成万能免死金牌：一次误判就永久放过这个人发的一切内容。
+	const allowProbe = matchAdAllowlist({
+		text: rawText,
+		name: rawDisplayName,
+		username: rawUsername,
+		bio: rawProfile.bio
+	});
+	const allow = allowProbe ? allowProbe.hit : null;
+	if (allowProbe) await bumpAdAllowlistHits(env, allowProbe.keys);
+
+	const displayName = allow?.name ? '' : rawDisplayName;
+	const text = allow?.text ? '' : rawText;
+	// 正文被放行时引用体一并置空：quoted 通道的门槛之一是「本人正文近乎为空」，
+	// 把正文抹掉恰好会伪造出这个前提，等于凭空造出一条新的误封路径。
+	// 主人已经宣布「这条消息是正常的」，这条消息整体就不该再被任何通道定罪。
+	const quotedText = allow?.text ? '' : rawQuotedText;
+	const profile = allow
+		? {
+			...rawProfile,
+			firstName: allow.name ? '' : rawProfile.firstName,
+			lastName: allow.name ? '' : rawProfile.lastName,
+			username: allow.username ? '' : rawProfile.username,
+			bio: allow.bio ? '' : rawProfile.bio
+		}
+		: rawProfile;
 
 	// skipMissingBioPenalty 透传：调用方明确知道「这次没查 bio」时置真，
 	// 避免把「未知的 bio」当成「空的 bio」拿去减分。详见 scoreAdProfile 内该项的说明。
-	const profileResult = scoreAdProfile(profile, { whitelist, skipMissingBioPenalty: options.skipMissingBioPenalty === true });
+	// 【bio 被放行时也必须置真】：bio 被抹空之后在 scoreAdProfile 眼里与「没查 bio」
+	// 长得一模一样，不挡住就会因「名称无 emoji 且无 Bio」白扣 1 分 —— 方向虽然偏安全，
+	// 但那是拿一个假前提做的判据，且会让放行 bio 反而改变总分的口径。
+	const profileResult = scoreAdProfile(profile, {
+		whitelist,
+		skipMissingBioPenalty: options.skipMissingBioPenalty === true || allow?.bio === true
+	});
 	const textResult = text ? scoreAdMessageText(text, { whitelist }) : { score: 0, reasons: [], tradeHits: [], businessHits: [] };
 	const forwardResult = input?.forwardChat ? scoreAdForwardChat(input.forwardChat) : { score: 0, reasons: [], isAd: false };
 	// 上下文判据（极短正文 + 转发来源同现）。
@@ -13014,11 +13329,20 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		+ (forwardResult.isAd ? forwardResult.score : 0);
 	const reasons = [...profileResult.reasons, ...textResult.reasons, ...contextResult.reasons];
 	if (forwardResult.isAd) reasons.push(...forwardResult.reasons);
+	// 放行必须留痕。主人用 /pending 复核、或事后追问「这条为什么没封」时，
+	// 唯一能解释的就是这一行 —— 否则整条放行路径完全不可观测。
+	if (allow) {
+		const parts = AD_ALLOWLIST_DIMENSIONS.filter((d) => allow[d])
+			.map((d) => AD_ALLOWLIST_DIMENSION_LABELS[d] || d);
+		reasons.unshift('（误判放行库命中：' + parts.join('、') + ' —— 该素材已被 /ignore 标为正常，本次不参与判定）');
+	}
 	let layer = 'score';
 
+	// payload 一律用【放行后】的值：指纹库、AI 语义、四条结构查杀全部读它，
+	// 于是「置空维度」这一个动作就同时作用于全部下游，不必逐层加开关。
 	const payload = {
 		name: displayName,
-		username: profile.username ? '@' + String(profile.username).replace(/^@/, '') : '',
+		username: allow?.username ? '' : rawUsername,
 		bio: profile.bio || '',
 		text,
 		// 引用体正文（他引用/回复的那条别人的消息）。只喂给 quoted 通道做布尔判定，
@@ -13127,17 +13451,23 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		aiSimilarity: ai.similarity,
 		aiSample: ai.sample,
 		payload,
+		// allowlist：本次命中的放行维度（未命中为 null）。透传给处置端只为可观测 ——
+		// 快照与日志据此能看出「这条为什么得分这么低」。
+		allowlist: allow,
 		// bioChecked 区分「查过 bio 且为空」与「本次没查 bio」。
 		// 这两者在 snapshot.bio 里长得一模一样（都是空串），但对人的意义完全不同：
 		// 主人拿到通知要决定「放着不动」还是 /ignore 回滚，看到「简介为空」会以为已经核过了。
 		// 通知渲染据此写明「未查询」，避免误导。
 		bioChecked: options.skipMissingBioPenalty !== true,
+		// 【快照一律用原始素材，绝不用放行后的值】快照是主人复核与 /ignore 的依据：
+		// 存了被抹空的正文，/pending 就只剩一行空消息，主人根本看不出这条封得对不对；
+		// 而且 /ignore 会拿快照反推放行键，存空值等于把自己刚登记的记录又抹掉。
 		snapshot: {
-			name: displayName.slice(0, 120),
-			username: payload.username.slice(0, 40),
-			bio: String(profile.bio || '').slice(0, 200),
-			text: text.slice(0, 300),
-			status: String(profile.status || ''),
+			name: rawDisplayName.slice(0, 120),
+			username: rawUsername.slice(0, 40),
+			bio: String(rawProfile.bio || '').slice(0, 200),
+			text: rawText.slice(0, 300),
+			status: String(rawProfile.status || ''),
 			forwardTitle: String(input?.forwardChat?.title || '').slice(0, 120)
 		}
 	};
@@ -13148,10 +13478,23 @@ const AD_LAYER_LABELS = {
 	card: '资料卡查杀（用户名+简介）', body: '正文查杀（简介+正文）'
 };
 
+// 处置动作的文案。三个取值与 enforceAdDetection 里的 action 变量一一对应。
+// 【单独立表而不是在拼接处写三元表达式】文案要同时出现在通知、回执与日志三处，
+// 分散写必然分叉 —— 之前「仅封触发群」就是靠一处三元表达式撑着的。
+const AD_ACTION_LABELS = {
+	mute_single: '🔇 仅本群禁言：',
+	ban_single_fallback: '📌 仅本群封禁（禁言失败降级）：',
+	ban_global: '🌐 全群封禁：'
+};
+
 // 渲染推送给第一主人的判定通知。序号是 /ignore 的唯一入口。
 function renderAdDetectionNotice(evaluation, context) {
 	const lines = [];
-	lines.push('<b>🚫 广告号自动封禁</b>');
+	// 标题必须区分「禁言」与「封禁」：两者的后果差一个量级（一个留在群里、一个被踢出），
+	// 主人扫一眼通知就要能判断这条需不需要立刻处理。
+	lines.push(context?.action === 'mute_single'
+		? '<b>🔇 广告号自动禁言（仅本群，未踢出）</b>'
+		: '<b>🚫 广告号自动封禁</b>');
 	if (context?.seq) lines.push('快照序号：<b>#' + context.seq + '</b>');
 	lines.push('用户：<code>' + escapeHtml(String(context?.userId || '')) + '</code>');
 	if (evaluation.snapshot.name) lines.push('名称：' + escapeHtml(evaluation.snapshot.name));
@@ -13175,7 +13518,9 @@ function renderAdDetectionNotice(evaluation, context) {
 		lines.push('判定依据：');
 		for (const reason of evaluation.reasons.slice(0, 10)) lines.push('· ' + escapeHtml(String(reason)));
 	}
-	if (context?.banSummary) lines.push('封禁结果：' + escapeHtml(String(context.banSummary)));
+	// 标签用「处置结果」而不是「封禁结果」：首次命中现在只禁言，
+	// 继续叫封禁结果会让主人以为人被踢出去了。
+	if (context?.banSummary) lines.push('处置结果：' + escapeHtml(String(context.banSummary)));
 	if (context?.seq) {
 		lines.push('');
 		// 判定正确不给出口：指纹与 AI 样本已在 enforceAdDetection 里自动学入，
@@ -13356,6 +13701,28 @@ async function banUserFromSingleGroup(userId, chatId, options = {}) {
 	return results;
 }
 
+// 单群禁言。与 banUserFromSingleGroup 同构（返回同形状的结果数组），只是动作换成 restrictChatMember。
+// 【为什么首次命中用禁言而不是封禁】banChatMember 会把当事人【踢出群】，
+// 而 unbanChatMember 只解除封禁、并不会把人拉回群 —— 误判的代价是「这个人得自己重新进群」，
+// 对一个自动判定系统来说这个代价不对称。禁言则完全可逆：解除禁言，人一直在群里。
+async function muteUserFromSingleGroup(userId, chatId, options = {}) {
+	const results = [];
+	const memberProbe = options.probeMembership
+		? await probeTargetMemberBeforeBan(chatId, userId)
+		: null;
+	const r = await restrictUserInGroup(chatId, userId);
+	results.push({ groupId: String(chatId), userId: String(userId), ok: r.ok, error: r.error, retried: r.retried === true, memberProbe });
+	return results;
+}
+
+// 解除单群禁言。只给 /ignore 用 —— 首次命中现在只禁言不拉黑，
+// 少了这一步，/ignore 会报「已回滚」而那个人其实还在被禁言，误判根本没恢复。
+async function unmuteUserInGroup(userId, chatId) {
+	if (!chatId) return { ok: false, error: 'no_chat' };
+	const r = await restrictUserInGroup(chatId, userId, { mute: false });
+	return { ok: r.ok, error: r.error };
+}
+
 // 已黑用户在配置群里发言时的升级检查。
 //
 // 触发条件（三个都要满足）：
@@ -13368,6 +13735,13 @@ async function banUserFromSingleGroup(userId, chatId, options = {}) {
 // 它们的历史语义就是「管理员明确判定」，本来封的时候就已经走过全群封禁了。
 // 若不加这道门槛，任何一个被 /ban 的号在群里冒泡都会触发一次全群封禁风暴 ——
 // 那是纯粹的浪费，且会让主人收到一堆莫名其妙的升级通知。
+// 【2026-09-18 起本函数的触发面大幅收窄，但必须保留】首次命中改成本群禁言且【不拉黑】之后，
+// 首次判定的号不再进黑名单，也就不会走黑名单兜底拦截 → 本函数不再是主要升级路径。
+// 升级现在主要由正常检测链完成：他去别的群发广告 → detectAdOnMessage →
+// decideAdBanScope 读到台账 state='single' → reason='escalated' → enforceAdDetection 全群封禁。
+// 保留它的原因：① 升级前就已拉黑的历史台账行还要能被升级；
+//             ② 手工加黑的号虽然被台账门槛挡住，但那条拦截本身仍在跑，这里不能悬空。
+// 台账仍是升级的门槛（见下），手工 /ban 的号永远不会在这里被升级。
 async function maybeEscalateBlacklistedUser(message, env, userId, chatId) {
 	if (AD_BAN_SCOPE_MODE !== AD_BAN_SCOPE_PROGRESSIVE) return false;
 	const uid = String(userId || '');
@@ -13407,10 +13781,10 @@ async function maybeEscalateBlacklistedUser(message, env, userId, chatId) {
 		'',
 		'👤 账号：<code>' + escapeHtml(uid) + '</code>',
 		'📍 本次露头：' + escapeHtml(message?.chat?.title || cid) + '（<code>' + escapeHtml(cid) + '</code>）',
-		'📌 首次封禁：' + escapeHtml(ledger.firstChatTitle || ledger.firstChatId || '未知'),
+		'📌 首次处置群：' + escapeHtml(ledger.firstChatTitle || ledger.firstChatId || '未知'),
 		sameAsFirst ? '（同群再犯）' : '（换群投放）',
 		'',
-		'该号首次被判广告时仅封了触发群，现已确认在' + (sameAsFirst ? '原群继续投放' : '其他治理群活动') + '，',
+		'该号首次被判广告时只做了单群处置，现已确认在' + (sameAsFirst ? '原群继续投放' : '其他治理群活动') + '，',
 		'按渐进式封禁策略升级为<b>全群封禁</b>。',
 		'',
 		'封禁结果：' + escapeHtml(summary)
@@ -13440,37 +13814,61 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	if (evaluation.aiSimilarity > 0) noteParts.push('相似度 ' + evaluation.aiSimilarity.toFixed(3));
 	const note = noteParts.join(' | ').slice(0, 200);
 
-	let blacklistCode = 'SKIPPED';
-	try {
-		const added = await addToBlacklist(userId, env, { reason: 'ad_auto', by: 'system', note });
-		blacklistCode = String(added?.code || (added?.success ? 'ADDED' : 'ERROR'));
-	} catch (error) {
-		console.error('[广告检测] 加入黑名单失败:', error);
-		blacklistCode = 'ERROR';
+	// ===== 处置范围决策（AD_BAN_SCOPE_MODE）=====
+	// 必须在【任何副作用之前】决定：它同时决定「禁言还是封禁」与「拉不拉黑」两件事，
+	// 而且范围决策只在这里做一次 —— 它是唯一真源，任何调用点都不得自行判断。
+	const banScope = await decideAdBanScope(env, input, options);
+	// 双保险：single 模式必须真的有 chatId，否则绝不能去调 restrictChatMember(undefined)。
+	// decideAdBanScope 已在无 chatId 时回落 global，这里再判一次是因为
+	// 处置是【不可逆的外部动作】，宁可多写一行也不接受「拿 undefined 去动一个人」。
+	const singleScope = banScope.mode === 'single' && Boolean(input.chatId);
+
+	// ===== 黑名单 =====
+	// 【首次命中不再拉黑】2026-09-18 主人确认「首次只在本群禁言、不踢出不拉黑」。
+	// 拉黑会让「黑名单兜底拦截」在他去别的群发言时删消息并封那个群 ——
+	// 那等于绕开「再犯才升级」直接做了近似全群封禁，渐进式就白做了。
+	// 代价是首次命中少了黑名单这层安全网，所以下面【禁言失败必须退回封禁】。
+	let blacklistCode = singleScope ? 'SKIPPED_SINGLE_SCOPE' : 'SKIPPED';
+	if (!singleScope) {
+		try {
+			const added = await addToBlacklist(userId, env, { reason: 'ad_auto', by: 'system', note });
+			blacklistCode = String(added?.code || (added?.success ? 'ADDED' : 'ERROR'));
+		} catch (error) {
+			console.error('[广告检测] 加入黑名单失败:', error);
+			blacklistCode = 'ERROR';
+		}
 	}
 
-	// ===== 封禁范围决策（AD_BAN_SCOPE_MODE）=====
-	// 必须在封禁动作【之前】决定范围，且范围决策只在这里做一次 ——
-	// 它是「封当前群还是封全群」的唯一真源，任何调用点都不得自行判断。
-	const banScope = await decideAdBanScope(env, input, options);
-
+	// action 记录本次【实际执行】的动作，用于回执与通知文案。
+	// 三态：本群禁言（首次命中）/ 本群封禁（禁言失败的降级）/ 全群封禁。
+	let action = singleScope ? 'mute_single' : 'ban_global';
+	let fallbackNote = '';
 	let banResults = [];
 	try {
-		// 双保险：single 模式必须真的有 chatId，否则绝不能去调 banChatMember(undefined)。
-		// decideAdBanScope 已在无 chatId 时回落 global，这里再判一次是因为
-		// 封禁是【不可逆的外部动作】，宁可多写一行也不接受「拿 undefined 去封人」。
-		banResults = (banScope.mode === 'single' && input.chatId)
-			? await banUserFromSingleGroup(userId, input.chatId, { probeMembership: true, revokeMessages: true })
-			: await banUserFromAllGroups(userId, { probeMembership: true, revokeMessages: true });
+		if (singleScope) {
+			banResults = await muteUserFromSingleGroup(userId, input.chatId, { probeMembership: true });
+			if (!banResults.some((r) => r.ok)) {
+				// 【禁言失败必须退回封禁】不拉黑之后就没有黑名单兜底这层网了，
+				// 处置必须真正生效，否则广告号会留在群里继续刷。
+				// 只在权限 / 网络异常时才会走到，正常路径永远命中不到。
+				fallbackNote = '（禁言失败：'
+					+ banResults.map((r) => r.error || '未知').slice(0, 2).join('、')
+					+ '，已退回本群封禁）';
+				action = 'ban_single_fallback';
+				banResults = await banUserFromSingleGroup(userId, input.chatId, { probeMembership: true, revokeMessages: true });
+			}
+		} else {
+			banResults = await banUserFromAllGroups(userId, { probeMembership: true, revokeMessages: true });
+		}
 	} catch (error) {
-		console.error('[广告检测] 封禁失败:', error);
+		console.error('[广告检测] 处置失败:', error);
 	}
 	const okCount = banResults.filter((r) => r.ok).length;
 	const failedBans = banResults.filter((r) => !r.ok);
-	// 文案里必须写明范围。否则主人看到「1/1 个群成功」会以为是全群封禁时只成了一半，
-	// 而实际那是「按新策略只封了触发群」的正常结果。
-	let banSummary = (banScope.mode === 'single' ? '📌 仅封触发群：' : '🌐 全群封禁：')
-		+ okCount + '/' + banResults.length + ' 个群成功';
+	// 文案里必须写明范围【与动作】。否则主人看到「1/1 个群成功」会以为是全群封禁时只成了一半，
+	// 而实际那是「按新策略只在本群禁言」的正常结果；禁言与封禁的后果差别更大，更不能含混。
+	let banSummary = (AD_ACTION_LABELS[action] || AD_ACTION_LABELS.ban_global)
+		+ okCount + '/' + banResults.length + ' 个群成功' + fallbackNote;
 	if (failedBans.length) {
 		banSummary += '；失败群：' + failedBans.slice(0, 3)
 			.map((r) => r.groupId + '(' + (r.error || '未知') + ')')
@@ -13478,11 +13876,13 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	}
 
 	// ===== 台账写入 =====
-	// 两条路径互斥，且都【只在封禁动作已尝试之后】写：
+	// 两条路径互斥，且都【只在处置动作已尝试之后】写：
 	//   · 首次判定（mode=single）→ 落监控记录，供下次露头时升级
-	//   · 升级封禁（reason=escalated）→ 标 state='global'，防止重复升级
+	//   · 升级处置（reason=escalated）→ 标 state='global'，防止重复升级
 	// 刻意不处理 already_global / mode_global / no_chat_context / ledger_unavailable：
 	// 那四种情况要么不该产生记录，要么根本没有「首次群」可记。
+	// 【注意 mode=single 时不管实际是禁言还是降级封禁都要记】：
+	// 台账的语义是「这个号已经被判定过一次」，与本次动作强弱无关。
 	let scopeNote = '';
 	try {
 		if (banScope.mode === 'single') {
@@ -13493,7 +13893,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			// 直接走 already_global 而不重试全群封禁，等于升级被静默吞掉。
 			if (okCount > 0) {
 				await markAdBanScopeEscalated(env, userId, banSummary);
-				scopeNote = '｜已升级全群封禁（此前仅封 ' + (banScope.previous?.firstChatId || '?') + '）';
+				scopeNote = '｜已升级全群封禁（首次处置群 ' + (banScope.previous?.firstChatId || '?') + '）';
 			} else {
 				scopeNote = '｜升级封禁全部失败，保留监控状态待下次重试';
 			}
@@ -13582,6 +13982,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			userId,
 			chatTitle: input?.chatTitle || '',
 			seq,
+			action,
 			banSummary: banSummary + learnNote
 		});
 		try {
@@ -13595,7 +13996,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	console.log(
 		'[广告检测] 已处置 user=' + userId + ' chat=' + chatId
 		+ ' layer=' + evaluation.layer + ' score=' + evaluation.score
-		+ ' 黑名单=' + blacklistCode + ' 封禁=' + banSummary
+		+ ' 黑名单=' + blacklistCode + ' 处置=' + banSummary
 		+ ' 指纹=' + learned + ' AI样本=' + (sampleAdded ? 1 : 0)
 	);
 	return { banned: true, seq, blacklistCode, banSummary, learned, sampleAdded };
@@ -13990,10 +14391,12 @@ async function detectAdOnMessage(message, env) {
 }
 
 // === 命令层 ===
-// 10 条广告检测命令一律走这一个入口，handleMessage 里只挂一个钩子，
+// 广告检测管理命令一律走这一个入口，handleMessage 里只挂一个钩子，
 // 不改动任何既有命令分支。返回 true 表示命令已被处理，调用方应立即 return。
 // 【2026-09-08 从 11 条减为 10 条】confirm 已删除，见 handleAdIgnoreCommand 上方的说明。
-const AD_COMMAND_RE = /^\/(pending|ignore|addword|delword|words|addsample|clearsamples|adstats|whitelist|exempt|rescreen|warmup)(?:@[^\s]+)?(?:\s|$)/i;
+// 【2026-09-18 加 allowlist】/ignore 的负例登记需要一个人工出口，否则主人只能靠重建整条
+// 误判来撤销 —— 张数不写死在注释里，以本正则的分支为唯一真源。
+const AD_COMMAND_RE = /^\/(pending|ignore|allowlist|addword|delword|words|addsample|clearsamples|adstats|whitelist|exempt|rescreen|warmup)(?:@[^\s]+)?(?:\s|$)/i;
 
 // 快照 → 判定载荷。/ignore 标误判、删 AI 样本都要用同一份载荷，保证两边命中的集合一致。
 function adPayloadFromSnapshot(snapshot) {
@@ -14050,6 +14453,7 @@ async function handleAdDetectionCommands(message, env, ctx) {
 		switch (command) {
 			case 'pending': await handleAdPendingCommand(env, chatId, ownerId, arg); break;
 			case 'ignore': await handleAdIgnoreCommand(env, chatId, ownerId, arg); break;
+			case 'allowlist': await handleAdAllowlistCommand(env, chatId, ownerId, arg); break;
 			case 'addword': await handleAdAddWordCommand(env, chatId, ownerId, arg); break;
 			case 'delword': await handleAdDelWordCommand(env, chatId, ownerId, arg); break;
 			case 'words': await handleAdWordsCommand(env, chatId, arg); break;
@@ -14105,14 +14509,28 @@ async function handleAdPendingCommand(env, chatId, ownerId, arg) {
 // 即加 AI 样本，主人对判定正确的号【不需要任何操作】，只在误判时发 /ignore。
 // ⚠️ 与 ad_confirm_tokens 那张表无关，那是通用二次确认令牌机制，不要一起动。
 
-// 单条误判回滚：移出黑名单 → 全群解封 → 指纹记误报并即删 → 删掉对应 AI 样本 → 标记快照已复核。
+// 单条误判回滚：解除本群禁言 → 移出黑名单 → 全群解封 → 指纹记误报并即删
+// → 删掉对应 AI 样本 → 清观察记录 → 清渐进式封禁台账 → 【登记误判放行库】→ 标记快照已复核。
 // 抽出来给 /ignore 的单条与批量两种用法共用，保证两条路径的副作用完全一致。
+// 最后一步是 2026-09-18 加的：前六步都是「删掉学错的」，只有它回答
+// 「同一份素材再出现时怎么办」—— 不登记就仍会被当成全新输入重新判一遍、再封一次。
+// 第一步也是 2026-09-18 加的：首次命中改成本群禁言后，被禁言的人不在黑名单里，
+// 不解禁的话这条回滚链会「全部成功但误判没恢复」。
 async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	const targetId = snapshot.userId;
 	const removed = await removeFromBlacklist(targetId, env);
 	// 必须先确认黑名单已清（或本就不在），再解 Telegram 封禁，避免解完又被兜底拦截重新踢掉。
 	let unbanSummary = '未执行';
+	let muteSummary = '未执行';
 	if (removed.success || removed.code === 'NOT_FOUND') {
+		// 【首次命中改成本群禁言之后，这一步不能少】被禁言的人【不在黑名单里】，
+		// 少了它，/ignore 会报「已按误判回滚」而那个人其实还挂在本群禁言里，
+		// 误判根本没恢复 —— 而且他不在黑名单，主人用 /unban 也找不到他。
+		// 用快照里记的 chatId：那正是当初执行禁言的那个群。
+		const muteResult = await unmuteUserInGroup(targetId, snapshot.chatId);
+		muteSummary = muteResult.ok
+			? '已解除本群禁言'
+			: ('解除禁言失败（' + (muteResult.error || '未知') + '）');
 		const results = await unbanUserFromAllGroups(targetId);
 		const okCount = results.filter((r) => r.ok).length;
 		unbanSummary = okCount + '/' + results.length + ' 个群成功';
@@ -14134,8 +14552,15 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	// 同一并清掉渐进式封禁台账。留着它会让这个号下次被判定时【直接升级全群封禁】，
 	// 而它已被主人证明是误判 —— 等于一次误判永久提高了它后续的处置强度。
 	await deleteAdBanScope(env, targetId);
+	// 【本函数唯一一处「加法」】上面五步全是减法（把学错的东西删掉），
+	// 删完之后同一份素材再出现仍会被从头判一遍、再封一次 —— 那正是主人这次指出的缺口：
+	// 「ignore 是误判才会用，应该告诉 AI 这条消息或资料卡/用户名是正常的，不应该再次封禁」。
+	// 所以这里把这次误判涉及的四个维度登记进放行库，让它们【退出判定】而不是「减分」。
+	const allowlisted = await allowlistAdPayload(env, payload, {
+		userId: targetId, addedBy: ownerId, source: 'ignore'
+	});
 	await deleteAdPendingSnapshot(env, ownerId, seq);
-	return { targetId, removed, unbanSummary, fp, sampleRemoved };
+	return { targetId, removed, unbanSummary, muteSummary, fp, sampleRemoved, allowlisted };
 }
 
 // /ignore 单次最多处理多少个序号。
@@ -14212,12 +14637,23 @@ async function handleAdIgnoreCommand(env, chatId, ownerId, arg) {
 		const sampleNote = r.sampleRemoved.ok
 			? (r.sampleRemoved.removed > 0 ? 'AI 样本 已删 ' + r.sampleRemoved.removed : 'AI 样本 无对应')
 			: 'AI 样本 删除失败';
+		const allowNote = '放行 ' + (r.allowlisted?.added?.length || 0) + ' 项';
 		if (single) {
 			lines.push('用户：<code>' + escapeHtml(r.targetId) + '</code>');
 			lines.push('黑名单：' + (r.removed.success ? '已移除' : (r.removed.code === 'NOT_FOUND' ? '本就不在黑名单' : '移除失败')));
 			lines.push('解封：' + escapeHtml(r.unbanSummary));
+			// 禁言与封禁是两套状态，回执必须分别报 —— 只报「解封 3/3 个群成功」
+			// 会让主人以为误判已经彻底恢复，而人可能还挂在本群禁言里。
+			lines.push('解禁：' + escapeHtml(r.muteSummary));
 			lines.push('指纹修正：' + (r.fp.ok ? '已标记 <b>' + (r.fp.affected || 0) + '</b> 条误判，删除 <b>' + (r.fp.retired || 0) + '</b> 条' : '标记失败'));
 			lines.push('AI 样本：' + (r.sampleRemoved.ok ? (r.sampleRemoved.removed > 0 ? '已删除 <b>' + r.sampleRemoved.removed + '</b> 条' : '无对应样本') : '删除失败'));
+			// 放行库是本命令唯一「加法」副作用，必须写清楚登记了哪几项 ——
+			// 它是「同一份素材不会再被封」的全部依据，主人事后要撤也只能靠这条回执找到入口。
+			lines.push('误判放行：' + (r.allowlisted?.added?.length
+				? '已登记 <b>' + r.allowlisted.added.length + '</b> 项（'
+					+ r.allowlisted.added.map((a) => escapeHtml(AD_ALLOWLIST_DIMENSION_LABELS[a.dimension] || a.dimension)).join('、')
+					+ '），这些素材不再参与判定'
+				: '无可登记素材'));
 			if (r.fp.ok && r.fp.affected > 0 && Array.isArray(r.fp.rows)) {
 				lines.push('');
 				lines.push('受影响指纹：');
@@ -14225,16 +14661,107 @@ async function handleAdIgnoreCommand(env, chatId, ownerId, arg) {
 			}
 		} else {
 			lines.push('<b>#' + seq + '</b>　<code>' + escapeHtml(r.targetId) + '</code>　解封 '
-				+ escapeHtml(r.unbanSummary) + '　' + fpNote + '　' + sampleNote);
+				+ escapeHtml(r.unbanSummary) + '　' + escapeHtml(r.muteSummary)
+				+ '　' + fpNote + '　' + sampleNote + '　' + allowNote);
 		}
 	}
 	const header = single
-		? ['<b>♻️ 已按误判回滚</b>', '序号：<b>#' + parsed.seqs[0] + '</b>']
+		? ['<b>♻️ 已按误判回滚</b>', '序号：<b>#' + parsed.seqs[0] + '</b>',
+			'撤销放行：<code>/allowlist</code> 查看序号，<code>/allowlist del 序号</code> 撤掉某条']
 		: ['<b>♻️ 批量误判回滚</b>', '已回滚 <b>' + rolled + '</b> 个，跳过 <b>' + missed + '</b> 个', ''];
 	if (parsed.truncated) {
 		header.push('⚠️ 序号超过单次上限 ' + AD_IGNORE_BATCH_MAX + ' 个，只处理了前 ' + parsed.seqs.length + ' 个，其余请再发一次。');
 	}
 	await sendTelegramMessageChunks(chatId, header.concat(lines).join('\n'));
+}
+
+// /allowlist [list|del 序号...]：误判放行库的查看与撤销。
+// 为什么必须有这个出口：/ignore 现在会自动把误判素材登记成负例（永久生效），
+// 没有撤销入口的话，一次手滑的 /ignore 就等于给那个号的资料卡发了永久免死金牌，
+// 而主人手上没有任何办法收回来 —— 只能靠改 D1。这个命令就是那个回收开关。
+// 【为什么不给 add】：手工加放行等于绕过「误判」这个前提，想做减分请用 /exempt，
+// 想整条放行只能先发生一次误判（/ignore），这样放行库里每一条都能追溯到具体判定。
+async function handleAdAllowlistCommand(env, chatId, ownerId, arg) {
+	const tokens = String(arg ?? '').trim().split(/[\s,，、]+/).filter(Boolean);
+	const action = (tokens[0] || 'list').toLowerCase();
+	const targets = tokens.slice(1);
+
+	if (action === 'del' || action === 'delete' || action === 'rm') {
+		if (!targets.length) {
+			await sendTelegramMessage(chatId, '用法：<code>/allowlist del 12</code>　可一次删多个：<code>/allowlist del 12 13</code>');
+			return;
+		}
+		if (!targets.every((t) => /^\d{1,9}$/.test(t))) {
+			await sendTelegramMessage(chatId, '❌ 序号只能是数字。用法：<code>/allowlist del 12</code>');
+			return;
+		}
+		if (targets.length > AD_ALLOWLIST_DELETE_MAX) {
+			await sendTelegramMessage(chatId, '❌ 单次最多删 ' + AD_ALLOWLIST_DELETE_MAX + ' 条，请分批发。');
+			return;
+		}
+		const result = await removeAdAllowlistByIds(env, targets.map((t) => parseInt(t, 10)));
+		if (!result.ok) {
+			await sendTelegramMessage(chatId, '❌ 删除失败：' + escapeHtml(String(result.reason || 'error')));
+			return;
+		}
+		if (!result.removed) {
+			await sendTelegramMessage(chatId, '⚠️ 没有删到任何记录（序号可能已不存在）。用 <code>/allowlist</code> 看当前序号。');
+			return;
+		}
+		const lines = ['<b>🗑 已删除 ' + result.removed + ' 条放行记录</b>', ''];
+		for (const row of result.rows) {
+			lines.push('· <code>#' + row.id + '</code>　[' + escapeHtml(AD_ALLOWLIST_DIMENSION_LABELS[row.dimension] || row.dimension)
+				+ '] ' + escapeHtml(row.value.slice(0, 40)));
+		}
+		lines.push('');
+		lines.push('这些素材从下一次判定起重新参与检测。');
+		await sendTelegramMessageChunks(chatId, lines.join('\n'));
+		return;
+	}
+
+	if (action !== 'list') {
+		await sendTelegramMessage(chatId, [
+			'用法：<code>/allowlist</code>　查看',
+			'　　　<code>/allowlist del 12</code>　删除（可一次多个）'
+		].join('\n'));
+		return;
+	}
+
+	const result = await listAdAllowlist(env);
+	if (!result.ok) {
+		await sendTelegramMessage(chatId, '❌ 读取放行库失败。');
+		return;
+	}
+	const dimSummary = AD_ALLOWLIST_DIMENSIONS
+		.filter((d) => result.byDimension[d])
+		.map((d) => (AD_ALLOWLIST_DIMENSION_LABELS[d] || d) + ' ' + result.byDimension[d])
+		.join('　');
+	const lines = [
+		'<b>🟢 误判放行库</b>',
+		'生效 <b>' + result.total + '</b> 条' + (dimSummary ? '（' + dimSummary + '）' : ''),
+		'命中即让<b>该维度退出判定</b>（不是减分，也不会整条放行）',
+		''
+	];
+	if (!result.rows.length) {
+		lines.push('当前没有放行记录。');
+		lines.push('');
+		lines.push('用 /ignore 回滚误判时会自动登记，这里就能看到并撤销。');
+		await sendTelegramMessageChunks(chatId, lines.join('\n'));
+		return;
+	}
+	for (const row of result.rows) {
+		const last = row.lastHitAt ? new Date(row.lastHitAt * 1000).toISOString().slice(0, 10) : '从未';
+		lines.push('<code>#' + row.id + '</code>　[' + escapeHtml(AD_ALLOWLIST_DIMENSION_LABELS[row.dimension] || row.dimension)
+			+ '] ' + escapeHtml(row.value.slice(0, 40))
+			+ '　命中 <b>' + row.hitCount + '</b> 次（最近 ' + last + '）');
+	}
+	lines.push('');
+	if (result.total > result.rows.length) {
+		lines.push('共 ' + result.total + ' 条，显示前 ' + result.rows.length + ' 条（命中次数少的在前）。');
+	}
+	lines.push('排序按命中次数升序：<b>长期 0 命中</b>的就是可以删掉的残留。');
+	lines.push('删除：<code>/allowlist del 序号</code>');
+	await sendTelegramMessageChunks(chatId, lines.join('\n'));
 }
 
 // /addword <值> [类型]：手动加指纹。类型缺省按值形态推断（@ → username，域名 → domain，其余 keyword）。

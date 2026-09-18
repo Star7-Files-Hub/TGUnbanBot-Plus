@@ -171,17 +171,21 @@ function joinMessage(members) {
 function report(label, env, userId) {
 	const black = env.DB.query('SELECT id FROM blacklist WHERE id = ?', String(userId));
 	const banned = calls.filter((c) => c.method === 'banChatMember' && String(c.body?.user_id) === String(userId)).length;
+	// 首次命中改成【本群禁言】之后，「处置生效了吗」不再能靠 banChatMember 计数回答 ——
+	// 必须单独数 restrictChatMember。否则断言会从「没处置」的角度误报成「完全放行」。
+	const muted = calls.filter((c) => c.method === 'restrictChatMember' && String(c.body?.user_id) === String(userId)).length;
 	const obs = env.DB.query('SELECT score, layer, reasons FROM ad_user_screening WHERE user_id = ?', String(userId));
 	const notice = calls.filter((c) => c.method === 'sendMessage').map((c) => String(c.body?.text || '')).join('\n');
 	const scoreLine = notice.match(/得分：<b>(\d+)<\/b> \/ 阈值 (\d+)/);
 	const reasonLines = notice.split('\n').filter((l) => l.startsWith('· '));
 	console.log('\n===== ' + label + ' =====');
 	console.log('  加黑名单     : ' + (black.length ? '是' : '否'));
-	console.log('  调用封禁接口 : ' + banned + ' 次');
+	console.log('  调用封禁接口 : ' + banned + ' 次（全群封禁）');
+	console.log('  调用禁言接口 : ' + muted + ' 次（首次命中·仅本群）');
 	console.log('  观察窗口记录 : ' + (obs.length ? JSON.stringify(obs[0]) : '无'));
 	console.log('  通知里的得分 : ' + (scoreLine ? scoreLine[1] + ' / 阈值 ' + scoreLine[2] : '（未发通知）'));
 	if (reasonLines.length) { console.log('  判定依据     :'); for (const r of reasonLines) console.log('    ' + r.replace(/<\/?[a-z]+>/g, '')); }
-	return { blacklisted: black.length > 0, banned, observed: obs[0] || null, score: scoreLine ? Number(scoreLine[1]) : null };
+	return { blacklisted: black.length > 0, banned, muted, observed: obs[0] || null, score: scoreLine ? Number(scoreLine[1]) : null };
 }
 
 // ---------- 判定与计数 ----------
@@ -207,8 +211,8 @@ function verdict(name, ok, passText, failText) {
 	memberStatus = { [String(uid)]: 'restricted' };
 	await sendUpdate(groupMessage({ id: uid, first_name: 'My fuhrer', username: 'suqi_20' }, '有人在吗'), env);
 	const r = report('场景 1 · 误封样本（正常用户 + 本群被禁言）', env, uid);
-	const ok = !r.blacklisted && r.banned === 0;
-	verdict('场景 1 · 误封回归（正常用户 + 本群被禁言）', ok, '通过：未加黑、未封禁', '失败：仍被处置');
+	const ok = !r.blacklisted && r.banned === 0 && r.muted === 0;
+	verdict('场景 1 · 误封回归（正常用户 + 本群被禁言）', ok, '通过：未加黑、未封禁、未禁言', '失败：仍被处置');
 }
 
 // ============================================================
@@ -248,8 +252,8 @@ function verdict(name, ok, passText, failText) {
 		} }
 	), env);
 	const r = report('场景 2 · 漏放样本（单字母正文 + 引用体广告 · external_reply）', env, uid);
-	const ok = r.blacklisted && r.banned > 0;
-	verdict('场景 2 · 漏放回归（单字母正文 + 引用体广告）', ok, '通过：已加黑并封禁，得分 ' + r.score, '失败：仍被放行');
+	const ok = r.muted > 0 && !r.blacklisted;
+	verdict('场景 2 · 漏放回归（单字母正文 + 引用体广告）', ok, '通过：已本群禁言（未拉黑），得分 ' + r.score, '失败：仍被放行');
 }
 
 // ============================================================
@@ -275,8 +279,8 @@ function verdict(name, ok, passText, failText) {
 		} }
 	), env);
 	const r = report('场景 2b · 引用广告来举报的群友（正文「广告」）', env, uid);
-	const ok = !r.blacklisted && r.banned === 0;
-	verdict('场景 2b · 引用体门槛二（举报语义放行）', ok, '通过：未加黑、未封禁', '失败：举报的人被误封了');
+	const ok = !r.blacklisted && r.banned === 0 && r.muted === 0;
+	verdict('场景 2b · 引用体门槛二（举报语义放行）', ok, '通过：未加黑、未封禁、未禁言', '失败：举报的人被误封了');
 }
 
 // ============================================================
@@ -301,8 +305,8 @@ function verdict(name, ok, passText, failText) {
 		} }
 	), env);
 	const r = report('场景 2c · 正文写了正常话（6 字，无举报词）', env, uid);
-	const ok = !r.blacklisted && r.banned === 0;
-	verdict('场景 2c · 引用体门槛一（正文非空即放行）', ok, '通过：未加黑、未封禁', '失败：门槛一失效');
+	const ok = !r.blacklisted && r.banned === 0 && r.muted === 0;
+	verdict('场景 2c · 引用体门槛一（正文非空即放行）', ok, '通过：未加黑、未封禁、未禁言', '失败：门槛一失效');
 }
 
 // ============================================================
@@ -328,8 +332,8 @@ function verdict(name, ok, passText, failText) {
 		} }
 	), env);
 	const r = report('场景 2d · 引用体广告（reply_to_message 形态）', env, uid);
-	const ok = r.blacklisted && r.banned > 0;
-	verdict('场景 2d · 引用体三字段覆盖（reply_to_message）', ok, '通过：已加黑并封禁，得分 ' + r.score, '失败：这个字段没读到');
+	const ok = r.muted > 0 && !r.blacklisted;
+	verdict('场景 2d · 引用体三字段覆盖（reply_to_message）', ok, '通过：已本群禁言（未拉黑），得分 ' + r.score, '失败：这个字段没读到');
 }
 
 // ============================================================
@@ -352,8 +356,8 @@ function verdict(name, ok, passText, failText) {
 		{ quote: { text: '出租虚拟币行情机器人，附 vless 节点订阅教程', position: 0, is_manual: true } }
 	), env);
 	const r = report('场景 2e · 引用体是技术贴（quote 片段 + 豁免词）', env, uid);
-	const ok = !r.blacklisted && r.banned === 0;
-	verdict('场景 2e · 引用体技术豁免（无强动词则放行）', ok, '通过：未加黑、未封禁', '失败：技术贴被引用就定罪了');
+	const ok = !r.blacklisted && r.banned === 0 && r.muted === 0;
+	verdict('场景 2e · 引用体技术豁免（无强动词则放行）', ok, '通过：未加黑、未封禁、未禁言', '失败：技术贴被引用就定罪了');
 }
 
 {
@@ -370,8 +374,8 @@ function verdict(name, ok, passText, failText) {
 		{ quote: { text: '收购虚拟币账号，USDT 秒结，vless 节点也收', position: 0, is_manual: true } }
 	), env);
 	const r = report('场景 2e 对照 · 夹带术语的引用体广告（有强动词）', env, uid);
-	const ok = r.blacklisted && r.banned > 0;
-	verdict('场景 2e 对照 · 有强动词则不免死（quote 片段）', ok, '通过：已加黑并封禁，得分 ' + r.score, '失败：塞几个术语就溜过去了');
+	const ok = r.muted > 0 && !r.blacklisted;
+	verdict('场景 2e 对照 · 有强动词则不免死（quote 片段）', ok, '通过：已本群禁言（未拉黑），得分 ' + r.score, '失败：塞几个术语就溜过去了');
 }
 
 // ============================================================
@@ -386,8 +390,8 @@ function verdict(name, ok, passText, failText) {
 	memberStatus = { [String(uid)]: 'member' };
 	await sendUpdate(groupMessage({ id: uid, first_name: '💚高价收网赚号💚' }, '收U秒结 私聊我'), env);
 	const r = report('场景 3 · 真广告（不回退验证）', env, uid);
-	const ok = r.blacklisted || r.observed;
-	verdict('场景 3 · 真广告不回退', ok, '通过：' + (r.blacklisted ? '已封禁，得分 ' + r.score : '进入观察窗口 ' + JSON.stringify(r.observed)), '失败：完全放行');
+	const ok = r.muted > 0 || r.blacklisted || r.observed;
+	verdict('场景 3 · 真广告不回退', ok, '通过：' + (r.muted > 0 ? '已本群禁言，得分 ' + r.score : (r.blacklisted ? '已封禁，得分 ' + r.score : '进入观察窗口 ' + JSON.stringify(r.observed))), '失败：完全放行');
 }
 
 // ============================================================
@@ -403,7 +407,7 @@ function verdict(name, ok, passText, failText) {
 	const r = report('场景 4 · 正常技术讨论（拉资料但放行）', env, uid);
 	const getChatCalls = calls.filter((c) => c.method === 'getChat').length;
 	console.log('  getChat 调用   : ' + getChatCalls + ' 次（预筛已移除，应为 1）');
-	const ok = !r.blacklisted && r.banned === 0 && !r.observed && getChatCalls === 1;
+	const ok = !r.blacklisted && r.banned === 0 && r.muted === 0 && !r.observed && getChatCalls === 1;
 	verdict('场景 4 · 正常技术讨论拉了资料仍放行', ok, '通过：拉了资料仍放行', '失败');
 }
 
@@ -484,8 +488,8 @@ function verdict(name, ok, passText, failText) {
 	const r = report('场景 7 · 闸二（昵称/正文全干净，广告只在 bio）', env, uid);
 	const getChatCalls = calls.filter((c) => c.method === 'getChat' && String(c.body?.chat_id) === String(uid)).length;
 	console.log('  getChat 调用 : ' + getChatCalls + ' 次（应为 1 —— 闸二每人一次的那一次）');
-	const ok = r.blacklisted && r.banned > 0 && getChatCalls === 1;
-	verdict('场景 7 · 闸二（广告只在 bio）', ok, '通过：只凭 bio 定罪，且只花 1 个请求', '失败：bio 广告被放过');
+	const ok = r.muted > 0 && !r.blacklisted && getChatCalls === 1;
+	verdict('场景 7 · 闸二（广告只在 bio）', ok, '通过：只凭 bio 定罪并本群禁言，且只花 1 个请求', '失败：bio 广告被放过');
 }
 
 // ============================================================
@@ -553,9 +557,9 @@ function verdict(name, ok, passText, failText) {
 	const r = report('场景 9 · 入群检测（chat_member 路径，自己点链接进群）', env, uid);
 	const getChatCalls = calls.filter((c) => c.method === 'getChat' && String(c.body?.chat_id) === String(uid)).length;
 	console.log('  getChat 调用 : ' + getChatCalls + ' 次（应为 1 —— 入群当场拉一次资料）');
-	const ok = r.blacklisted && r.banned > 0 && getChatCalls === 1;
+	const ok = r.muted > 0 && !r.blacklisted && getChatCalls === 1;
 	verdict('场景 9 · 入群检测（chat_member 路径）', ok,
-		'通过：自己点链接进群也被当场查 bio 并封禁', '失败：chat_member 路径仍然放过 bio 广告');
+		'通过：自己点链接进群也被当场查 bio 并本群禁言', '失败：chat_member 路径仍然放过 bio 广告');
 }
 
 // ============================================================
@@ -577,9 +581,9 @@ function verdict(name, ok, passText, failText) {
 	memberStatus = {};
 	await sendUpdate(joinMessage([{ id: uid, first_name: '客服小王', username: 'kf_shop_x' }]), env);
 	const r = report('场景 10 · 入群检测（new_chat_members 路径，被拉进群）', env, uid);
-	const ok = r.blacklisted && r.banned > 0;
+	const ok = r.muted > 0 && !r.blacklisted;
 	verdict('场景 10 · 入群检测（new_chat_members 路径）', ok,
-		'通过：抽成 screenAdJoinMember 后原路径仍生效', '失败：原入群检测被改坏了');
+		'通过：抽成 screenAdJoinMember 后原路径仍生效（首次只本群禁言）', '失败：原入群检测被改坏了');
 }
 
 // ============================================================
