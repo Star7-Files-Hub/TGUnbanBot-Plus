@@ -107,8 +107,20 @@ vm.runInContext(stripExportDefault(src), sandbox, { filename: '_worker.js' });
 const handler = sandbox.__handler;
 
 const GROUP_ID = '-1001111111111';
+// 【为什么必须另设一个主群】2026-09-19 起「主群」（= SELF_UNBAN_CONTACT_GROUP，默认 GROUP_IDS[0]）
+// 被排除在所有【自动】处置之外 —— 它是被全群封禁 + 拉黑后唯一还能联系到主人的通道，
+// 自动判定（可能误判）不能把它堵死（见 _worker.js 的 isSelfUnbanContactGroup）。
+// 若测试沿用「唯一治理群就是主群」的老夹具，GROUP_ID 会同时是治理群和主群，
+// 于是所有自动处置都被豁免，测出来的不是产品行为而是夹具的漏洞。
+// 所以这里把主群另设成一个不参与治理的群，治理群仍是 GROUP_ID 且仍是列表第一项。
+const CONTACT_GROUP_ID = '-1009999999999';
 function makeEnv() {
-	return { TOKEN: 'TESTTOKEN', BOT_TOKEN: '123456:fake', GROUP_ID, OWNER_IDS: '10001', DB: makeD1() };
+	return {
+		TOKEN: 'TESTTOKEN', BOT_TOKEN: '123456:fake',
+		GROUP_ID: GROUP_ID + ',' + CONTACT_GROUP_ID,
+		SELF_UNBAN_CONTACT_GROUP: CONTACT_GROUP_ID,
+		OWNER_IDS: '10001', DB: makeD1()
+	};
 }
 
 async function sendUpdate(message, env) {
@@ -180,8 +192,10 @@ function report(label, env, userId) {
 	const reasonLines = notice.split('\n').filter((l) => l.startsWith('· '));
 	console.log('\n===== ' + label + ' =====');
 	console.log('  加黑名单     : ' + (black.length ? '是' : '否'));
-	console.log('  调用封禁接口 : ' + banned + ' 次（全群封禁）');
-	console.log('  调用禁言接口 : ' + muted + ' 次（首次命中·仅本群）');
+	console.log('  调用封禁接口 : ' + banned + ' 次（banChatMember）');
+	// 【2026-09-19 起 cron 轨道也走渐进式】首次命中是「全群禁言」而不是封禁，
+	// 所以这两个计数都要看：只看 banChatMember 会把「按新策略禁言」误报成「没处置」。
+	console.log('  调用禁言接口 : ' + muted + ' 次（restrictChatMember）');
 	console.log('  观察窗口记录 : ' + (obs.length ? JSON.stringify(obs[0]) : '无'));
 	console.log('  通知里的得分 : ' + (scoreLine ? scoreLine[1] + ' / 阈值 ' + scoreLine[2] : '（未发通知）'));
 	if (reasonLines.length) { console.log('  判定依据     :'); for (const r of reasonLines) console.log('    ' + r.replace(/<\/?[a-z]+>/g, '')); }
@@ -530,8 +544,13 @@ function verdict(name, ok, passText, failText) {
 	console.log('  首次发言是否过检 : ' + (passedFirst ? '是（符合预期，干净资料）' : '否'));
 	console.log('  名册留痕         : ' + (roster.length ? JSON.stringify(roster[0]) : '无（闸三就没有扫描源了）'));
 	console.log('  扫描结果         : ' + JSON.stringify(summary));
-	const ok = passedFirst && roster.length === 1 && r.blacklisted && r.banned > 0 && summary.banned >= 1;
-	verdict('场景 8 · 闸三（发言后改 bio 且不再发言）', ok, '通过：cron 抓住了事后改 bio 的逃逸', '失败');
+	// 【2026-09-19 起 cron 轨道也走渐进式】首次命中是「全群禁言」：不拉黑、不封禁，
+	// 只 restrictChatMember。断言必须跟着改 —— 继续断言「被拉黑 + 调了 banChatMember」
+	// 会把「按新策略全群禁言」误报成失败。
+	// summary.banned 是 runAdBioRescan 的历史字段名，语义是「本轮处置了几个」，
+	// 在渐进式下它不再等于「封禁了几个」。
+	const ok = passedFirst && roster.length === 1 && !r.blacklisted && r.banned === 0 && r.muted > 0 && summary.banned >= 1;
+	verdict('场景 8 · 闸三（发言后改 bio 且不再发言）', ok, '通过：cron 抓住了事后改 bio 的逃逸（首次全群禁言）', '失败');
 }
 
 // ============================================================
@@ -623,9 +642,10 @@ function verdict(name, ok, passText, failText) {
 	console.log('  干净入群是否放行 : ' + (cleanPass ? '是（符合预期）' : '否'));
 	console.log('  入群后是否在册   : ' + (roster.length ? '是 ' + JSON.stringify(roster[0]) : '否（闸三就没有扫描源）'));
 	console.log('  扫描结果         : ' + JSON.stringify(summary));
-	const ok = cleanPass && roster.length === 1 && r.blacklisted && r.banned > 0 && summary.banned >= 1;
+	// 同场景 8：cron 轨道首次命中 = 全群禁言，不拉黑不封禁。
+	const ok = cleanPass && roster.length === 1 && !r.blacklisted && r.banned === 0 && r.muted > 0 && summary.banned >= 1;
 	verdict('场景 11 · 入群即进名册（从未发言也能被 cron 复查）', ok,
-		'通过：入群写册，一句话没说过的号也被 cron 抓到', '失败：入群不进名册，从未发言的号仍是盲区');
+		'通过：入群写册，一句话没说过的号也被 cron 抓到（首次全群禁言）', '失败：入群不进名册，从未发言的号仍是盲区');
 }
 
 // ============================================================

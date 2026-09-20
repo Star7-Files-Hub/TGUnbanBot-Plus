@@ -104,15 +104,17 @@ const TG_MUTATION_RETRY_DELAY_MS = 350;
 
 // 7) /blacklist 列表中"原因"字段的中文映射。
 //    spam 表示 /spam 举报，manual 表示 /ban 手动添加；历史 reason=sa 继续按 /spam 展示。
-//    ad_auto / ad_learn / gky_global 已无写入方（自动广告治理与杀神主动查杀均已移除），
-//    但 D1 里的历史封禁记录仍带这些 reason，标签必须保留，否则旧记录会显示成裸字符串。
+//    ⚠️ ad_auto 【现在仍有写入方】：渐进式封禁升级为全群封禁时由 enforceAdDetection 写入，
+//    判定通知里的「全群封禁」按钮也写它 —— 而「主群豁免只给自动判定」这条规则
+//    （见 isAutoBlacklistReason）正是按这个 reason 判定的，改动写入口径时必须同步改判据。
+//    ad_learn / gky_global 已无写入方，仅用于渲染 D1 里的历史记录。
 //    环境变量名：BLACKLIST_REASON_LABELS （要求是 JSON 字符串，例如 {"spam":"群内举报"}）
 const DEFAULT_BLACKLIST_REASON_LABELS = {
 	sa: '群内 /spam 举报（历史记录）',
 	spam: '群内 /spam 举报',
 	manual: '管理员 /ban 指令加黑',
 	manual_ban: '旧版 Telegram 原生封禁同步记录',
-	ad_auto: '🤖 广告自动检测（历史记录）',
+	ad_auto: '🤖 广告自动检测',
 	ad_learn: '🤖 上报学习（历史记录）',
 	ad_vote: '🗳️ 群内投票举报',
 	gky_global: '🌐 杀神全局封禁库命中（历史记录）'
@@ -145,6 +147,15 @@ const DEFAULT_OWNER_IDS = [];
 //    填了但该群不在 GROUP_ID 配置里 → 忽略并回落主群 + 打日志，避免把用户导向 bot 管不到的群。
 //    环境变量名：SELF_UNBAN_CONTACT_GROUP
 const DEFAULT_SELF_UNBAN_CONTACT_GROUP = '';
+
+// 11.1) 【联络入口 URL】直接给一个链接，取代「去主群找人」。
+//    典型用法是填**频道的私信链接**（频道 → 管理 → 私信）。与主群相比它有两个硬优势：
+//      ① 【不依赖群成员身份】被全群封禁 + 拉黑的人照样点得到 —— 而主群链接对他可能根本进不去；
+//      ② 主动来私信这个动作本身就是很强的反广告信号（广告号不会去申诉），
+//         所以这条通道可以放心开得很宽，不会变成广告入口。
+//    留空 → 回落 SELF_UNBAN_CONTACT_GROUP（主群链接），与原行为完全一致。
+//    环境变量名：SELF_UNBAN_CONTACT_URL
+const DEFAULT_SELF_UNBAN_CONTACT_URL = '';
 
 // 12) 广告自动判定后的【封禁范围】。这是「渐进式封禁」的总开关。
 //
@@ -181,6 +192,9 @@ const AD_VOTE_RETENTION_SECONDS = 7 * 24 * 60 * 60;
 const AD_VOTE_BUTTON_PREFIX = 'adv:';
 const AD_WORDS_PAGINATION_PREFIX = 'adwords:';
 const AD_JOB_PAGINATION_PREFIX = 'adjob:';
+// 自动判定通知下方的处置按钮。data 形如 ade:<A|B>:<userId>:<seq>。
+// A = 误判回滚（解除禁言/解封 + 放行），B = 全群封禁（含主群）。
+const AD_ENFORCE_BUTTON_PREFIX = 'ade:';
 const AD_WORDS_PAGE_LIMIT = 20;
 const AD_VOTE_HISTORY_FALLBACK_LIMIT = 20;
 
@@ -191,6 +205,8 @@ let SELF_UNBAN_PROMPT;
 let SELF_UNBAN_APPROVED;
 let SELF_UNBAN_APPROVED_NOLINK;
 let SELF_UNBAN_CONTACT_GROUP;
+// 联络入口 URL（例如频道私信链接）。留空时回落 SELF_UNBAN_CONTACT_GROUP 的群链接。
+let SELF_UNBAN_CONTACT_URL;
 let BLACKLIST_PAGE_LIMIT;
 let BLACKLIST_REASON_LABELS;
 let GKY_BANLIST_ENDPOINT;
@@ -256,6 +272,7 @@ function applyRuntimeConfig(config) {
 	SELF_UNBAN_APPROVED = config.SELF_UNBAN_APPROVED;
 	SELF_UNBAN_APPROVED_NOLINK = config.SELF_UNBAN_APPROVED_NOLINK;
 	SELF_UNBAN_CONTACT_GROUP = config.SELF_UNBAN_CONTACT_GROUP;
+	SELF_UNBAN_CONTACT_URL = config.SELF_UNBAN_CONTACT_URL;
 	BLACKLIST_PAGE_LIMIT = config.BLACKLIST_PAGE_LIMIT;
 	BLACKLIST_REASON_LABELS = config.BLACKLIST_REASON_LABELS;
 	GKY_BANLIST_ENDPOINT = config.GKY_BANLIST_ENDPOINT;
@@ -483,6 +500,20 @@ function loadRequiredConfig(env) {
 		}
 	}
 
+	// 联络入口 URL：只做 trim + 形态粗校验（必须是 http/https）。
+	// 不校验域名 —— 主人可能填 t.me 短链、tg:// 之外的自建页，甚至频道私信链接，
+	// 这些形态各不相同，写死规则只会把合法值挡掉。填错了他自己点一下就知道。
+	// 非法值只打日志并回落主群链接，绝不构造一个点不动的假按钮。
+	const rawContactUrl = pickStr(env.SELF_UNBAN_CONTACT_URL, DEFAULT_SELF_UNBAN_CONTACT_URL).trim();
+	let selfUnbanContactUrl = '';
+	if (rawContactUrl) {
+		if (/^https?:\/\/\S+$/i.test(rawContactUrl)) {
+			selfUnbanContactUrl = rawContactUrl;
+		} else {
+			console.error('[配置] SELF_UNBAN_CONTACT_URL 不是合法的 http/https 链接，已忽略并回落主群链接：' + rawContactUrl);
+		}
+	}
+
 	let blacklistPageLimit = DEFAULT_BLACKLIST_PAGE_LIMIT;
 	if (env.BLACKLIST_PAGE_LIMIT !== undefined && env.BLACKLIST_PAGE_LIMIT !== null && String(env.BLACKLIST_PAGE_LIMIT).trim() !== '') {
 		const n = parseInt(String(env.BLACKLIST_PAGE_LIMIT).trim(), 10);
@@ -557,6 +588,7 @@ function loadRequiredConfig(env) {
 		SELF_UNBAN_APPROVED: selfUnbanApproved,
 		SELF_UNBAN_APPROVED_NOLINK: selfUnbanApprovedNoLink,
 		SELF_UNBAN_CONTACT_GROUP: selfUnbanContactGroup,
+		SELF_UNBAN_CONTACT_URL: selfUnbanContactUrl,
 		BLACKLIST_PAGE_LIMIT: blacklistPageLimit,
 		BLACKLIST_REASON_LABELS: blacklistReasonLabels,
 		GKY_BANLIST_ENDPOINT: gkyEndpoint,
@@ -1405,9 +1437,20 @@ async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, option
 
 	if (!options.silentGroupReply) {
 		if (options.flashOnly) {
+			// 闪屏没有挂按钮的能力，保持原样发原文案 —— 不写「点下方按钮」这种指向空气的话。
 			await sendFlashMessage(chatId, blacklistCheck.message, options.ctx);
 		} else {
-			await sendTelegramMessage(chatId, blacklistCheck.message);
+			// 【黑名单用户是自助解封被硬闸门拒掉的那批人，他们唯一的出路就是找管理员】。
+			// 光写「请自行联系管理员解封」等于没给路 —— 主人指出的正是这个缺口：
+			// 被全群封禁的人进不去主群，又没有其它入口，就彻底失联了。
+			// 所以这条回执必须自带联络入口（优先用 SELF_UNBAN_CONTACT_URL 这类
+			// 不依赖群成员身份的链接，见 resolveSelfUnbanContact）。
+			const contact = await resolveSelfUnbanContact();
+			const hasButton = Boolean(contact.button);
+			const text = hasButton
+				? blacklistCheck.message + '\n\n💬 申诉请点下方按钮联系管理员。'
+				: blacklistCheck.message;
+			await sendTelegramMessage(chatId, text, hasButton ? { inline_keyboard: [[contact.button]] } : null);
 		}
 	}
 	if (!blacklistCheck.checkFailed) {
@@ -1497,9 +1540,17 @@ async function removeFromBlacklist(userId, env) {
 // 用户在群内时 banChatMember 会把人移出并封禁；用户不在群内但 Telegram 可识别时，会加入群封禁列表（预封）。
 // bot 不在群 / 没权限 / Telegram 无法识别用户时，单群失败不影响其它群；串行避免 Telegram API 限流。
 // 返回 [{ groupId, userId, ok, error, memberProbe }]
+//
+// options.excludeContactGroup —— 自动处置专用：跳过主群（见 isSelfUnbanContactGroup）。
+// 跳过项带 skipped: true 且 ok: false，摘要必须用 attempted = results.filter(r => !r.skipped)
+// 算分母，否则会渲染成「3/4 个群成功」，主人会以为封禁出了问题。
 async function banUserFromAllGroups(userId, options = {}) {
 	const results = [];
 	for (const groupId of GROUP_IDS) {
+		if (options.excludeContactGroup === true && isSelfUnbanContactGroup(groupId)) {
+			results.push({ groupId, userId: String(userId), ok: false, skipped: true, error: null, memberProbe: null });
+			continue;
+		}
 		const memberProbe = options.probeMembership
 			? await probeTargetMemberBeforeBan(groupId, userId)
 			: null;
@@ -4898,6 +4949,24 @@ async function handleChatMemberUpdate(chatMember, env) {
 	if (enteredGroup) {
 		const blacklistCheck = await checkBlacklist(targetIdStr, env);
 		if (blacklistCheck.isBlacklisted) {
+			// 【主群豁免】主群是黑名单用户唯一还能联系到主人的通道（见 isSelfUnbanContactGroup）。
+			// 自动封禁已经不再碰主群，如果这里再把「想回主群求助」的人踢回去，通道等于又焊死了 ——
+			// 而他之所以是黑名单用户，恰恰是因为自动判定（可能误判）把他全群封禁了。
+			// ⚠️ 只豁免【自动判定】加黑的号（isAutoBlacklistReason）：手工 /ban、/spam
+			// 是管理员的明确决定，照常踢回，不能被这里悄悄削弱。
+			if (isSelfUnbanContactGroup(chat.id) && isAutoBlacklistReason(blacklistCheck.entry?.reason)) {
+				console.log('[chat_member] 黑名单用户复入联络主群，按通道豁免放行:', JSON.stringify({
+					群ID: chat.id,
+					用户ID: targetIdStr,
+					旧状态: oldStatusEarly,
+					新状态: newStatusEarly,
+					处置: '主群豁免（不踢人）'
+				}));
+				await notifyOwnerBlacklistIntercept(targetUser, chat, '复入群拦截（主群豁免，未踢出）', blacklistCheck, null);
+				// 已处理，不再往下走：他本来就是黑名单 + 已升级的号，重新筛查资料卡不会带来
+				// 任何新结论，只会多烧几次 API 与再推一条重复通知。
+				return;
+			}
 			const banResult = await banUserFromGroup(chat.id, targetIdStr);
 			console.log('[chat_member] 黑名单用户复入群，立即踢回:', JSON.stringify({
 				群ID: chat.id,
@@ -5719,13 +5788,14 @@ function getAdQuotedText(message) {
 
 
 function translateBlacklistReason(reason) {
-	// ad_auto / ad_learn 已无写入方，仅用于渲染 D1 里的历史封禁记录。
+	// ad_auto 现在仍有写入方（渐进式升级 / 通知按钮），标签里的「历史记录」已去掉。
+	// ad_learn 无写入方，仅用于渲染 D1 里的历史记录。
 	const map = {
 		manual_ban: '旧版 Telegram 原生封禁同步记录',
 		manual: '管理员 /ban 指令加黑',
 		sa: '管理员 /spam 引用回复加黑（历史记录）',
 		spam: '管理员 /spam 引用回复加黑',
-		ad_auto: '广告自动检测加黑（历史记录）',
+		ad_auto: '广告自动检测加黑',
 		ad_vote: '群内 /ad 举报投票加黑',
 		ad_learn: '上报学习加黑（历史记录）',
 	};
@@ -6703,16 +6773,164 @@ async function handleBulkJobPaginationCallback(callbackQuery, env) {
 	await answerAdVoteCallback(callbackQuery?.id);
 }
 
+// 自动判定通知下方的两颗处置按钮。挂在通知的【最后一块】上
+// （sendTelegramMessageChunks 只给最后一块挂键盘）。
+//
+// 【为什么要有按钮】通知原本只有一行「判定错误并解封：/ignore N」—— 主人要处置得先切到私聊
+// 手动敲命令，还得记准序号。按钮把这一步压成一次点击，序号写在回调数据里，不存在敲错的可能。
+//
+// 【标签必须随实际动作变】禁言与封禁的后果差一个量级，按钮得说清点下去会发生什么：
+//   · 禁言轨道 → 「解除禁言」
+//   · 封禁轨道 → 「解除封禁」
+//   · 主群豁免 → 「误判放行」（本次根本没处置人，说「解除禁言」是假的）
+// 三者底层都是同一条误判回滚链（解禁 + 解封 + 指纹纠正 + 登记放行库）——
+// 一条回滚链本来就该把两种状态一起清干净，所以不按轨道拆成三条不同的实现。
+//
+// 键盘塞不下（callback_data 超 64 字节）时返回 null → 退回只有命令行的老样子，
+// 绝不挂一颗点下去报 BUTTON_DATA_INVALID 的死按钮。
+function buildAdEnforceKeyboard(userId, seq, action) {
+	const uid = String(userId || '');
+	const seqNo = Number(seq) || 0;
+	if (!uid || !seqNo) return null;
+	const undoLabel = action === 'contact_group_exempt'
+		? '✅ 误判放行'
+		: (action === 'mute_single' || action === 'mute_all' ? '✅ 解除禁言' : '✅ 解除封禁');
+	const undoData = AD_ENFORCE_BUTTON_PREFIX + 'A:' + uid + ':' + seqNo;
+	const banData = AD_ENFORCE_BUTTON_PREFIX + 'B:' + uid + ':' + seqNo;
+	if (!adCallbackDataFits(undoData) || !adCallbackDataFits(banData)) return null;
+	return {
+		inline_keyboard: [[
+			{ text: undoLabel, callback_data: undoData },
+			{ text: '🚫 全群封禁', callback_data: banData }
+		]]
+	};
+}
+
+// 处置完成后把通知上的键盘摘掉。用 editMessageReplyMarkup 而不是 editMessageText ——
+// 后者要重发正文，而回调里的 message.text 是 Telegram 剥掉标签后的纯文本，
+// 拿它配 parse_mode=HTML 重发会丢格式、甚至被正文里的 < 破坏。
+// 摘掉键盘既不动正文，又能挡住「同一颗按钮被点第二次」。
+async function clearAdNoticeKeyboard(chatId, messageId) {
+	if (!chatId || !messageId) return { ok: false, error: '缺少 chat_id / message_id' };
+	try {
+		const response = await fetch('https://api.telegram.org/bot' + BOT_TOKEN + '/editMessageReplyMarkup', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } })
+		});
+		const result = await response.json();
+		if (!response.ok || !result?.ok) {
+			const description = result?.description || ('HTTP ' + response.status);
+			// 「message is not modified」是重复摘键盘的正常结果，不算故障。
+			if (!/not modified/i.test(description)) console.error('[判定通知] 摘除按钮失败:', description);
+			return { ok: false, error: description };
+		}
+		return result;
+	} catch (error) {
+		console.error('[判定通知] 摘除按钮异常:', error);
+		return { ok: false, error: error.message || String(error) };
+	}
+}
+
+// 判定通知上的处置按钮回调。data 形如 ade:<A|B>:<userId>:<seq>。
+//
+// 权限口径与 /ignore、/words 完全一致 —— 只认第一主人，且必须是【在他自己的私聊里】点的：
+// 通知只发第一主人，处置又是跨群不可逆动作；转发到群里让别人点不算数。
+async function handleAdEnforceCallback(callbackQuery, env) {
+	const data = String(callbackQuery?.data || '');
+	const clickerId = String(callbackQuery?.from?.id || '');
+	const chatId = String(callbackQuery?.message?.chat?.id || '');
+	const messageId = Number(callbackQuery?.message?.message_id) || 0;
+	const match = data.slice(AD_ENFORCE_BUTTON_PREFIX.length).match(/^([AB]):(\d+):(\d+)$/);
+	if (!match) {
+		await answerAdVoteCallback(callbackQuery?.id);
+		return;
+	}
+	if (!isPrimaryOwner(clickerId) || chatId !== clickerId) {
+		await answerAdVoteCallback(callbackQuery?.id, '仅限第一主人在私聊中操作', true);
+		return;
+	}
+	if (!env?.DB) {
+		await answerAdVoteCallback(callbackQuery?.id, '未绑定 D1 存储空间', true);
+		return;
+	}
+	const action = match[1];
+	const targetId = match[2];
+	const seq = parseInt(match[3], 10);
+	const snapshot = await readAdPendingSnapshot(env, clickerId, seq);
+	if (!snapshot) {
+		// 序号已被复核过 / 已过期。顺手摘掉键盘，避免主人反复点一颗已经失效的按钮。
+		await answerAdVoteCallback(callbackQuery?.id, '该判定已处理或已过期', true);
+		await clearAdNoticeKeyboard(chatId, messageId);
+		return;
+	}
+	// 回调数据里的 userId 必须与快照一致。不一致说明序号被复用或数据被改过 ——
+	// 处置是跨群不可逆动作，宁可拒绝也不能拿错人的号去执行。
+	if (String(snapshot.userId) !== targetId) {
+		await answerAdVoteCallback(callbackQuery?.id, '按钮数据与快照不匹配，请改用 /ignore ' + seq, true);
+		return;
+	}
+
+	if (action === 'A') {
+		// 误判回滚：与 /ignore 走【同一个函数】，副作用逐项相同（解禁 + 解封 + 指纹纠正
+		// + 删错样本 + 清台账 + 登记放行库 + 标记快照已复核），只是入口从命令换成按钮。
+		const r = await rollbackAdPendingSnapshot(env, clickerId, seq, snapshot);
+		await clearAdNoticeKeyboard(chatId, messageId);
+		await answerAdVoteCallback(callbackQuery?.id, '已按误判回滚');
+		const lines = ['<b>♻️ 已按误判回滚（通知按钮）</b>', '序号：<b>#' + seq + '</b>'];
+		lines.push(...renderAdRollbackSingleLines(r));
+		lines.push('');
+		lines.push('撤销放行：<code>/allowlist</code> 查看序号，<code>/allowlist del 序号</code> 撤掉某条');
+		await sendTelegramMessageChunks(chatId, lines.join('\n'));
+		return;
+	}
+
+	// ===== B：全群封禁 =====
+	// 【含主群】这是主人的明确决定，所以【不】传 excludeContactGroup ——
+	// 主群豁免只针对自动判定；主群被刷广告时，这颗按钮就是唯一出口。
+	const added = await addToBlacklist(targetId, env, {
+		reason: 'ad_auto', by: clickerId, note: '判定通知按钮：全群封禁'
+	});
+	const banResults = await banUserFromAllGroups(targetId, { probeMembership: true, revokeMessages: true });
+	const okCount = banResults.filter((r) => r.ok).length;
+	const failed = banResults.filter((r) => !r.ok);
+	let summary = '🌐 全群封禁：' + okCount + '/' + banResults.length + ' 个群成功';
+	if (failed.length) {
+		summary += '；失败群：' + failed.slice(0, 3).map((r) => r.groupId + '(' + (r.error || '未知') + ')').join('、');
+	}
+	// 至少封成功一个群才标升级 —— 与 enforceAdDetection 同口径：全失败说明网络/权限问题，
+	// 标了会让下次直接走 already_global 而不再重试，等于升级被静默吞掉。
+	// 台账里本来没有这一行（例如 AD_BAN_SCOPE_MODE=global）时 UPDATE 影响 0 行，同样无害。
+	if (okCount > 0) await markAdBanScopeEscalated(env, targetId, summary);
+	await deleteAdPendingSnapshot(env, clickerId, seq);
+	await clearAdNoticeKeyboard(chatId, messageId);
+	await answerAdVoteCallback(callbackQuery?.id, '已全群封禁');
+	const lines = [
+		'<b>🚫 已全群封禁（通知按钮）</b>',
+		'序号：<b>#' + seq + '</b>',
+		'用户：<code>' + escapeHtml(targetId) + '</code>',
+		'黑名单：' + (added?.success ? '已加入' : (added?.code === 'EXISTS' ? '本就在黑名单' : '加入失败（' + escapeHtml(String(added?.message || added?.code || '未知')) + '）')),
+		escapeHtml(summary),
+		'',
+		'解封出口：<code>/unban ' + escapeHtml(targetId) + '</code>（会同时解除禁言与全群封禁）'
+	];
+	await sendTelegramMessageChunks(chatId, lines.join('\n'));
+}
+
 async function handleAdCallbackQuery(callbackQuery, env, ctx) {
 	const data = String(callbackQuery?.data || '');
-	// 三分支分流。必须排在 adv: 校验【之前】：投票分支开头那道 isConfiguredGroup
-	// 会把私聊来的回调全部挡掉，而 /words 本来就只在私聊里用。
+	// 四分支分流。必须排在 adv: 校验【之前】：投票分支开头那道 isConfiguredGroup
+	// 会把私聊来的回调全部挡掉，而 /words 与判定通知按钮本来就只在私聊里用。
 	if (data.startsWith(AD_WORDS_PAGINATION_PREFIX)) {
 		await handleAdWordsPaginationCallback(callbackQuery, env);
 		return;
 	}
 	if (data.startsWith(AD_JOB_PAGINATION_PREFIX)) {
 		await handleBulkJobPaginationCallback(callbackQuery, env);
+		return;
+	}
+	if (data.startsWith(AD_ENFORCE_BUTTON_PREFIX)) {
+		await handleAdEnforceCallback(callbackQuery, env);
 		return;
 	}
 	if (!data.startsWith(AD_VOTE_BUTTON_PREFIX)) return;
@@ -6944,11 +7162,25 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			// 双保险：管理员豁免，避免误加黑导致管理员被踢
 			const isAdmin = await checkIfUserIsAdmin(userId);
 			if (!isAdmin) {
-				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，删消息+踢人`);
+				// 【主群豁免】主群是黑名单用户唯一还能联系到主人的通道（见 isSelfUnbanContactGroup），
+				// 而他「联系主人」的第一步就是在主群里开口 —— 这里把他踢了，通道当场就关了。
+				// 所以主群只删消息（主群不会被广告刷屏）、不封人；其余群行为完全不变。
+				// ⚠️ 只豁免【自动判定】加黑的号（isAutoBlacklistReason）：手工 /ban、/spam
+				// 是管理员的明确决定，照常封，不能被这里悄悄削弱。
+				const contactGroupExempt = isSelfUnbanContactGroup(chatId)
+					&& isAutoBlacklistReason(blacklistCheck.entry?.reason);
+				console.log(`[黑名单拦截] 用户 ${userId} 在群 ${chatId} 发言，`
+					+ (contactGroupExempt ? '删消息（联络主群：豁免封禁）' : '删消息+踢人'));
 				await deleteMessage(chatId, message.message_id);
 				// 先按既有语义封当前群，保证「不管升级逻辑是否可用，本群一定封掉」。
-				await banUserFromGroup(chatId, userId);
-				await notifyOwnerBlacklistIntercept(message.from, message.chat, '发言拦截', blacklistCheck, null);
+				if (!contactGroupExempt) {
+					await banUserFromGroup(chatId, userId);
+				}
+				await notifyOwnerBlacklistIntercept(
+					message.from, message.chat,
+					contactGroupExempt ? '发言拦截（主群豁免，未踢出）' : '发言拦截',
+					blacklistCheck, null
+				);
 				// 再决定要不要升级为全群封禁。单独 try/catch：升级失败绝不能影响
 				// 上面已经完成的删消息 + 封当前群 + 通知，那三件事才是本条消息的本职。
 				try {
@@ -8417,13 +8649,56 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	}
 }
 
-// 构造自助解封成功回执：文案 + 主群联系入口按钮。
-// 主群（SELF_UNBAN_CONTACT_GROUP，默认 GROUP_IDS[0]）在本项目里是"回家的入口" ——
-// 解封走全群、封禁也走全群，bot 无法知道用户原本在哪个群被封，所以不说"返回某个群"，
-// 而是告知"全部群组限制已解除"，并给一个能联系到管理员的主群按钮。
-// 拿不到群链接时使用降级文案（无"点击下方按钮"字样）且不附按钮，绝不出现点不动的假链接。
-async function buildSelfUnbanApprovedReply() {
+// === 主群（唯一的对外联络通道）===
+// 「主群」= 自助解封成功回执里那颗回群按钮指向的群，即 SELF_UNBAN_CONTACT_GROUP
+// （留空时回落 GROUP_IDS[0]，见 getConfig）。全项目只有这一个定义，别在别处再算一遍。
+//
+// 【为什么自动处置必须跳过它】被判定广告的号会进黑名单，而 blockSelfUnbanIfBlacklisted
+// 对黑名单用户【一律拒绝自助解封且不自动移出】—— 也就是说被全群封禁的号既进不了群、
+// 也走不了自助解封。如果连主群都被自动封掉，他就彻底没有任何途径联系到主人了。
+// 主群是这套系统里唯一的对外联络通道，自动判定（可能误判）不能把它堵死。
+//
+// 【为什么禁言也要一起跳过】只豁免封禁的话，误判者人虽然在主群里，却仍然说不了话 ——
+// 联络通道名义上开着、实际打不开，等于没豁免。所以豁免的粒度是「不处置这个人」，
+// 而不是「不把他踢出去」。
+//
+// 【人工处置不受此限】/ban、/spam、/ad 投票、/rescreen 与判定通知里的「全群封禁」按钮
+// 都是主人的明确决定，一律照常覆盖主群 —— 它们也正是主群被刷广告时的出口。
+function getSelfUnbanContactGroupId() {
+	return String(SELF_UNBAN_CONTACT_GROUP || GROUP_ID || '');
+}
+
+function isSelfUnbanContactGroup(chatId) {
+	const contact = getSelfUnbanContactGroupId();
+	return Boolean(contact) && String(chatId ?? '') === contact;
+}
+
+// 该黑名单记录是否来自【自动判定】。
+// 只有自动判定造成的封禁才享受主群豁免 —— 人工 /ban、/spam、/ad 投票加黑是管理员的
+// 明确决定，一律照常覆盖主群。不加这道区分的话，一次手工封禁会被悄悄削弱成
+// 「他还能在主群里说话」，而主人以为自己已经全群封了他。
+//
+// 判据用 reason 而不是 by：reason 是 addToBlacklist 的必填语义字段，写入口径固定
+// （enforceAdDetection 与判定通知按钮都写 'ad_auto'），而 by 只记操作人字符串。
+function isAutoBlacklistReason(reason) {
+	return String(reason || '') === 'ad_auto';
+}
+
+// 解析「联络入口」：一个能联系到管理员的按钮（+ 文案里要用的群标识）。
+// 两个场景共用：自助解封成功回执、黑名单拒绝回执。
+//
+// 【优先级】SELF_UNBAN_CONTACT_URL（显式链接，例如频道私信）> 联系主群链接。
+// 显式链接的硬优势是【不依赖群成员身份】—— 被全群封禁 + 拉黑的人照样点得到，
+// 而主群链接对他可能根本进不去。主人自己说得很准：主动来联系这个动作本身就是
+// 很强的反广告信号，所以这条通道可以放心开。
+//
+// 拿不到任何链接时 button 返回 null：调用方退化成纯文本，
+// 绝不构造一个点不动的假按钮（原 buildSelfUnbanApprovedReply 的既有约定）。
+async function resolveSelfUnbanContact() {
 	const contactGroupId = SELF_UNBAN_CONTACT_GROUP || GROUP_ID;
+	const explicit = String(SELF_UNBAN_CONTACT_URL || '').trim();
+	// 一次 getChat 同时拿到 title 与 link。这条路径只在「有人尝试联系管理员」时触发，
+	// 频率极低，不值得为它加一层模块级缓存（那反而要处理跨请求失效）。
 	let title = '';
 	let link = '';
 	try {
@@ -8431,21 +8706,33 @@ async function buildSelfUnbanApprovedReply() {
 		title = String(info?.title || '').trim();
 		link = String(info?.link || '').trim();
 	} catch (error) {
-		console.error('[自助解封] 获取联系主群信息失败:', error?.message || error);
+		console.error('[联络入口] 获取联系主群信息失败:', error?.message || error);
 	}
+	const button = explicit
+		? { text: SELF_UNBAN_CONTACT_BUTTON_PREFIX + '联系管理员', url: explicit }
+		: (title && link ? { text: SELF_UNBAN_CONTACT_BUTTON_PREFIX + title, url: link } : null);
+	return { button, contactGroupId, groupTitle: title || String(contactGroupId) };
+}
+
+// 构造自助解封成功回执：文案 + 联系入口按钮。
+// 解封走全群、封禁也走全群，bot 无法知道用户原本在哪个群被封，所以不说"返回某个群"，
+// 而是告知"全部群组限制已解除"，并给一个能联系到管理员的入口按钮。
+// 拿不到链接时使用降级文案（无"点击下方按钮"字样）且不附按钮。
+async function buildSelfUnbanApprovedReply() {
+	const contact = await resolveSelfUnbanContact();
 	const groupCount = Array.isArray(GROUP_IDS) ? GROUP_IDS.length : 0;
-	const clickable = Boolean(link && title);
+	const clickable = Boolean(contact.button);
 	const template = clickable ? SELF_UNBAN_APPROVED : SELF_UNBAN_APPROVED_NOLINK;
-	const groupName = title || String(contactGroupId);
+	// {groupname} / {groupid} 始终指向配置里的联系主群：即使按钮换成了外部链接，
+	// 文案里的群标识也不该跟着变成 URL —— 那会让模板读起来莫名其妙。
+	const groupName = contact.groupTitle;
 	const text = String(template)
 		.replaceAll('{groupcount}', String(groupCount))
 		.replaceAll('{groupname}', groupName)
-		.replaceAll('{groupid}', String(contactGroupId))
+		.replaceAll('{groupid}', String(contact.contactGroupId))
 		// 兼容旧自定义文案里的 {username}：等价于 {groupname}，老配置不会失效
 		.replaceAll('{username}', groupName);
-	const replyMarkup = clickable
-		? { inline_keyboard: [[{ text: SELF_UNBAN_CONTACT_BUTTON_PREFIX + groupName, url: link }]] }
-		: null;
+	const replyMarkup = clickable ? { inline_keyboard: [[contact.button]] } : null;
 	return { text, replyMarkup };
 }
 
@@ -13005,8 +13292,17 @@ async function rescanAdMember(env, row, options = {}) {
 		chatId,
 		chatTitle: '',
 		messageId: null
-	}, evaluation, { config: options.config, whitelist: options.whitelist, forceGlobal: true });
-	console.log('[广告检测·扫描] 封禁 user=' + userId + ' score=' + evaluation.score + '/' + evaluation.threshold);
+	}, evaluation, { config: options.config, whitelist: options.whitelist, muteAllFirst: true });
+	// 【2026-09-19 起这条轨道也走渐进式】原先传的是 forceGlobal: true（直接全群封禁），
+	// 理由是「没有当前群语义」。但渐进式在这条轨道上有一个成立的等价物 ——
+	// 禁言【所有治理群】：人全部留在群里、一条消息都发不出，不踢出不拉黑，误判可逆。
+	// 实测教训（主人 09-19 报障）：cron 扫到一个资料卡广告号直接全群封禁，
+	// 而主人认定那是误判 —— 一次误判把人在所有群里都踢了，代价不对称。
+	// 现在：首次 → mute_all（全群禁言 + 记台账）；台账已有记录 → 升级全群封禁。
+	// ⚠️ /rescreen（handleAdRescreenCommand）保持 forceGlobal 不变：那是主人手工发起的
+	// 深度清理，与手工 /ban 同类，手工动作一律不进渐进式。
+	console.log('[广告检测·扫描] 已处置 user=' + userId + ' score=' + evaluation.score + '/' + evaluation.threshold
+		+ ' 动作=' + (result?.banSummary || '未知'));
 	return { scanned: true, banned: result?.banned !== false, seq: result?.seq ?? null };
 }
 
@@ -13067,7 +13363,9 @@ async function runAdBioRescan(env, options = {}) {
 	}
 
 	await writeAdScanState(env, 'scan_count', String(done + scanned), Math.floor(Date.now() / 1000));
-	console.log('[广告检测·扫描] 本轮完成 批次=' + batches + ' 复查=' + scanned + ' 封禁=' + banned + ' 当日累计=' + (done + scanned) + '/' + dailyLimit);
+	// 日志字段用「处置」而不是「封禁」：渐进式下首次命中只禁言，
+	// 继续叫「封禁=N」会让排障时以为真封了 N 个人。
+	console.log('[广告检测·扫描] 本轮完成 批次=' + batches + ' 复查=' + scanned + ' 处置=' + banned + ' 当日累计=' + (done + scanned) + '/' + dailyLimit);
 	return { scanned, banned, batches, done: done + scanned, dailyLimit };
 }
 
@@ -13487,8 +13785,12 @@ const AD_LAYER_LABELS = {
 // 分散写必然分叉 —— 之前「仅封触发群」就是靠一处三元表达式撑着的。
 const AD_ACTION_LABELS = {
 	mute_single: '🔇 仅本群禁言：',
+	mute_all: '🔇 全群禁言（未踢出）：',
 	ban_single_fallback: '📌 仅本群封禁（禁言失败降级）：',
-	ban_global: '🌐 全群封禁：'
+	ban_global: '🌐 全群封禁：',
+	// 触发群正是主群时整体豁免（见 isSelfUnbanContactGroup）。它不是失败，
+	// 也不能沿用「0/0 个群成功」那种计数文案 —— 必须让主人一眼看出「按设计没处置人」。
+	contact_group_exempt: '🏠 主群豁免（未处置）：'
 };
 
 // 首次禁言后「清扫本群近期消息」的单次上限。
@@ -13509,10 +13811,15 @@ const AD_MUTE_CLEANUP_LIMIT = 20;
 function renderAdDetectionNotice(evaluation, context) {
 	const lines = [];
 	// 标题必须区分「禁言」与「封禁」：两者的后果差一个量级（一个留在群里、一个被踢出），
-	// 主人扫一眼通知就要能判断这条需不需要立刻处理。
+	// 主人扫一眼通知就要能判断这条需不需要立刻处理。禁言内部再分「本群 / 全群」——
+	// 消息路径只禁言触发群，cron 主动扫描禁言所有治理群，主人要知道该去哪个范围复核。
 	lines.push(context?.action === 'mute_single'
 		? '<b>🔇 广告号自动禁言（仅本群，未踢出）</b>'
-		: '<b>🚫 广告号自动封禁</b>');
+		: context?.action === 'mute_all'
+			? '<b>🔇 广告号自动禁言（全群，未踢出）</b>'
+			: context?.action === 'contact_group_exempt'
+				? '<b>🏠 广告号判定（主群豁免，未处置）</b>'
+				: '<b>🚫 广告号自动封禁</b>');
 	if (context?.seq) lines.push('快照序号：<b>#' + context.seq + '</b>');
 	lines.push('用户：<code>' + escapeHtml(String(context?.userId || '')) + '</code>');
 	if (evaluation.snapshot.name) lines.push('名称：' + escapeHtml(evaluation.snapshot.name));
@@ -13544,18 +13851,20 @@ function renderAdDetectionNotice(evaluation, context) {
 		// 判定正确不给出口：指纹与 AI 样本已在 enforceAdDetection 里自动学入，
 		// 主人【什么都不用做】。/confirm 已于 2026-09-08 删除。
 		lines.push('判定正确：无需任何操作（已自动学入指纹与 AI 样本）');
-		lines.push('判定错误并解封：/ignore ' + context.seq);
+		// 两个出口并列写：按钮是最省事的路径，命令是它的兜底 ——
+		// 键盘塞不下（callback_data 超 64 字节）时按钮不会挂上，光写「点下方按钮」会指向空气。
+		lines.push('判定错误并解封：点下方按钮，或发 /ignore ' + context.seq);
 	}
 	return lines.join('\n');
 }
 
 // === 渐进式封禁台账（AD_BAN_SCOPE_MODE = progressive）===
 // 对外只有三个概念，全部收在这里，避免「同一个判断抄两份」：
-//   · 读台账 decideAdBanScope() —— 决定这次封【当前群】还是【全群】
+//   · 读台账 decideAdBanScope() —— 决定这次是【禁言】还是【全群封禁】、范围多大
 //   · 记台账 recordSingleGroupBan() —— 首次判定后落一行监控记录
 //   · 标升级 markAdBanScopeEscalated() —— 升级为全群封禁后置 state='global'
 // 台账读失败【必须降级为旧行为（全群封禁）】：安全侧优先 —— 台账不可用时宁可多封，
-// 也不能因为读不到记录就把一个正在刷广告的号放进「只封当前群」的宽松路径。
+// 也不能因为读不到记录就把一个正在刷广告的号放进「只禁言」的宽松路径。
 async function readAdBanScope(env, userId) {
 	if (!env?.DB) return null;
 	const uid = String(userId || '');
@@ -13585,33 +13894,45 @@ async function readAdBanScope(env, userId) {
 	}
 }
 
-// 封禁范围决策。返回 { mode: 'single' | 'global', reason, previous, isFirst }。
+// 处置范围决策。返回 { mode: 'single' | 'mute_all' | 'global', reason, previous, isFirst }。
 //
-// mode = 'single'   → 只封 input.chatId，并落监控记录（首次判定）
-// mode = 'global'   → 全群封禁。三种来源：
+// mode = 'single'    → 只禁言 input.chatId，并落监控记录（消息触发的首次判定）
+// mode = 'mute_all'  → 禁言【所有治理群】，并落监控记录（cron 主动扫描的首次判定）
+// mode = 'global'    → 全群封禁。四种来源：
 //                      ① 开关是 global（旧行为）
-//                      ② 台账里已有记录且未升级（本次是第二次露头 → 升级）
-//                      ③ 台账读取失败（安全侧降级）
+//                      ② 调用点显式 forceGlobal（/rescreen 手工深度清理）
+//                      ③ 台账里已有记录且未升级（本次是第二次露头 → 升级）
+//                      ④ 台账读取失败 / 无用户（安全侧降级）
 // 注意「同群再犯也升级」—— 主人口径：任何第二次判定都视为惯犯，不再区分是不是同群。
+// 两条轨道共用同一张台账，因此「cron 首次禁言过的号，之后在群里发言被消息路径抓到」
+// 也算第二次露头 → 直接升级全群封禁。这正是「再犯才升级」的本意。
 async function decideAdBanScope(env, input, options = {}) {
 	// ① 开关为 global：完全走旧路径，一次 D1 查询都不做。
 	if (AD_BAN_SCOPE_MODE !== AD_BAN_SCOPE_PROGRESSIVE) {
 		return { mode: 'global', reason: 'mode_global', previous: null, isFirst: false };
 	}
-	// ② 调用点显式要求全群封禁。用于两类场景：
-	//    · cron 主动扫描（runAdBioRescan）—— 它封的是「不发言但资料就是广告」的号，
-	//      chatId 只是名册里记的最近发言群，【不是】触发判定的当前群，
-	//      拿它当「当前群」去只封一个群，等于主动扫描几乎不产生威慑；
-	//    · /rescreen 批量复查 —— 同理，没有单一时点、单一群的语义。
+	// ② 调用点显式要求全群封禁。/rescreen 批量复查走这条 —— 它是主人主动发起的深度清理，
+	//    没有单一时点、单一群的语义，与手工 /ban 同类（手工动作一律不进渐进式）。
 	if (options.forceGlobal === true) {
 		return { mode: 'global', reason: 'forced_global', previous: null, isFirst: false };
 	}
 	const userId = String(input?.userId ?? '');
 	const chatId = input?.chatId != null ? String(input.chatId) : '';
 
-	// 没有 chatId 的调用点（例如 /rescreen 批量复查、cron 扫描）本来就没有「当前群」语义，
+	// ③ 【cron 主动扫描轨道】同样没有「当前群」语义，但它的处置不该是「直接全群封禁」。
+	//    它扫的是「不发言但资料卡就是广告」的号，chatId 只是名册里记的最近发言群。
+	//    渐进式在这条轨道上的等价物不是「只禁言一个群」（那样其余群完全没被处置），
+	//    而是「禁言所有治理群」：首次一律禁言、不踢出不拉黑，再犯才升级全群封禁。
+	//    ⚠️ 这条分支【不要求 chatId】：名册里可能根本没有群（历史数据 / 入群筛查漏写册），
+	//    那种情况下「禁言所有治理群」照样成立，没有理由退回全群封禁。
+	const muteAllFirst = options.muteAllFirst === true;
+
+	if (!userId) {
+		return { mode: 'global', reason: 'no_user', previous: null, isFirst: false };
+	}
+	// 没有 chatId 且【不是】cron 轨道的调用点（例如其它批量调用）本来就没有「当前群」语义，
 	// 无法执行「只封当前群」—— 一律回落到全群封禁，与旧行为一致。
-	if (!userId || !chatId) {
+	if (!muteAllFirst && !chatId) {
 		return { mode: 'global', reason: 'no_chat_context', previous: null, isFirst: false };
 	}
 
@@ -13624,7 +13945,13 @@ async function decideAdBanScope(env, input, options = {}) {
 		return { mode: 'global', reason: 'ledger_unavailable', previous: null, isFirst: false };
 	}
 	if (!previous) {
-		return { mode: 'single', reason: 'first_detection', previous: null, isFirst: true };
+		// 首次判定的处置形态按轨道区分：
+		//   · 消息触发（有当前群）→ 只禁言当前群；
+		//   · cron 主动扫描（无当前群）→ 禁言所有治理群。
+		// 两者语义完全一致：禁言 + 不拉黑 + 记台账，只是范围不同。
+		return muteAllFirst
+			? { mode: 'mute_all', reason: 'first_detection', previous: null, isFirst: true }
+			: { mode: 'single', reason: 'first_detection', previous: null, isFirst: true };
 	}
 	// ② 已有记录且未升级 → 本次是第二次露头，升级全群封禁。
 	if (previous.scopeState !== AD_BAN_SCOPE_GLOBAL) {
@@ -13642,7 +13969,11 @@ async function recordSingleGroupBan(env, input, evaluation) {
 	if (!env?.DB) return false;
 	const userId = String(input?.userId ?? '');
 	const chatId = input?.chatId != null ? String(input.chatId) : '';
-	if (!userId || !chatId) return false;
+	// ⚠️ 这里【不能】要求 chatId：cron 主动扫描轨道（mute_all）的 chatId 来自名册，
+	// 历史数据 / 入群筛查漏写册的号可能为空。那种情况下台账仍然必须写 ——
+	// 不写就等于「这个号永远是首次判定」，下次复查又只禁言，升级链彻底断掉。
+	// 台账的语义是「这个号已经被判定过一次」，与「在哪个群」无关。
+	if (!userId) return false;
 	try {
 		if (!(await adDetectionReady(env))) return false;
 		const now = Math.floor(Date.now() / 1000);
@@ -13733,12 +14064,72 @@ async function muteUserFromSingleGroup(userId, chatId, options = {}) {
 	return results;
 }
 
-// 解除单群禁言。只给 /ignore 用 —— 首次命中现在只禁言不拉黑，
-// 少了这一步，/ignore 会报「已回滚」而那个人其实还在被禁言，误判根本没恢复。
-async function unmuteUserInGroup(userId, chatId) {
-	if (!chatId) return { ok: false, error: 'no_chat' };
-	const r = await restrictUserInGroup(chatId, userId, { mute: false });
-	return { ok: r.ok, error: r.error };
+// 全群禁言（cron 主动扫描轨道的「首次处置」）。
+//
+// 【为什么需要它】`muteUserFromSingleGroup` 的语义是「只处置触发判定的那个群」，
+// 而 cron 主动扫描（runAdBioRescan）扫的是【从没发过言的人】——
+// chatId 只是名册里记的最近发言群，不是「当前群」，拿它去只禁言一个群等于漏掉其余群。
+// 渐进式在这条轨道上的等价物是「禁言所有治理群」：人全部留在群里、一条消息都发不出，
+// 但不踢出、不拉黑，误判时可逆。再犯（下次复查再抓到）才升级全群封禁。
+//
+// 【为什么先探测成员身份】`restrictChatMember` 对不在群内的人会直接报
+// `USER_NOT_PARTICIPANT` —— 那既不是「禁言失败」，也不该出现在失败群清单里，
+// 它的语义是「这个群无需处置」。不探测的话摘要会变成「1/4 个群成功；失败群：…」，
+// 主人会以为禁言出了问题。探测本身失败（网络 / 权限）时【照常尝试禁言】：
+// 宁可多一次 API 调用，也不因为探测抖动漏掉一个群。
+//
+// 结果数组与 banUserFromAllGroups 同形状（额外多一个 skipped 标记），
+// 让上层可以拼进同一套摘要渲染逻辑。
+//
+// options.excludeContactGroup —— 自动处置专用，跳过主群（见 isSelfUnbanContactGroup）。
+async function muteUserFromAllGroups(userId, options = {}) {
+	const results = [];
+	for (const groupId of GROUP_IDS) {
+		// 主群豁免排在成员探测之前：既然不打算处置它，就没必要为它多花一次 getChatMember。
+		if (options.excludeContactGroup === true && isSelfUnbanContactGroup(groupId)) {
+			results.push({ groupId, userId: String(userId), ok: false, skipped: true, error: null, memberProbe: null });
+			continue;
+		}
+		const memberProbe = options.probeMembership
+			? await probeTargetMemberBeforeBan(groupId, userId)
+			: null;
+		// 只跳过「明确不在群里」与「已在群封禁列表」两种确定态；
+		// unknown / unresolvable 都照常尝试 —— 探测失败不等于人不在。
+		if (memberProbe && (memberProbe.state === 'not_in_group' || memberProbe.state === 'already_banned')) {
+			results.push({
+				groupId,
+				userId: String(userId),
+				ok: false,
+				skipped: true,
+				error: null,
+				memberProbe
+			});
+			continue;
+		}
+		const r = await restrictUserInGroup(groupId, userId);
+		results.push({ groupId, userId: String(userId), ok: r.ok, error: r.error, retried: r.retried === true, memberProbe });
+	}
+	return results;
+}
+
+// 解除该号在【所有治理群】的禁言。只给 /ignore 误判回滚用。
+//
+// 全群禁言（mute_all）会在多个群留下禁言，只解触发群的话主人发了 /ignore
+// 那个人仍然在其余群里说不了话 —— 与「误判必须真正恢复」的口径不符。
+// 它在单群禁言场景下同样安全：禁言与解禁走同一个 restrictChatMember 调用，
+// 对没被禁言的人解除禁言是幂等的；而且这条回滚链本来就已经在跑
+// unbanUserFromAllGroups（全群解除封禁），解禁的范围严格小于它。
+async function unmuteUserFromAllGroups(userId) {
+	const results = [];
+	for (const groupId of GROUP_IDS) {
+		try {
+			const r = await restrictUserInGroup(groupId, userId, { mute: false });
+			results.push({ groupId, userId: String(userId), ok: r.ok === true, error: r.ok === true ? null : (r.error || '未知') });
+		} catch (error) {
+			results.push({ groupId, userId: String(userId), ok: false, error: error.message || String(error) });
+		}
+	}
+	return results;
 }
 
 // 已黑用户在配置群里发言时的升级检查。
@@ -13773,11 +14164,17 @@ async function maybeEscalateBlacklistedUser(message, env, userId, chatId) {
 	// 而全群封禁在升级那次已经做过；重复做只会白烧 API 配额与通知条数。
 	if (ledger.scopeState === AD_BAN_SCOPE_GLOBAL) return false;
 
-	// 升级：全群封禁。
-	const results = await banUserFromAllGroups(uid, { probeMembership: true, revokeMessages: true });
-	const okCount = results.filter((r) => r.ok).length;
-	const failed = results.filter((r) => !r.ok);
-	let summary = '🌐 全群封禁：' + okCount + '/' + results.length + ' 个群成功';
+	// 升级：全群封禁。同样跳过主群（自动处置的联络通道豁免，见 isSelfUnbanContactGroup）——
+	// 升级后他进不了任何治理群，主群是他唯一还能找到主人的地方，不能一起堵死。
+	const results = await banUserFromAllGroups(uid, { probeMembership: true, revokeMessages: true, excludeContactGroup: true });
+	// 分母只算【实际尝试过】的群：跳过项 ok=false 且带 skipped 标记，算进去会渲染成
+	// 「3/4 个群成功」，主人会以为升级出了问题。
+	const attempted = results.filter((r) => !r.skipped);
+	const okCount = attempted.filter((r) => r.ok).length;
+	const failed = attempted.filter((r) => !r.ok);
+	let summary = attempted.length === 0
+		? '🌐 全群封禁：未执行任何群处置（仅配置了主群）'
+		: '🌐 全群封禁：' + okCount + '/' + attempted.length + ' 个群成功';
 	if (failed.length) {
 		summary += '；失败群：' + failed.slice(0, 3).map((r) => r.groupId + '(' + (r.error || '未知') + ')').join('、');
 	}
@@ -13840,14 +14237,26 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	// decideAdBanScope 已在无 chatId 时回落 global，这里再判一次是因为
 	// 处置是【不可逆的外部动作】，宁可多写一行也不接受「拿 undefined 去动一个人」。
 	const singleScope = banScope.mode === 'single' && Boolean(input.chatId);
+	// 全群禁言（cron 主动扫描轨道的首次判定）。与 singleScope 同属「首次判定」，
+	// 因此共享「不拉黑」「落台账」两项语义 —— 两者只有范围不同（一个群 vs 所有治理群）。
+	const allMuteScope = banScope.mode === 'mute_all';
+	const firstOffense = singleScope || allMuteScope;
+	// 【主群豁免自动处置】主群是唯一的对外联络通道（见 isSelfUnbanContactGroup 的说明），
+	// 自动判定（可能误判）不能把人挡在门外 —— 禁言也一起跳过：只豁免封禁的话，
+	// 误判者人虽然在主群里，却仍然说不了话，联络通道名义上开着、实际打不开。
+	// 触发消息下面照样单独删一次，所以主群不会被广告刷屏，只是【不处置人】。
+	// 真要处置，通知里那颗「全群封禁」按钮就是出口（人工路径一律不豁免）。
+	// ⚠️ 它仍然算「首次判定」（firstOffense 为真）→ 照常落台账，下次露头仍会升级。
+	const singleExempt = singleScope && isSelfUnbanContactGroup(input.chatId);
 
 	// ===== 黑名单 =====
 	// 【首次命中不再拉黑】2026-09-18 主人确认「首次只在本群禁言、不踢出不拉黑」。
 	// 拉黑会让「黑名单兜底拦截」在他去别的群发言时删消息并封那个群 ——
 	// 那等于绕开「再犯才升级」直接做了近似全群封禁，渐进式就白做了。
 	// 代价是首次命中少了黑名单这层安全网，所以下面【禁言失败必须退回封禁】。
-	let blacklistCode = singleScope ? 'SKIPPED_SINGLE_SCOPE' : 'SKIPPED';
-	if (!singleScope) {
+	// 两条首次轨道（single / mute_all）都跳过拉黑，判据统一收在 firstOffense 一个真源。
+	let blacklistCode = firstOffense ? 'SKIPPED_FIRST_OFFENSE' : 'SKIPPED';
+	if (!firstOffense) {
 		try {
 			const added = await addToBlacklist(userId, env, { reason: 'ad_auto', by: 'system', note });
 			blacklistCode = String(added?.code || (added?.success ? 'ADDED' : 'ERROR'));
@@ -13858,13 +14267,27 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	}
 
 	// action 记录本次【实际执行】的动作，用于回执与通知文案。
-	// 三态：本群禁言（首次命中）/ 本群封禁（禁言失败的降级）/ 全群封禁。
-	let action = singleScope ? 'mute_single' : 'ban_global';
+	// 五态：本群禁言（消息路径首次）/ 全群禁言（cron 轨道首次）/ 本群封禁（禁言失败的降级）/
+	// 全群封禁 / 主群豁免（触发群正是联络主群，整体不处置）。
+	let action = singleExempt
+		? 'contact_group_exempt'
+		: (singleScope ? 'mute_single' : (allMuteScope ? 'mute_all' : 'ban_global'));
 	let fallbackNote = '';
 	let banResults = [];
 	let cleanupResult = null;
 	try {
-		if (singleScope) {
+		if (singleExempt) {
+			// 主群豁免：不调任何【处置人】的接口，banResults 保持空数组
+			// （下面按「未执行任何群处置」渲染）。
+			// 但清扫照做 —— 删消息是消息级动作，不改变任何人的成员状态，也就不会
+			// 关上联络通道；不做的话主群就真成了广告可以随便刷的地方。
+			// 口径与 mute_single 轨道逐字一致：同一个 AD_MUTE_CLEANUP_LIMIT 上限。
+			try {
+				cleanupResult = await cleanupCurrentChatUserMessages(env, input.chatId, userId, [], AD_MUTE_CLEANUP_LIMIT);
+			} catch (error) {
+				console.error('[广告检测] 主群豁免后的本群清扫失败:', error);
+			}
+		} else if (singleScope) {
 			banResults = await muteUserFromSingleGroup(userId, input.chatId, { probeMembership: true });
 			if (!banResults.some((r) => r.ok)) {
 				// 【禁言失败必须退回封禁】不拉黑之后就没有黑名单兜底这层网了，
@@ -13888,18 +14311,44 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 					console.error('[广告检测] 首次禁言后的本群清扫失败:', error);
 				}
 			}
+		} else if (allMuteScope) {
+			// 【全群禁言】cron 主动扫描轨道的首次处置。不做本群清扫 ——
+			// 这条轨道扫的是「资料卡就是广告」的号，广告在简介里不在消息里，没有触发消息可删；
+			// 而逐群清扫会把子请求数乘上群数（4 群 × 20 条 = 80 次），撞上 Workers 子请求上限
+			// 会让整个请求抛异常 —— 处置明明生效却报错，比留几条历史消息糟得多。
+			banResults = await muteUserFromAllGroups(userId, { probeMembership: true, excludeContactGroup: true });
+			if (!banResults.some((r) => r.ok)) {
+				// 【禁言失败必须退回封禁】同 single 轨道的理由：不拉黑之后就没有黑名单兜底这层网。
+				// 这里【整体】退回全群封禁而不是逐个群降级 —— 这条轨道的语义就是「全群」，
+				// 只降级成功的那些群会留下「部分群禁言、部分群封禁」的混合状态，更难解释也更难回滚。
+				const muteErrors = banResults.filter((r) => !r.ok && !r.skipped)
+					.map((r) => r.error || '未知').slice(0, 2).join('、');
+				fallbackNote = '（全群禁言失败：'
+					+ (muteErrors || '该号不在任何治理群内')
+					+ '，已退回全群封禁）';
+				action = 'ban_global';
+				banResults = await banUserFromAllGroups(userId, { probeMembership: true, revokeMessages: true, excludeContactGroup: true });
+			}
 		} else {
-			banResults = await banUserFromAllGroups(userId, { probeMembership: true, revokeMessages: true });
+			banResults = await banUserFromAllGroups(userId, { probeMembership: true, revokeMessages: true, excludeContactGroup: true });
 		}
 	} catch (error) {
 		console.error('[广告检测] 处置失败:', error);
 	}
-	const okCount = banResults.filter((r) => r.ok).length;
-	const failedBans = banResults.filter((r) => !r.ok);
+	// 摘要只统计【实际尝试过】的群：mute_all 会跳过「不在群内 / 已在群封禁列表」的群，
+	// 把它们算进分母会渲染成「1/4 个群成功」，主人会以为禁言出了问题。
+	// 其余轨道（single / ban_global）的结果项没有 skipped 字段，口径与改动前逐字一致。
+	const attempted = banResults.filter((r) => !r.skipped);
+	const okCount = attempted.filter((r) => r.ok).length;
+	const failedBans = attempted.filter((r) => !r.ok);
 	// 文案里必须写明范围【与动作】。否则主人看到「1/1 个群成功」会以为是全群封禁时只成了一半，
 	// 而实际那是「按新策略只在本群禁言」的正常结果；禁言与封禁的后果差别更大，更不能含混。
-	let banSummary = (AD_ACTION_LABELS[action] || AD_ACTION_LABELS.ban_global)
-		+ okCount + '/' + banResults.length + ' 个群成功' + fallbackNote;
+	// 【attempted 为空时不能渲染成「0/0 个群成功」】那是主群豁免（或治理群全被跳过）的正常结果，
+	// 写成计数看着像一次彻底失败，反而让主人以为要手动补救。
+	const actionLabel = AD_ACTION_LABELS[action] || AD_ACTION_LABELS.ban_global;
+	let banSummary = attempted.length === 0
+		? actionLabel + '未执行任何群处置' + fallbackNote
+		: actionLabel + okCount + '/' + attempted.length + ' 个群成功' + fallbackNote;
 	// 清扫结果单独报。禁言路径没有 revoke_messages，主人需要知道「除了触发那条还删掉了几条」——
 	// 否则会以为前几条广告还留在群里。0 条时不写，避免每次都在通知里塞一句废话。
 	if (cleanupResult && cleanupResult.total > 0) {
@@ -13913,17 +14362,28 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 
 	// ===== 台账写入 =====
 	// 两条路径互斥，且都【只在处置动作已尝试之后】写：
-	//   · 首次判定（mode=single）→ 落监控记录，供下次露头时升级
+	//   · 首次判定（mode=single 或 mute_all）→ 落监控记录，供下次露头时升级
 	//   · 升级处置（reason=escalated）→ 标 state='global'，防止重复升级
-	// 刻意不处理 already_global / mode_global / no_chat_context / ledger_unavailable：
-	// 那四种情况要么不该产生记录，要么根本没有「首次群」可记。
-	// 【注意 mode=single 时不管实际是禁言还是降级封禁都要记】：
+	// 刻意不处理 already_global / mode_global / no_chat_context / ledger_unavailable / forced_global：
+	// 那几种情况要么不该产生记录，要么根本没有「首次群」可记。
+	// 【注意首次判定时不管实际是禁言还是降级封禁都要记】：
 	// 台账的语义是「这个号已经被判定过一次」，与本次动作强弱无关。
+	// 两条首次轨道共用同一行台账 —— 因此「cron 首次禁言过的号，之后在群里发言被消息路径
+	// 抓到」也算第二次露头，会直接升级全群封禁。这正是「再犯才升级」的本意。
 	let scopeNote = '';
 	try {
-		if (banScope.mode === 'single') {
+		if (banScope.mode === 'single' || banScope.mode === 'mute_all') {
 			await recordSingleGroupBan(env, input, evaluation);
-			scopeNote = '｜已进入监控，再次判定将升级全群封禁';
+			// 降级成封禁时不能说「再次判定将升级」—— 这次已经是封禁了，那样写会让人
+			// 以为还有一层没收紧，反而误判当前处置强度。
+			scopeNote = action === 'contact_group_exempt'
+				// 主群豁免不改变台账语义：这次仍然算「已被判定过一次」，
+				// 所以下次露头（无论在哪个群）decideAdBanScope 都会返回 global → 升级全群封禁
+				// （升级时同样跳过主群）。写明按钮是因为主人当场就想处置的话不用等下一次。
+				? '｜已进入监控（主群豁免处置，如需立即处置请点下方「全群封禁」；再次判定将升级全群封禁）'
+				: (action === 'mute_single' || action === 'mute_all')
+					? '｜已进入监控，再次判定将升级全群封禁'
+					: '｜已进入监控（本次禁言失败，已降级封禁）';
 		} else if (banScope.reason === 'escalated') {
 			// 只有至少封成功一个群才标升级：全失败说明网络/权限问题，标了会让下次
 			// 直接走 already_global 而不重试全群封禁，等于升级被静默吞掉。
@@ -14021,8 +14481,11 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			action,
 			banSummary: banSummary + learnNote
 		});
+		// 通知下方挂两颗按钮，把「切私聊敲 /ignore N」压成一次点击（序号写在回调数据里，
+		// 不存在敲错的可能）。seq 为空或键盘塞不下时返回 null → 退回只有命令行的老样子。
+		const enforceKeyboard = buildAdEnforceKeyboard(userId, seq, action);
 		try {
-			await sendTelegramMessageChunks(ownerId, notice);
+			await sendTelegramMessageChunks(ownerId, notice, enforceKeyboard);
 		} catch (error) {
 			console.error('[广告检测] 推送判定通知失败:', error);
 		}
@@ -14545,13 +15008,42 @@ async function handleAdPendingCommand(env, chatId, ownerId, arg) {
 // 即加 AI 样本，主人对判定正确的号【不需要任何操作】，只在误判时发 /ignore。
 // ⚠️ 与 ad_confirm_tokens 那张表无关，那是通用二次确认令牌机制，不要一起动。
 
-// 单条误判回滚：解除本群禁言 → 移出黑名单 → 全群解封 → 指纹记误报并即删
+// 单条误判回滚的明细文案。抽出来给【两个入口共用】：/ignore 单序号，以及判定通知上那颗
+// 「解除禁言 / 解除封禁 / 误判放行」按钮 —— 两者走的是同一个 rollbackAdPendingSnapshot，
+// 副作用逐项相同，回执也必须逐字相同。各写一份的话，按钮那条迟早会漏报某一项副作用，
+// 主人就会以为「按钮做的事比命令少」而不敢用。
+function renderAdRollbackSingleLines(r) {
+	const lines = [];
+	lines.push('用户：<code>' + escapeHtml(r.targetId) + '</code>');
+	lines.push('黑名单：' + (r.removed.success ? '已移除' : (r.removed.code === 'NOT_FOUND' ? '本就不在黑名单' : '移除失败')));
+	lines.push('解封：' + escapeHtml(r.unbanSummary));
+	// 禁言与封禁是两套状态，回执必须分别报 —— 只报「解封 3/3 个群成功」
+	// 会让主人以为误判已经彻底恢复，而人可能还挂在本群禁言里。
+	lines.push('解禁：' + escapeHtml(r.muteSummary));
+	lines.push('指纹修正：' + (r.fp.ok ? '已标记 <b>' + (r.fp.affected || 0) + '</b> 条误判，删除 <b>' + (r.fp.retired || 0) + '</b> 条' : '标记失败'));
+	lines.push('AI 样本：' + (r.sampleRemoved.ok ? (r.sampleRemoved.removed > 0 ? '已删除 <b>' + r.sampleRemoved.removed + '</b> 条' : '无对应样本') : '删除失败'));
+	// 放行库是这条链上唯一「加法」副作用，必须写清楚登记了哪几项 ——
+	// 它是「同一份素材不会再被封」的全部依据，主人事后要撤也只能靠这条回执找到入口。
+	lines.push('误判放行：' + (r.allowlisted?.added?.length
+		? '已登记 <b>' + r.allowlisted.added.length + '</b> 项（'
+			+ r.allowlisted.added.map((a) => escapeHtml(AD_ALLOWLIST_DIMENSION_LABELS[a.dimension] || a.dimension)).join('、')
+			+ '），这些素材不再参与判定'
+		: '无可登记素材'));
+	if (r.fp.ok && r.fp.affected > 0 && Array.isArray(r.fp.rows)) {
+		lines.push('');
+		lines.push('受影响指纹：');
+		for (const row of r.fp.rows.slice(0, 5)) lines.push('· [' + escapeHtml(row.type) + '] ' + escapeHtml(String(row.value).slice(0, 40)));
+	}
+	return lines;
+}
+
+// 单条误判回滚：解除全群禁言 → 移出黑名单 → 全群解封 → 指纹记误报并即删
 // → 删掉对应 AI 样本 → 清观察记录 → 清渐进式封禁台账 → 【登记误判放行库】→ 标记快照已复核。
 // 抽出来给 /ignore 的单条与批量两种用法共用，保证两条路径的副作用完全一致。
 // 最后一步是 2026-09-18 加的：前六步都是「删掉学错的」，只有它回答
 // 「同一份素材再出现时怎么办」—— 不登记就仍会被当成全新输入重新判一遍、再封一次。
-// 第一步也是 2026-09-18 加的：首次命中改成本群禁言后，被禁言的人不在黑名单里，
-// 不解禁的话这条回滚链会「全部成功但误判没恢复」。
+// 第一步是 2026-09-18 加的（2026-09-19 扩到全群）：首次命中改成本群禁言后，
+// 被禁言的人不在黑名单里，不解禁的话这条回滚链会「全部成功但误判没恢复」。
 async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	const targetId = snapshot.userId;
 	const removed = await removeFromBlacklist(targetId, env);
@@ -14559,14 +15051,20 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	let unbanSummary = '未执行';
 	let muteSummary = '未执行';
 	if (removed.success || removed.code === 'NOT_FOUND') {
-		// 【首次命中改成本群禁言之后，这一步不能少】被禁言的人【不在黑名单里】，
-		// 少了它，/ignore 会报「已按误判回滚」而那个人其实还挂在本群禁言里，
+		// 【首次命中改成禁言之后，这一步不能少】被禁言的人【不在黑名单里】，
+		// 少了它，/ignore 会报「已按误判回滚」而那个人其实还挂着禁言，
 		// 误判根本没恢复 —— 而且他不在黑名单，主人用 /unban 也找不到他。
-		// 用快照里记的 chatId：那正是当初执行禁言的那个群。
-		const muteResult = await unmuteUserInGroup(targetId, snapshot.chatId);
-		muteSummary = muteResult.ok
-			? '已解除本群禁言'
-			: ('解除禁言失败（' + (muteResult.error || '未知') + '）');
+		// 【2026-09-19 起解禁范围扩到所有治理群】禁言有两种范围：消息路径只禁言触发群，
+		// cron 主动扫描（mute_all）禁言所有治理群。只解触发群的话，后者会留下
+		// 「回滚成功但他仍在其余群说不了话」的假象。对没被禁言的人解除禁言是幂等的，
+		// 且这条链紧接着就在跑 unbanUserFromAllGroups（全群解除封禁），范围严格更大。
+		const muteResults = await unmuteUserFromAllGroups(targetId);
+		const muteOk = muteResults.filter((r) => r.ok).length;
+		const muteFailed = muteResults.filter((r) => !r.ok);
+		muteSummary = '已解除全群禁言（' + muteOk + '/' + muteResults.length + ' 个群）';
+		if (muteFailed.length) {
+			muteSummary += '；失败群：' + muteFailed.slice(0, 3).map((r) => r.groupId + '(' + (r.error || '未知') + ')').join('、');
+		}
 		const results = await unbanUserFromAllGroups(targetId);
 		const okCount = results.filter((r) => r.ok).length;
 		unbanSummary = okCount + '/' + results.length + ' 个群成功';
@@ -14675,26 +15173,7 @@ async function handleAdIgnoreCommand(env, chatId, ownerId, arg) {
 			: 'AI 样本 删除失败';
 		const allowNote = '放行 ' + (r.allowlisted?.added?.length || 0) + ' 项';
 		if (single) {
-			lines.push('用户：<code>' + escapeHtml(r.targetId) + '</code>');
-			lines.push('黑名单：' + (r.removed.success ? '已移除' : (r.removed.code === 'NOT_FOUND' ? '本就不在黑名单' : '移除失败')));
-			lines.push('解封：' + escapeHtml(r.unbanSummary));
-			// 禁言与封禁是两套状态，回执必须分别报 —— 只报「解封 3/3 个群成功」
-			// 会让主人以为误判已经彻底恢复，而人可能还挂在本群禁言里。
-			lines.push('解禁：' + escapeHtml(r.muteSummary));
-			lines.push('指纹修正：' + (r.fp.ok ? '已标记 <b>' + (r.fp.affected || 0) + '</b> 条误判，删除 <b>' + (r.fp.retired || 0) + '</b> 条' : '标记失败'));
-			lines.push('AI 样本：' + (r.sampleRemoved.ok ? (r.sampleRemoved.removed > 0 ? '已删除 <b>' + r.sampleRemoved.removed + '</b> 条' : '无对应样本') : '删除失败'));
-			// 放行库是本命令唯一「加法」副作用，必须写清楚登记了哪几项 ——
-			// 它是「同一份素材不会再被封」的全部依据，主人事后要撤也只能靠这条回执找到入口。
-			lines.push('误判放行：' + (r.allowlisted?.added?.length
-				? '已登记 <b>' + r.allowlisted.added.length + '</b> 项（'
-					+ r.allowlisted.added.map((a) => escapeHtml(AD_ALLOWLIST_DIMENSION_LABELS[a.dimension] || a.dimension)).join('、')
-					+ '），这些素材不再参与判定'
-				: '无可登记素材'));
-			if (r.fp.ok && r.fp.affected > 0 && Array.isArray(r.fp.rows)) {
-				lines.push('');
-				lines.push('受影响指纹：');
-				for (const row of r.fp.rows.slice(0, 5)) lines.push('· [' + escapeHtml(row.type) + '] ' + escapeHtml(String(row.value).slice(0, 40)));
-			}
+			lines.push(...renderAdRollbackSingleLines(r));
 		} else {
 			lines.push('<b>#' + seq + '</b>　<code>' + escapeHtml(r.targetId) + '</code>　解封 '
 				+ escapeHtml(r.unbanSummary) + '　' + escapeHtml(r.muteSummary)

@@ -212,15 +212,28 @@ vm.runInContext(stripExportDefault(src), sandbox, { filename: '_worker.js' });
 const handler = sandbox.__handler;
 const GROUP_ID = '-1001111111111';
 const OWNER_ID = 10001;
+// 【为什么必须另设一个主群】2026-09-19 起「主群」（= SELF_UNBAN_CONTACT_GROUP，默认 GROUP_IDS[0]）
+// 被排除在所有【自动】处置之外 —— 被全群封禁 + 拉黑后它唯一还能联系到主人的通道，
+// 自动判定（可能误判）不能把它堵死（见 _worker.js 的 isSelfUnbanContactGroup）。
+// 若沿用「唯一治理群就是主群」的老夹具，GROUP_ID 会同时是治理群和主群，
+// 于是所有自动处置都被豁免，测出来的不是产品行为而是夹具的漏洞。
+// 人工路径（/ban、/spam、/rescreen、通知按钮）不受豁免，那些断言保持不变。
+const CONTACT_GROUP_ID = '-1009999999999';
 
 function makeEnv(extra = {}) {
+	// 主群永远追加在【最后】：治理群仍是列表第一项（模块级 GROUP_ID 取第一项），
+	// 所有既有断言里的 GROUP_ID 语义完全不变。
+	const governed = String(extra.GROUP_ID ?? GROUP_ID);
+	const rest = { ...extra };
+	delete rest.GROUP_ID;
 	return {
 		TOKEN: 'TESTTOKEN',
 		BOT_TOKEN: '123456:fake',
-		GROUP_ID,
+		GROUP_ID: governed + ',' + CONTACT_GROUP_ID,
+		SELF_UNBAN_CONTACT_GROUP: CONTACT_GROUP_ID,
 		OWNER_IDS: String(OWNER_ID),
 		DB: makeD1(),
-		...extra
+		...rest
 	};
 }
 
@@ -2033,7 +2046,10 @@ section('[15] 方案 6 · 三道闸的 bio 检测（双轨：首发查 bio + 定
 	//   1) 用干净 bio 发一句正常话 → 进名册、bio_checked_at 记为「刚查过」
 	//   2) 把 bio 改成广告（模拟改简介），此后不再发言
 	//   3) 把 bio_checked_at 手工推回 4 天前（模拟时间流逝到超过 3 天冷却）
-	//   4) 触发 cron → 必须查出来并封禁
+	//   4) 触发 cron → 必须查出来并按【渐进式】处置：2026-09-19 起这条轨道也走渐进式，
+	//      首次命中是「全群禁言」（restrictChatMember）：不踢出、不拉黑、写监控台账。
+	//      主人口径：「首次只禁言，再犯才全群封禁」——cron 扫的是从没发过言的人，
+	//      没有「当前群」语义，所以它的「首次禁言」范围是【所有治理群】。
 	const envG6 = makeEnv();
 	resetCalls();
 	setApi(api({ first_name: '王五', bio: '爱好摄影' }));
@@ -2051,9 +2067,29 @@ section('[15] 方案 6 · 三道闸的 bio 检测（双轨：首发查 bio + 定
 	setApi(api({ first_name: '王五', bio: '长期收购微信老号 支付宝实名号 高价收 秒结 私聊' }));
 	const scanResult = await W.runAdBioRescan(envG6, { dailyLimit: 10, batchSize: 5, intervalMs: 0 });
 	assert('闸三：扫描确实复查了该用户', scanResult.scanned >= 1, JSON.stringify(scanResult));
-	assert('闸三：改 bio 后被扫描抓到并封禁', envG6.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '90006'")[0].c === 1, JSON.stringify(envG6.DB.query('SELECT id FROM blacklist')));
-	assert('闸三：扫描执行了全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	// 首次判定【不拉黑】：拉黑会让黑名单兜底拦截在他去别的群发言时封那个群，
+	// 等于绕开「再犯才升级」直接做了近似全群封禁，渐进式就白做了。
+	assert('闸三：首次命中不拉黑', envG6.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '90006'")[0].c === 0, JSON.stringify(envG6.DB.query('SELECT id FROM blacklist')));
+	// 处置动作必须是【禁言】而不是封禁：banChatMember 会把人在所有群里踢出去，
+	// 误判的代价（人得自己重新进群）不对称。
+	assert('闸三：扫描执行了全群禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('闸三：扫描未执行封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+	// 台账是升级的门槛：不写这一行，下次复查又会当成「首次」再禁言一次，升级链永远断掉。
+	assert('闸三：写了渐进式监控台账', envG6.DB.query("SELECT COUNT(*) AS c FROM ad_ban_scope WHERE user_id = '90006'")[0].c === 1, JSON.stringify(envG6.DB.query('SELECT user_id, scope_state FROM ad_ban_scope')));
 	assert('闸三：扫描后 bio_checked_at 被推到当前', Number(envG6.DB.query("SELECT bio_checked_at FROM ad_group_members WHERE user_id = '90006'")[0]?.bio_checked_at) > staleAt);
+
+	// ---- 闸三：第二次复查抓到 → 升级全群封禁 ----
+	// 这是「再犯才升级」在 cron 轨道上的落点：台账里已有 state='single' 的记录，
+	// decideAdBanScope 读到它就会返回 reason='escalated' → 全群封禁 + 拉黑 + 标台账。
+	// 不测这一步的话，「首次禁言」会被误当成「永远只禁言」。
+	envG6.DB.exec("UPDATE ad_group_members SET bio_checked_at = " + staleAt + " WHERE user_id = '90006'");
+	resetCalls();
+	W.invalidateAdProfileCache();
+	setApi(api({ first_name: '王五', bio: '长期收购微信老号 支付宝实名号 高价收 秒结 私聊' }));
+	await W.runAdBioRescan(envG6, { dailyLimit: 10, batchSize: 5, intervalMs: 0 });
+	assert('闸三升级：第二次被抓到后全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('闸三升级：升级后拉黑', envG6.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '90006'")[0].c === 1, JSON.stringify(envG6.DB.query('SELECT id FROM blacklist')));
+	assert('闸三升级：台账置为 global', String(envG6.DB.query("SELECT scope_state FROM ad_ban_scope WHERE user_id = '90006'")[0]?.scope_state) === 'global', JSON.stringify(envG6.DB.query('SELECT user_id, scope_state FROM ad_ban_scope')));
 
 	// ---- 闸三：冷却期内的人不被重复扫描 ----
 	// bio_checked_at 刚被推到现在，队列里应当没人可取 —— 这就是「游标」的自平衡性质：
@@ -2092,6 +2128,54 @@ section('[15] 方案 6 · 三道闸的 bio 检测（双轨：首发查 bio + 定
 	assert('闸三：不超过当日配额', capped.scanned === 4, JSON.stringify(capped));
 	assert('闸三：按 batchSize 分批', capped.batches === 2, JSON.stringify(capped));
 	assert('闸三：配额用尽后再次触发不再扫描', (await W.runAdBioRescan(envG8, { dailyLimit: 4, batchSize: 2, intervalMs: 0 })).skipped === 'daily_limit_reached');
+
+	// ---- 全群禁言 / 全群解禁的范围（双群环境）----
+	// 主人 09-19 报障的那个场景：cron 主动扫描扫到「资料卡就是广告」的号。
+	// 这条轨道没有「当前群」语义（chatId 只是名册里记的最近发言群），
+	// 所以它的「首次禁言」范围必须是【所有治理群】—— 只禁言一个群等于其余群完全没被处置。
+	// 同理 /ignore 回滚必须覆盖同样的范围：只解触发群会留下
+	// 「回执写着已解除禁言，而那个人仍在其余群说不了话」的假象。
+	{
+		const G2 = '-1002222222222';
+		const envMulti = makeEnv({ GROUP_ID: GROUP_ID + ',' + G2 });
+		const multiApi = {
+			getChat: (b) => ({ ok: true, result: { id: b?.chat_id, first_name: '广告号', bio: '长期收购微信老号 支付宝实名号 高价收 秒结 私聊' } }),
+			getChatMember: (b) => ({ ok: true, result: { status: 'member', user: { id: b?.user_id } } }),
+			getChatAdministrators: () => ({ ok: true, result: [] })
+		};
+		// 先走一次请求让 applyConfig 生效 —— GROUP_IDS 是模块级变量，只在请求入口按
+		// env.GROUP_ID 重建。不预热的话下面 runAdBioRescan 用的还是上一个场景的单群清单。
+		resetCalls();
+		setApi(multiApi);
+		await sendUpdate({ message: groupMessage({ id: 91999, first_name: '路人甲' }, '大家好') }, envMulti);
+		// 名册里种一行：cron 的扫描源就是它。bio_checked_at = 0 → 立刻可扫。
+		envMulti.DB.exec("INSERT INTO ad_group_members (user_id, chat_id, first_name, last_name, username, first_seen, last_seen, bio_checked_at) VALUES ('92001', '" + GROUP_ID + "', '广告号', '', '', 1, 1, 0)");
+		resetCalls();
+		W.invalidateAdProfileCache();
+		setApi(multiApi);
+		const multiScan = await W.runAdBioRescan(envMulti, { dailyLimit: 10, batchSize: 5, intervalMs: 0 });
+		const muteCalls = countCalls('restrictChatMember');
+		assert('★ cron 轨道首次处置 = 全群禁言（每个治理群各一次）',
+			multiScan.banned >= 1 && muteCalls === 2 && countCalls('banChatMember') === 0,
+			JSON.stringify({ scan: multiScan, muteCalls, methods: calls.map((c) => c.method) }));
+		assert('★ 全群禁言不拉黑', envMulti.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '92001'")[0].c === 0);
+
+		const seqMulti = envMulti.DB.query("SELECT seq FROM ad_pending_snapshots WHERE user_id = '92001'")[0]?.seq;
+		resetCalls();
+		await sendUpdate({ message: privateMessage(OWNER_ID, '/ignore ' + seqMulti) }, envMulti);
+		const unmuteCalls = countCalls('restrictChatMember');
+		// 解禁覆盖【全部】配置群，含主群 —— 与解封（unbanUserFromAllGroups）同口径。
+		// 理由：解除禁言是幂等且无副作用的动作，而 /ignore 是人工回滚，
+		// 宁可多解一个群，也不能漏掉一个还挂在禁言里的群。主群虽然不会被自动禁言，
+		// 但这里刻意不为它开特例 —— 少一处分支就少一处漏判。
+		// 分母从配置里算，不写死数字：夹具改了群数断言仍然成立。
+		const configuredGroups = String(envMulti.GROUP_ID).split(',').length;
+		assert('★ /ignore 对每个治理群都发了解除禁言请求（不是只解触发群）',
+			unmuteCalls === configuredGroups,
+			JSON.stringify({ unmuteCalls, configuredGroups, methods: calls.map((c) => c.method) }));
+	}
+	resetCalls();
+	W.invalidateAdProfileCache();
 
 	// ---- 未查 bio 时不得施加「无 Bio」减分 ----
 	// 「没查」和「没有」在 profile.bio 上都是空串，但意义相反。
@@ -3715,6 +3799,351 @@ section('[20] 渐进式处置（AD_BAN_SCOPE_MODE：首次只禁言当前群 →
 	assert('手工 /ban 的号：不发升级通知给主人',
 		!ownerText().includes('升级为全群封禁'),
 		ownerText().slice(0, 400));
+}
+
+section('[21] 主群豁免自动处置 + 判定通知按钮（解除禁言 / 全群封禁）');
+{
+	// 本节全部用【多群 + 独立主群】配置。主群（CONTACT_GROUP_ID）不参与治理，
+	// 它是「被全群封禁 + 拉黑之后唯一还能联系到主人的通道」，自动处置必须跳过它。
+	const G1 = '-1001111111111';
+	const G2 = '-1002222222222';
+	const G3 = '-1003333333333';
+	const AD_ID = '61001';
+	const AD_NAME = '💚高价收网赚号💚';
+	const AD_BIO = '长期收购网 du 商宝账号，老账号优先加价';
+	const AD_TEXT = '招代理日结佣金 无需经验 加微详聊';
+
+	const makeMultiEnv = (extra = {}) => makeEnv({ GROUP_ID: `${G1},${G2},${G3}`, ...extra });
+	const msgIn = (chatId, chatTitle, from, text, extra = {}) => ({
+		message_id: 700 + Math.floor(Math.random() * 1000),
+		date: Math.floor(Date.now() / 1000),
+		text,
+		chat: { id: Number(chatId), type: 'supergroup', title: chatTitle },
+		from: { is_bot: false, ...from },
+		...extra
+	});
+	const bannedChats = () => calls.filter((c) => c.method === 'banChatMember').map((c) => String(c.body?.chat_id));
+	const mutedCalls = () => calls.filter((c) => c.method === 'restrictChatMember');
+	const mutedChats = () => mutedCalls().map((c) => String(c.body?.chat_id));
+	const ownerMsgs = () => calls
+		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(OWNER_ID))
+		.map((c) => String(c.body?.text || ''));
+	const ownerText = () => ownerMsgs().join('\n');
+	// 通知上实际挂出去的键盘。断言直接读它 —— 比读源码常量更接近主人的真实体验：
+	// 只要这里拿不到按钮，主人手上就是没有按钮。
+	const ownerKeyboard = () => calls
+		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(OWNER_ID) && c.body?.reply_markup)
+		.map((c) => c.body.reply_markup).at(-1) || null;
+	const adApi = () => setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: AD_NAME, bio: AD_BIO } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	// 按钮回调 update。默认在主人自己的私聊里点，且 message.chat.id === from.id。
+	const cbUpdate = (data, { fromId = OWNER_ID, chatId = OWNER_ID } = {}) => ({
+		callback_query: {
+			id: 'cb-' + Math.floor(Math.random() * 1e9),
+			from: { id: fromId, is_bot: false, first_name: 'Owner' },
+			chat_instance: '1',
+			data,
+			message: {
+				message_id: 4242,
+				date: Math.floor(Date.now() / 1000),
+				chat: { id: chatId, type: 'private', first_name: 'Owner' },
+				text: '（判定通知）'
+			}
+		}
+	});
+
+	// ===== 21.1 首次在主群触发：整体豁免（禁言与封禁都不做），但删消息 + 落台账 + 发通知 =====
+	const envA = makeMultiEnv();
+	resetCalls();
+	adApi();
+	await sendUpdate({ message: msgIn(CONTACT_GROUP_ID, '联络主群', { id: AD_ID, first_name: AD_NAME }, AD_TEXT) }, envA);
+	assert('★ 主群豁免：没有禁言任何群', mutedChats().length === 0, JSON.stringify(mutedChats()));
+	assert('★ 主群豁免：没有封禁任何群', bannedChats().length === 0, JSON.stringify(bannedChats()));
+	// 豁免的是「处置人」，不是「放过广告」—— 删消息是消息级动作，不改变成员状态，
+	// 也就不会关上联络通道；不删的话主群就真成了广告可以随便刷的地方。
+	assert('主群豁免：触发消息仍然被删（止住广告但不处置人）',
+		countCalls('deleteMessage') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('主群豁免：不拉黑（拉黑会让自助解封被硬闸门拒掉）',
+		envA.DB.query(`SELECT COUNT(*) AS c FROM blacklist WHERE id = '${AD_ID}'`)[0].c === 0,
+		JSON.stringify(envA.DB.query('SELECT id, reason FROM blacklist')));
+	// 台账语义是「这个号已经被判定过一次」，与本次动作强弱无关 ——
+	// 不写的话这个号永远是「首次判定」，下次露头也不会升级。
+	assert('★ 主群豁免：仍然写入监控台账（下次露头才会升级）',
+		envA.DB.query(`SELECT scope_state FROM ad_ban_scope WHERE user_id = '${AD_ID}'`)[0]?.scope_state === 'single',
+		JSON.stringify(envA.DB.query('SELECT * FROM ad_ban_scope')));
+	assert('主群豁免：通知标题写明「主群豁免」', ownerText().includes('主群豁免'), ownerText().slice(0, 500));
+	// 文案不能说「0/0 个群成功」—— 那是正常豁免，写成计数看着像彻底失败。
+	assert('★ 主群豁免：文案是「未执行任何群处置」而不是 0/0 计数',
+		ownerText().includes('未执行任何群处置') && !ownerText().includes('0/0 个群成功'),
+		ownerText().slice(0, 500));
+	assert('主群豁免：通知说明再次判定仍会升级', ownerText().includes('再次判定将升级全群封禁'), ownerText().slice(0, 600));
+
+	// ===== 21.2 通知下方必须挂两颗按钮，且回调数据能被解析 =====
+	const kbA = ownerKeyboard();
+	const rowA = kbA?.inline_keyboard?.[0] || [];
+	assert('★ 通知挂了 2 颗处置按钮', rowA.length === 2, JSON.stringify(kbA));
+	assert('★ 按钮回调数据都在 Telegram 的 64 字节上限内',
+		rowA.every((b) => new TextEncoder().encode(String(b.callback_data || '')).length <= 64),
+		JSON.stringify(rowA));
+	assert('主群豁免时左键是「误判放行」（本次没禁言，不能写「解除禁言」）',
+		String(rowA[0]?.text || '').includes('误判放行'), JSON.stringify(rowA));
+	assert('右键是「全群封禁」', String(rowA[1]?.text || '').includes('全群封禁'), JSON.stringify(rowA));
+	assert('按钮回调数据带 ade: 前缀且指向本人 + 快照序号',
+		/^ade:A:\d+:\d+$/.test(String(rowA[0]?.callback_data || ''))
+		&& /^ade:B:\d+:\d+$/.test(String(rowA[1]?.callback_data || '')),
+		JSON.stringify(rowA.map((b) => b.callback_data)));
+
+	// ===== 21.3 第二次在主群触发：升级全群封禁，但封禁清单里【没有】主群 =====
+	resetCalls();
+	adApi();
+	await sendUpdate({ message: msgIn(CONTACT_GROUP_ID, '联络主群', { id: AD_ID, first_name: AD_NAME }, AD_TEXT) }, envA);
+	const escalateBans = bannedChats();
+	assert('★ 主群再犯：升级为全群封禁', escalateBans.length >= 1, JSON.stringify(escalateBans));
+	assert('★ 主群再犯：三个治理群都被封', [G1, G2, G3].every((g) => escalateBans.includes(g)), JSON.stringify(escalateBans));
+	assert('★ 主群再犯：封禁清单里没有主群（联络通道必须留着）',
+		!escalateBans.includes(CONTACT_GROUP_ID), JSON.stringify(escalateBans));
+	assert('主群再犯：升级后拉黑（这一步才真正需要联络通道兜底）',
+		envA.DB.query(`SELECT COUNT(*) AS c FROM blacklist WHERE id = '${AD_ID}'`)[0].c === 1,
+		JSON.stringify(envA.DB.query('SELECT id, reason FROM blacklist')));
+	assert('主群再犯：台账已标记为 global',
+		envA.DB.query(`SELECT scope_state FROM ad_ban_scope WHERE user_id = '${AD_ID}'`)[0]?.scope_state === 'global',
+		JSON.stringify(envA.DB.query('SELECT * FROM ad_ban_scope')));
+	assert('主群再犯：通知标题是「全群封禁」而不是「主群豁免」',
+		ownerText().includes('广告号自动封禁'), ownerText().slice(0, 500));
+
+	// ===== 21.4 左键 = 误判放行：与 /ignore 走同一条回滚链 =====
+	const envU = makeMultiEnv();
+	resetCalls();
+	adApi();
+	await sendUpdate({ message: msgIn(CONTACT_GROUP_ID, '联络主群', { id: AD_ID, first_name: AD_NAME }, AD_TEXT) }, envU);
+	const undoData = ownerKeyboard()?.inline_keyboard?.[0]?.[0]?.callback_data;
+	assert('前置：拿到了「误判放行」按钮的回调数据', Boolean(undoData), JSON.stringify(ownerKeyboard()));
+	resetCalls();
+	await sendUpdate(cbUpdate(undoData), envU);
+	// 解除禁言走 restrictChatMember（mute: false），且必须覆盖【全部】配置群 ——
+	// 与 /ignore 同口径：宁可多解一个群，也不能漏掉一个还挂在禁言里的群。
+	assert('★ 误判放行：对全部配置群发了「解除禁言」',
+		mutedCalls().length === 4 && mutedCalls().every((c) => c.body?.permissions?.can_send_messages === true),
+		JSON.stringify(mutedCalls().map((c) => c.body?.chat_id)));
+	assert('误判放行：同时执行全群解封', countCalls('unbanChatMember') >= 4, JSON.stringify(calls.map((c) => c.method)));
+	assert('★ 误判放行：清掉渐进式台账（否则一次误判永久抬高后续处置强度）',
+		envU.DB.query(`SELECT COUNT(*) AS c FROM ad_ban_scope WHERE user_id = '${AD_ID}'`)[0].c === 0,
+		JSON.stringify(envU.DB.query('SELECT * FROM ad_ban_scope')));
+	assert('★ 误判放行：登记了误判放行库（同一份素材不再参与判定）',
+		envU.DB.query(`SELECT COUNT(*) AS c FROM ad_allowlist WHERE user_id = '${AD_ID}'`)[0].c > 0,
+		JSON.stringify(envU.DB.query('SELECT * FROM ad_allowlist')));
+	assert('误判放行：摘掉通知上的按钮（挡住同一颗按钮被点第二次）',
+		countCalls('editMessageReplyMarkup') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('误判放行：回执写明已按误判回滚',
+		ownerMsgs().join('\n').includes('已按误判回滚'), ownerMsgs().join('\n').slice(0, 600));
+
+	// ===== 21.5 右键 = 全群封禁：人工路径，【包含】主群 =====
+	const envB = makeMultiEnv();
+	resetCalls();
+	adApi();
+	await sendUpdate({ message: msgIn(CONTACT_GROUP_ID, '联络主群', { id: AD_ID, first_name: AD_NAME }, AD_TEXT) }, envB);
+	const banData = ownerKeyboard()?.inline_keyboard?.[0]?.[1]?.callback_data;
+	assert('前置：拿到了「全群封禁」按钮的回调数据', Boolean(banData), JSON.stringify(ownerKeyboard()));
+	resetCalls();
+	await sendUpdate(cbUpdate(banData), envB);
+	const manualBans = bannedChats();
+	assert('★ 全群封禁：4 个群全封，主群也在内（这是主人的明确决定，不受自动豁免限制）',
+		manualBans.length === 4 && manualBans.includes(CONTACT_GROUP_ID)
+		&& [G1, G2, G3].every((g) => manualBans.includes(g)),
+		JSON.stringify(manualBans));
+	assert('★ 全群封禁：写入黑名单',
+		envB.DB.query(`SELECT COUNT(*) AS c FROM blacklist WHERE id = '${AD_ID}'`)[0].c === 1,
+		JSON.stringify(envB.DB.query('SELECT id, reason FROM blacklist')));
+	assert('★ 全群封禁：台账升级为 global（后续不会再重复升级）',
+		envB.DB.query(`SELECT scope_state FROM ad_ban_scope WHERE user_id = '${AD_ID}'`)[0]?.scope_state === 'global',
+		JSON.stringify(envB.DB.query('SELECT * FROM ad_ban_scope')));
+	assert('全群封禁：标记快照已复核（expires_at 归零 → 从 /pending 移除）',
+		Number(envB.DB.query(`SELECT expires_at FROM ad_pending_snapshots WHERE user_id = '${AD_ID}'`)[0]?.expires_at) === 0,
+		JSON.stringify(envB.DB.query('SELECT * FROM ad_pending_snapshots')));
+	assert('全群封禁：摘掉按钮', countCalls('editMessageReplyMarkup') >= 1, JSON.stringify(calls.map((c) => c.method)));
+
+	// ===== 21.6 权限与防重放 =====
+	// 非第一主人点击 → 拒绝，且不产生任何处置动作。
+	const envP = makeMultiEnv();
+	resetCalls();
+	adApi();
+	await sendUpdate({ message: msgIn(CONTACT_GROUP_ID, '联络主群', { id: AD_ID, first_name: AD_NAME }, AD_TEXT) }, envP);
+	const dataP = ownerKeyboard()?.inline_keyboard?.[0]?.[1]?.callback_data;
+	resetCalls();
+	await sendUpdate(cbUpdate(dataP, { fromId: 88888, chatId: 88888 }), envP);
+	assert('非第一主人点击：拒绝且不封禁任何群', bannedChats().length === 0, JSON.stringify(bannedChats()));
+	assert('非第一主人点击：黑名单未被写入',
+		envP.DB.query(`SELECT COUNT(*) AS c FROM blacklist WHERE id = '${AD_ID}'`)[0].c === 0);
+	assert('非第一主人点击：明确告知仅限第一主人',
+		allSentText().includes('仅限第一主人') || calls.some((c) => c.method === 'answerCallbackQuery'),
+		JSON.stringify(calls.map((c) => c.method)));
+
+	// 第一主人但在群里点（不是自己的私聊）→ 拒绝：转发出去的通知不该能被点。
+	resetCalls();
+	await sendUpdate(cbUpdate(dataP, { fromId: OWNER_ID, chatId: G1 }), envP);
+	assert('主人在群里点：同样拒绝（必须在自己私聊里点）', bannedChats().length === 0, JSON.stringify(bannedChats()));
+
+	// 回调数据里的 userId 与快照不一致 → 拒绝，绝不拿错人的号去处置。
+	resetCalls();
+	await sendUpdate(cbUpdate(String(dataP).replace(/^ade:B:\d+:/, 'ade:B:999999:')), envP);
+	assert('★ 按钮数据与快照不匹配：拒绝执行', bannedChats().length === 0, JSON.stringify(bannedChats()));
+	assert('按钮数据不匹配：黑名单未被写入',
+		envP.DB.query(`SELECT COUNT(*) AS c FROM blacklist WHERE id = '999999'`)[0].c === 0);
+
+	// 已复核过的序号再点 → 提示已处理，不重复执行。
+	const envR = makeMultiEnv();
+	resetCalls();
+	adApi();
+	await sendUpdate({ message: msgIn(CONTACT_GROUP_ID, '联络主群', { id: AD_ID, first_name: AD_NAME }, AD_TEXT) }, envR);
+	const dataR = ownerKeyboard()?.inline_keyboard?.[0]?.[1]?.callback_data;
+	resetCalls();
+	await sendUpdate(cbUpdate(dataR), envR);
+	const firstBanCount = bannedChats().length;
+	resetCalls();
+	await sendUpdate(cbUpdate(dataR), envR);
+	assert('★ 重复点击同一颗按钮：不重复处置（快照已复核）',
+		firstBanCount === 4 && bannedChats().length === 0,
+		JSON.stringify({ firstBanCount, second: bannedChats() }));
+
+	// ===== 21.7 黑名单兜底拦截：自动加黑的号在主群豁免，手工加黑的号照旧 =====
+	// 光豁免「处置」还不够 —— 黑名单兜底拦截（发言即踢、复入群即踢）才是自动封禁的
+	// 实际执行者。不豁免它，人虽然没被自动封禁，一开口 / 一进群还是会被踢出去。
+	const envBL = makeMultiEnv();
+	resetCalls();
+	adApi();
+	// 先发一条无害消息把 D1 核心表建起来（建表是懒加载的，直接 INSERT 会撞 no such table）。
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: '62000', first_name: '路人' }, '大家早上好') }, envBL);
+	envBL.DB.prepare("INSERT INTO blacklist (id, reason, by_user, at, note) VALUES (?, 'ad_auto', 'system', '2026-09-19T00:00:00Z', '')").bind('62001').run();
+	envBL.DB.prepare("INSERT INTO blacklist (id, reason, by_user, at, note) VALUES (?, 'manual', '10001', '2026-09-19T00:00:00Z', '')").bind('62002').run();
+
+	// 自动加黑的号在主群发言 → 只删消息，不踢人
+	resetCalls();
+	await sendUpdate({ message: msgIn(CONTACT_GROUP_ID, '联络主群', { id: '62001', first_name: '自动加黑' }, '我要申诉') }, envBL);
+	assert('★ 黑名单拦截（主群）：自动加黑的号不被踢出（联络通道留着）',
+		!bannedChats().includes(CONTACT_GROUP_ID), JSON.stringify(bannedChats()));
+	assert('黑名单拦截（主群）：消息仍被删（主群不会被刷屏）',
+		countCalls('deleteMessage') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('黑名单拦截（主群）：主人收到带「主群豁免」说明的通知',
+		ownerText().includes('主群豁免'), ownerText().slice(0, 500));
+
+	// 同一个自动加黑的号在【普通治理群】发言 → 照旧踢出，豁免不外溢
+	resetCalls();
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: '62001', first_name: '自动加黑' }, '继续发广告') }, envBL);
+	assert('★ 黑名单拦截（普通群）：自动加黑的号照旧被踢（豁免只作用于主群）',
+		bannedChats().includes(G1), JSON.stringify(bannedChats()));
+
+	// 手工加黑的号在主群发言 → 照旧踢出。豁免只给自动判定，手工封禁的效力不能被削弱。
+	resetCalls();
+	await sendUpdate({ message: msgIn(CONTACT_GROUP_ID, '联络主群', { id: '62002', first_name: '手工加黑' }, '我是广告') }, envBL);
+	assert('★ 黑名单拦截（主群）：手工加黑的号照旧被踢（豁免只给自动判定）',
+		bannedChats().includes(CONTACT_GROUP_ID), JSON.stringify(bannedChats()));
+
+	// 复入群拦截：这才是主人担心的那一步 ——「被封的人想回主群找我」。
+	const memberUpdate = (userId, firstName, { oldStatus = 'left', newStatus = 'member' } = {}) => ({
+		chat_member: {
+			chat: { id: Number(CONTACT_GROUP_ID), type: 'supergroup', title: '联络主群' },
+			from: { id: Number(userId), is_bot: false, first_name: firstName },
+			date: Math.floor(Date.now() / 1000),
+			old_chat_member: { user: { id: Number(userId), is_bot: false, first_name: firstName }, status: oldStatus },
+			new_chat_member: { user: { id: Number(userId), is_bot: false, first_name: firstName }, status: newStatus }
+		}
+	});
+	resetCalls();
+	await sendUpdate(memberUpdate(62001, '自动加黑'), envBL);
+	assert('★ 复入群拦截（主群）：自动加黑的号重新加回主群不被踢（这一步就是「联系我」）',
+		!bannedChats().includes(CONTACT_GROUP_ID), JSON.stringify(bannedChats()));
+	assert('复入群拦截（主群）：主人收到豁免通知',
+		ownerText().includes('主群豁免'), ownerText().slice(0, 500));
+
+	resetCalls();
+	await sendUpdate(memberUpdate(62002, '手工加黑'), envBL);
+	assert('★ 复入群拦截（主群）：手工加黑的号重新加回主群照旧踢回',
+		bannedChats().includes(CONTACT_GROUP_ID), JSON.stringify(bannedChats()));
+
+	// 复入群拦截在普通治理群不受影响
+	resetCalls();
+	await sendUpdate({
+		chat_member: {
+			chat: { id: Number(G1), type: 'supergroup', title: '第一治理群' },
+			from: { id: 62001, is_bot: false, first_name: '自动加黑' },
+			date: Math.floor(Date.now() / 1000),
+			old_chat_member: { user: { id: 62001, is_bot: false, first_name: '自动加黑' }, status: 'left' },
+			new_chat_member: { user: { id: 62001, is_bot: false, first_name: '自动加黑' }, status: 'member' }
+		}
+	}, envBL);
+	assert('★ 复入群拦截（普通群）：自动加黑的号照旧踢回',
+		bannedChats().includes(G1), JSON.stringify(bannedChats()));
+
+	resetCalls();
+	W.invalidateAdProfileCache();
+}
+
+section('[22] 联络入口：黑名单拒绝回执必须自带联系方式');
+{
+	// 主人 2026-09-19 指出的缺口：黑名单用户是自助解封被硬闸门拒掉的那批人，
+	// 而拒绝回执只写了「请自行联系管理员解封」—— 没有任何联系方式。
+	// 被全群封禁的人进不去主群，等于彻底失联。所以这条回执必须自带入口。
+	const CONTACT_URL = 'https://t.me/SevenStarChannel?direct';
+	const contactApi = () => setApi({
+		getChat: (b) => ({ ok: true, result: { id: b?.chat_id, title: '主群', username: 'main_group' } }),
+		getChatMember: (b) => ({ ok: true, result: { status: 'member', user: { id: b?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	const sentTo = (chatId) => calls
+		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(chatId));
+	const lastKeyboardTo = (chatId) => sentTo(chatId).map((c) => c.body?.reply_markup).filter(Boolean).at(-1) || null;
+	const textTo = (chatId) => sentTo(chatId).map((c) => String(c.body?.text || '')).join('\n');
+	// 建表 + 种一条黑名单记录
+	const seedBlacklisted = async (env, uid) => {
+		resetCalls();
+		contactApi();
+		await sendUpdate({ message: groupMessage({ id: String(Number(uid) + 1), first_name: '路人' }, '大家好') }, env);
+		env.DB.prepare("INSERT INTO blacklist (id, reason, by_user, at, note) VALUES (?, 'ad_auto', 'system', '2026-09-19T00:00:00Z', '')").bind(String(uid)).run();
+		resetCalls();
+		contactApi();
+		await sendUpdate({ message: privateMessage(Number(uid), '/unban') }, env);
+	};
+
+	// ① 配了 SELF_UNBAN_CONTACT_URL → 按钮就用它（频道私信这类不依赖群身份的链接）
+	const envC = makeEnv({ SELF_UNBAN_CONTACT_URL: CONTACT_URL });
+	await seedBlacklisted(envC, 63001);
+	const kbC = lastKeyboardTo(63001);
+	assert('★ 黑名单拒绝回执带上了联络按钮', Boolean(kbC?.inline_keyboard?.[0]?.[0]?.url), JSON.stringify(kbC));
+	assert('★ 联络按钮指向配置的 SELF_UNBAN_CONTACT_URL（不依赖群成员身份）',
+		kbC?.inline_keyboard?.[0]?.[0]?.url === CONTACT_URL, JSON.stringify(kbC));
+	assert('拒绝回执正文写明申诉入口', textTo(63001).includes('申诉请点下方按钮'), textTo(63001).slice(0, 400));
+	assert('拒绝回执仍保留原有黑名单提示', textTo(63001).includes('黑名单'), textTo(63001).slice(0, 400));
+
+	// ② 没配 → 回落主群链接，与原行为一致
+	const envD = makeEnv();
+	await seedBlacklisted(envD, 63003);
+	const kbD = lastKeyboardTo(63003);
+	assert('未配置联络 URL 时回落主群链接',
+		String(kbD?.inline_keyboard?.[0]?.[0]?.url || '').includes('t.me/main_group'), JSON.stringify(kbD));
+
+	// ③ 配了非法值 → 忽略并回落，绝不构造点不动的假按钮
+	const envE = makeEnv({ SELF_UNBAN_CONTACT_URL: 'not-a-url' });
+	await seedBlacklisted(envE, 63005);
+	const kbE = lastKeyboardTo(63005);
+	assert('★ 非法联络 URL 被忽略并回落主群链接（不出现假按钮）',
+		String(kbE?.inline_keyboard?.[0]?.[0]?.url || '').includes('t.me/main_group'), JSON.stringify(kbE));
+
+	// ④ 自助解封成功回执同样用这个入口（不再另写一套取链接逻辑）
+	// ⚠️ 关键词要从源码文本里取：vm 沙箱只挂 function 声明，顶层 const 读不到
+	//（同文件里 AD_EMBEDDING_DIMENSION 的处理方式）。
+	const SELF_UNBAN_KEYWORD = src.match(/const DEFAULT_SELF_UNBAN_KEYWORD = '([^']+)'/)?.[1] || '';
+	assert('前置：解析到自助解封关键词', SELF_UNBAN_KEYWORD.length > 0, SELF_UNBAN_KEYWORD);
+	const envF = makeEnv({ SELF_UNBAN_CONTACT_URL: CONTACT_URL });
+	resetCalls();
+	contactApi();
+	await sendUpdate({ message: privateMessage(63007, SELF_UNBAN_KEYWORD) }, envF);
+	const kbF = lastKeyboardTo(63007);
+	assert('★ 自助解封成功回执的按钮同样指向 SELF_UNBAN_CONTACT_URL',
+		kbF?.inline_keyboard?.[0]?.[0]?.url === CONTACT_URL, JSON.stringify(kbF));
+	assert('自助解封成功回执仍然是「已解封」口径', textTo(63007).includes('已同意给予解封'), textTo(63007).slice(0, 300));
 }
 
 console.log('');

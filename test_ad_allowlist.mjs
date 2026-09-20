@@ -191,15 +191,26 @@ const handler = sandbox.__handler;
 const W = sandbox;
 const GROUP_ID = '-1001111111111';
 const OWNER_ID = 10001;
+// 【为什么必须另设一个主群】2026-09-19 起「主群」（= SELF_UNBAN_CONTACT_GROUP，默认 GROUP_IDS[0]）
+// 被排除在所有【自动】处置之外 —— 它是被全群封禁 + 拉黑后唯一还能联系到主人的通道，
+// 自动判定（可能误判）不能把它堵死（见 _worker.js 的 isSelfUnbanContactGroup）。
+// 若沿用「唯一治理群就是主群」的老夹具，GROUP_ID 会同时是治理群和主群，
+// 于是首次命中不再禁言，「禁言 → /ignore 解禁 → 再犯」这条闭环根本测不到。
+const CONTACT_GROUP_ID = '-1009999999999';
 
 function makeEnv(extra = {}) {
+	const governed = String(extra.GROUP_ID ?? GROUP_ID);
+	const rest = { ...extra };
+	delete rest.GROUP_ID;
 	return {
 		TOKEN: 'TESTTOKEN',
 		BOT_TOKEN: '123456:fake',
-		GROUP_ID,
+		// 主群追加在最后：治理群仍是列表第一项，既有断言的 GROUP_ID 语义不变。
+		GROUP_ID: governed + ',' + CONTACT_GROUP_ID,
+		SELF_UNBAN_CONTACT_GROUP: CONTACT_GROUP_ID,
 		OWNER_IDS: String(OWNER_ID),
 		DB: makeD1(),
-		...extra
+		...rest
 	};
 }
 
