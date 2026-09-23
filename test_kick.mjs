@@ -1094,13 +1094,21 @@ console.log('\n[4a] D1 高频路径低请求验证');
 		text: `普通消息 ${messageId}`,
 	});
 
+	// 剪枝语句：按群剪枝后 SQL 变成 `... WHERE chat_id = ? AND id <= COALESCE(...)`，
+	// 因此不能再拿旧的全表前缀做匹配，改用「DELETE + 水位线」两个特征识别。
+	const isPruneQuery = (sql) => sql.startsWith('DELETE FROM moderation_messages WHERE') && sql.includes('id <= COALESCE');
+
 	await sandbox.cacheModerationMessage(env, makeMessage(701));
-	let pruneQueries = db._sql.filter((sql) => sql.startsWith('DELETE FROM moderation_messages WHERE id <= COALESCE'));
+	let pruneQueries = db._sql.filter(isPruneQuery);
 	assert('第 63 条缓存写入不执行裁剪', pruneQueries.length === 0, `实际 ${pruneQueries.length}`);
 
 	await sandbox.cacheModerationMessage(env, makeMessage(702));
-	pruneQueries = db._sql.filter((sql) => sql.startsWith('DELETE FROM moderation_messages WHERE id <= COALESCE'));
+	pruneQueries = db._sql.filter(isPruneQuery);
 	assert('第 64 条缓存写入只执行一次裁剪', pruneQueries.length === 1, `实际 ${pruneQueries.length}`);
+	// 剪枝必须【按群】。若退回全表共用一个窗口，多群部署下别的群的发言会把
+	// 广告号连发的消息提前挤出缓存，清扫就只能删掉最后几条（线上实测 15 条只删 5 条）。
+	assert('★ 裁剪按群限定（WHERE chat_id = ?），不再全表共用窗口',
+		pruneQueries.length === 1 && pruneQueries[0].includes('chat_id = ?'), JSON.stringify(pruneQueries));
 
 	const sqlCountBeforeSteadyMessage = db._sql.length;
 	await handler.fetch(new Request('https://x.com/', {

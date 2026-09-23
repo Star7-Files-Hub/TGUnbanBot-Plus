@@ -3653,6 +3653,42 @@ section('[20] 渐进式处置（AD_BAN_SCOPE_MODE：首次只禁言当前群 →
 		JSON.stringify(deleteCalls.map((c) => String(c.body?.chat_id)).slice(0, 5)));
 	assert('清扫结果写进主人通知', ownerText().includes('本群清扫'), ownerText().slice(0, 900));
 
+	// ===== 20.1c 缓存剪枝必须【按群】，不能全表共用一个窗口 =====
+	// 线上缺陷：广告号在 A 群连发 15 条，清扫只删掉最后 5 条。根因不是清扫上限
+	// （AD_MUTE_CLEANUP_LIMIT = 20 > 15），而是 moderation_messages 的剪枝曾经是
+	// 全表 `ORDER BY id DESC LIMIT 1 OFFSET ?` —— 保留的是【所有群加起来】最新的
+	// 200 行。多群部署下这个窗口被各群瓜分，B/C/D 群的正常发言会把 A 群广告号前面的
+	// 消息一条条挤出缓存；清扫按 mid 查缓存查不到，那几条广告就永远留在群里。
+	// 本用例用「G2 的 15 条被 G1 的 250 条挤」精确复现：旧实现下 G2 那 15 条会被整段剪掉。
+	{
+		const envPrune = makeMultiEnv();
+		await W.ensureD1Table(envPrune);
+		const PRUNE_USER = '60011';
+		for (let i = 0; i < 15; i++) {
+			await envPrune.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)')
+				.bind(88000 + i, G2, PRUNE_USER, new Date().toISOString()).run();
+		}
+		// 另一个群灌 250 条：全表 200 行窗口会被这 250 条占满并越过 G2 那 15 条。
+		for (let i = 0; i < 250; i++) {
+			await envPrune.DB.prepare('INSERT INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)')
+				.bind(77000 + i, G1, '7000' + (i % 7), new Date().toISOString()).run();
+		}
+		await W.pruneAutoincrementCacheTable(envPrune, 'moderation_messages', 200, G1);
+
+		const g2Rows = await envPrune.DB.prepare('SELECT mid FROM moderation_messages WHERE chat_id = ? AND from_id = ?').bind(G2, PRUNE_USER).all();
+		const g1Count = await envPrune.DB.prepare('SELECT COUNT(*) AS c FROM moderation_messages WHERE chat_id = ?').bind(G1).first();
+		assert('★ 剪枝按群隔离：别的群灌 250 条，本群 15 条缓存一条不少（旧实现会被整段剪掉）',
+			(g2Rows.results || []).length === 15, JSON.stringify({ g2Left: (g2Rows.results || []).length }));
+		assert('★ 剪枝按群生效：被剪的那个群只保留 keepLimit 行',
+			Number(g1Count?.c) === 200, JSON.stringify({ g1Left: g1Count?.c }));
+
+		// 端到端：清扫必须能找到该号在本群的全部 15 条（旧实现这里一条都找不到）。
+		resetCalls();
+		const cleanupAll = await W.cleanupCurrentChatUserMessages(envPrune, G2, PRUNE_USER, [], 20);
+		assert('★ 清扫能删掉该号在本群的全部 15 条（不再只剩最后几条）',
+			cleanupAll.total === 15 && cleanupAll.ok === 15, JSON.stringify(cleanupAll));
+	}
+
 	// ===== 20.2 该号在其他群再发广告 → 升级全群封禁 =====
 	// 首次不拉黑之后，他在别的群发言【不会】撞黑名单兜底拦截，而是走完整检测链：
 	// detectAdOnMessage → decideAdBanScope 读到台账 single → reason='escalated' → 全群封禁。

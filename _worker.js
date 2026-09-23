@@ -1315,13 +1315,32 @@ function shouldPruneD1Cache(insertResult) {
 	return insertedId === null || insertedId % D1_CACHE_PRUNE_INTERVAL === 0;
 }
 
-async function pruneAutoincrementCacheTable(env, table, keepLimit) {
+// 缓存剪枝：按【群】分别保留最近 keepLimit 行，而不是全表共用一个窗口。
+//
+// 【为什么必须按群】旧实现是全表 `ORDER BY id DESC LIMIT 1 OFFSET ?` —— 保留的是
+// 【所有群加起来】最新的 keepLimit 行。多群部署下这个窗口被各群瓜分：bot 在 4 个群
+// 时每个群实际只剩约四分之一。广告号在 A 群连发十几条，期间 B/C/D 群的正常发言会
+// 把它前面的广告一条条挤出窗口，等清扫执行时表里只剩最后几条 —— 线上表现为
+// 「发了 15 条只清扫掉 5 条」，前面那些广告永远留在群里（清扫按 mid 查缓存，
+// 缓存里没有的 ID 就永远删不掉）。
+// 按群剪枝后，一个群的缓存只被【本群】的新消息挤出，广告号连发的那一批必然完整。
+async function pruneAutoincrementCacheTable(env, table, keepLimit, chatId = null) {
 	if (table !== 'moderation_messages') {
 		throw new Error(`Unsupported D1 cache table: ${table}`);
 	}
 	const safeLimit = Math.max(1, Math.floor(Number(keepLimit) || 1));
-	await env.DB.prepare(`DELETE FROM ${table} WHERE id <= COALESCE((SELECT id FROM ${table} ORDER BY id DESC LIMIT 1 OFFSET ?), 0)`)
-		.bind(safeLimit)
+	const scopedChatId = chatId === null || chatId === undefined ? '' : String(chatId).trim();
+	if (!scopedChatId) {
+		// 没有群上下文时保留旧的全局口径（正常写入路径不会走到，仅作兜底）。
+		await env.DB.prepare(`DELETE FROM ${table} WHERE id <= COALESCE((SELECT id FROM ${table} ORDER BY id DESC LIMIT 1 OFFSET ?), 0)`)
+			.bind(safeLimit)
+			.run();
+		return;
+	}
+	// 水位线只在本群内按 id 倒序取第 keepLimit+1 行，DELETE 也限定本群 ——
+	// 其他群的缓存一条都不碰。索引 idx_moderation_chat_from_id 的前缀就是 chat_id。
+	await env.DB.prepare(`DELETE FROM ${table} WHERE chat_id = ? AND id <= COALESCE((SELECT id FROM ${table} WHERE chat_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?), 0)`)
+		.bind(scopedChatId, scopedChatId, safeLimit)
 		.run();
 }
 
@@ -5418,7 +5437,8 @@ async function cacheModerationMessage(env, message) {
 		}
 		const limit = Math.max(MSG_CACHE_SIZE, 200);
 		if (shouldPruneD1Cache(insertResult)) {
-			await pruneAutoincrementCacheTable(env, 'moderation_messages', limit);
+			// 按【本群】剪枝，而不是全表共用窗口 —— 理由见 pruneAutoincrementCacheTable。
+			await pruneAutoincrementCacheTable(env, 'moderation_messages', limit, message.chat.id);
 		}
 	} catch (error) {
 		console.error('[清扫缓存] 写 D1 失败:', error);
@@ -10551,8 +10571,9 @@ async function ensureAdDetectionTables(env) {
 			await runD1SchemaStatement(env, 'idx_ad_confirm_expires', 'CREATE INDEX IF NOT EXISTS idx_ad_confirm_expires ON ad_confirm_tokens (expires_at)', { optional: true });
 
 			// 发言者名册。一张表同时承担两件事，刻意不拆：
-			//   ① 方案 5 的扫描源 —— 【不能用 moderation_messages 代替】：那张表只保留最近
-			//      200 条消息（cacheModerationMessage 里 pruneAutoincrementCacheTable 剪枝），
+			//   ① 方案 5 的扫描源 —— 【不能用 moderation_messages 代替】：那张表每个群只保留
+			//      最近 max(MSG_CACHE_SIZE, 200) 行（cacheModerationMessage 里按群剪枝，
+			//      见 pruneAutoincrementCacheTable），
 			//      拿它当名册只能扫到最近说话的几十个人，历史发言者全部丢失。本表按 user_id
 			//      主键 upsert，只增不删（除超期剪枝），是真正的全量名册。
 			//   ② 方案 3 的「已查 bio」台账 —— bio_checked_at 记录上次拉 getChat 的时刻，
