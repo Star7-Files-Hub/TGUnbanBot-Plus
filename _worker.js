@@ -8852,8 +8852,11 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 // 联络通道名义上开着、实际打不开，等于没豁免。所以豁免的粒度是「不处置这个人」，
 // 而不是「不把他踢出去」。
 //
-// 【人工处置不受此限】/ban、/spam、/ad 投票、/rescreen 与判定通知里的「全群封禁」按钮
+// 【人工处置不受此限】/ban、/spam、/ad 投票与判定通知里的「全群封禁」按钮
 // 都是主人的明确决定，一律照常覆盖主群 —— 它们也正是主群被刷广告时的出口。
+// 【/rescreen 不在此列】它只走 enforceAdDetection，而那条路一律传
+// excludeContactGroup: true，从来就没覆盖过主群。2026-09-24 起它的处置也改成渐进式
+// （首次全群禁言），与 cron 扫描轨道完全一致，主群照旧跳过。
 function getSelfUnbanContactGroupId() {
 	return String(SELF_UNBAN_CONTACT_GROUP || GROUP_ID || '');
 }
@@ -13662,8 +13665,13 @@ async function rescanAdMember(env, row, options = {}) {
 	// 实测教训（主人 09-19 报障）：cron 扫到一个资料卡广告号直接全群封禁，
 	// 而主人认定那是误判 —— 一次误判把人在所有群里都踢了，代价不对称。
 	// 现在：首次 → mute_all（全群禁言 + 记台账）；台账已有记录 → 升级全群封禁。
-	// ⚠️ /rescreen（handleAdRescreenCommand）保持 forceGlobal 不变：那是主人手工发起的
-	// 深度清理，与手工 /ban 同类，手工动作一律不进渐进式。
+	// 【2026-09-24 第三轮：/rescreen 也并进来了】当时这里写的是「⚠️ /rescreen 保持
+	// forceGlobal 不变：那是主人手工发起的深度清理，与手工 /ban 同类」，把它排除在外。
+	// 主人随后就在 /rescreen 上报了与 09-19 完全同形的报障：只是想复查一下窗口里的人，
+	// 结果两个号被直接踢出所有群。类比错在：手工 /ban 是主人说「封了他」，处置动作
+	// 就是主人的决定；而 /rescreen 只是主人说「把窗口里的人再筛一遍」—— 封不封是机器人
+	// 自己判的。把机器人的自动判定当成主人的手工动作，等于给自动判定开了一条免检通道。
+	// 两条轨道的处境本来就一样（都没有「单一时点的当前群」语义），处置形态现在也一致。
 	console.log('[广告检测·扫描] 已处置 user=' + userId + ' score=' + evaluation.score + '/' + evaluation.threshold
 		+ ' 动作=' + (result?.banSummary || '未知'));
 	return { scanned: true, banned: result?.banned !== false, seq: result?.seq ?? null };
@@ -14389,12 +14397,16 @@ async function readAdBanScope(env, userId) {
 // 处置范围决策。返回 { mode: 'single' | 'mute_all' | 'global', reason, previous, isFirst }。
 //
 // mode = 'single'    → 只禁言 input.chatId，并落监控记录（消息触发的首次判定）
-// mode = 'mute_all'  → 禁言【所有治理群】，并落监控记录（cron 主动扫描的首次判定）
-// mode = 'global'    → 全群封禁。四种来源：
+// mode = 'mute_all'  → 禁言【所有治理群】，并落监控记录（无当前群语义的轨道首次判定：
+//                      cron 主动扫描 + /rescreen 批量复判）
+// mode = 'global'    → 全群封禁。三种来源：
 //                      ① 开关是 global（旧行为）
-//                      ② 调用点显式 forceGlobal（/rescreen 手工深度清理）
-//                      ③ 台账里已有记录且未升级（本次是第二次露头 → 升级）
-//                      ④ 台账读取失败 / 无用户（安全侧降级）
+//                      ② 台账里已有记录且未升级（本次是第二次露头 → 升级）
+//                      ③ 台账读取失败 / 无用户（安全侧降级）
+// 【2026-09-24 第三轮删掉了原来的「调用点显式 forceGlobal」这一条】它唯一的使用者是
+// /rescreen，而那个用法已被证明是错的（把机器人的自动判定当成了主人的手工动作，
+// 详见 handleAdRescreenCommand 里的说明）。现在没有任何调用点能绕过渐进式 ——
+// 想全群封禁只有两条路：台账里已经是第二次露头，或主人点判定通知里的「全群封禁」按钮。
 // 注意「同群再犯也升级」—— 主人口径：任何第二次判定都视为惯犯，不再区分是不是同群。
 // 两条轨道共用同一张台账，因此「cron 首次禁言过的号，之后在群里发言被消息路径抓到」
 // 也算第二次露头 → 直接升级全群封禁。这正是「再犯才升级」的本意。
@@ -14403,16 +14415,12 @@ async function decideAdBanScope(env, input, options = {}) {
 	if (AD_BAN_SCOPE_MODE !== AD_BAN_SCOPE_PROGRESSIVE) {
 		return { mode: 'global', reason: 'mode_global', previous: null, isFirst: false };
 	}
-	// ② 调用点显式要求全群封禁。/rescreen 批量复查走这条 —— 它是主人主动发起的深度清理，
-	//    没有单一时点、单一群的语义，与手工 /ban 同类（手工动作一律不进渐进式）。
-	if (options.forceGlobal === true) {
-		return { mode: 'global', reason: 'forced_global', previous: null, isFirst: false };
-	}
 	const userId = String(input?.userId ?? '');
 	const chatId = input?.chatId != null ? String(input.chatId) : '';
 
-	// ③ 【cron 主动扫描轨道】同样没有「当前群」语义，但它的处置不该是「直接全群封禁」。
-	//    它扫的是「不发言但资料卡就是广告」的号，chatId 只是名册里记的最近发言群。
+	// ② 【cron 主动扫描 + /rescreen 批量复判】同样没有「当前群」语义，但处置不该是
+	//    「直接全群封禁」。它们扫的是「不发言但资料卡就是广告」的号，chatId 只是名册里
+	//    记的最近发言群 / 台账里记的群。
 	//    渐进式在这条轨道上的等价物不是「只禁言一个群」（那样其余群完全没被处置），
 	//    而是「禁言所有治理群」：首次一律禁言、不踢出不拉黑，再犯才升级全群封禁。
 	//    ⚠️ 这条分支【不要求 chatId】：名册里可能根本没有群（历史数据 / 入群筛查漏写册），
@@ -14422,8 +14430,8 @@ async function decideAdBanScope(env, input, options = {}) {
 	if (!userId) {
 		return { mode: 'global', reason: 'no_user', previous: null, isFirst: false };
 	}
-	// 没有 chatId 且【不是】cron 轨道的调用点（例如其它批量调用）本来就没有「当前群」语义，
-	// 无法执行「只封当前群」—— 一律回落到全群封禁，与旧行为一致。
+	// 没有 chatId 且【不是】无当前群语义的那两条轨道（cron 扫描 / /rescreen 复判）
+	// 本来就没有「当前群」语义，无法执行「只封当前群」—— 一律回落到全群封禁，与旧行为一致。
 	if (!muteAllFirst && !chatId) {
 		return { mode: 'global', reason: 'no_chat_context', previous: null, isFirst: false };
 	}
@@ -14439,13 +14447,13 @@ async function decideAdBanScope(env, input, options = {}) {
 	if (!previous) {
 		// 首次判定的处置形态按轨道区分：
 		//   · 消息触发（有当前群）→ 只禁言当前群；
-		//   · cron 主动扫描（无当前群）→ 禁言所有治理群。
+		//   · 无当前群语义的两条轨道（cron 主动扫描 / /rescreen 批量复判）→ 禁言所有治理群。
 		// 两者语义完全一致：禁言 + 不拉黑 + 记台账，只是范围不同。
 		return muteAllFirst
 			? { mode: 'mute_all', reason: 'first_detection', previous: null, isFirst: true }
 			: { mode: 'single', reason: 'first_detection', previous: null, isFirst: true };
 	}
-	// ② 已有记录且未升级 → 本次是第二次露头，升级全群封禁。
+	// ③ 已有记录且未升级 → 本次是第二次露头，升级全群封禁。
 	if (previous.scopeState !== AD_BAN_SCOPE_GLOBAL) {
 		return { mode: 'global', reason: 'escalated', previous, isFirst: false };
 	}
@@ -14813,8 +14821,9 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 				}
 			}
 		} else if (allMuteScope) {
-			// 【全群禁言】cron 主动扫描轨道的首次处置。不做本群清扫 ——
-			// 这条轨道扫的是「资料卡就是广告」的号，广告在简介里不在消息里，没有触发消息可删；
+			// 【全群禁言】无当前群语义的那两条轨道的首次处置：cron 主动扫描 + /rescreen 批量复判。
+			// 不做本群清扫 —— 这两条轨道扫的是「资料卡就是广告」的号，广告在简介里不在消息里，
+			// 没有触发消息可删（/rescreen 复判时 input.messageId 恒为 null）；
 			// 而逐群清扫会把子请求数乘上群数（4 群 × 20 条 = 80 次），撞上 Workers 子请求上限
 			// 会让整个请求抛异常 —— 处置明明生效却报错，比留几条历史消息糟得多。
 			banResults = await muteUserFromAllGroups(userId, { probeMembership: true, excludeContactGroup: true });
@@ -14865,7 +14874,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	// 两条路径互斥，且都【只在处置动作已尝试之后】写：
 	//   · 首次判定（mode=single 或 mute_all）→ 落监控记录，供下次露头时升级
 	//   · 升级处置（reason=escalated）→ 标 state='global'，防止重复升级
-	// 刻意不处理 already_global / mode_global / no_chat_context / ledger_unavailable / forced_global：
+	// 刻意不处理 already_global / mode_global / no_chat_context / ledger_unavailable：
 	// 那几种情况要么不该产生记录，要么根本没有「首次群」可记。
 	// 【注意首次判定时不管实际是禁言还是降级封禁都要记】：
 	// 台账的语义是「这个号已经被判定过一次」，与本次动作强弱无关。
@@ -16420,7 +16429,7 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 
 	const config = loadAdDetectionConfig(env);
 	const whitelist = await loadAdDomainWhitelist(env);
-	const banned = [];
+	const handled = [];
 	const kept = [];
 	const cleared = [];
 	const failed = [];
@@ -16446,15 +16455,29 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 			);
 
 			if (evaluation.verdict === 'ban') {
-				// forceGlobal：/rescreen 是批量复查，没有「单一时点的当前群」语义，
-				// 且它是主人主动发起的深度清理，按全群封禁处理。
-				await enforceAdDetection(env, {
+				// 【2026-09-24 第三轮：forceGlobal → muteAllFirst】原先这里传 forceGlobal: true，
+				// 也就是一次就全群踢出 + 拉黑、没有任何禁言阶段。理由写的是「/rescreen 是主人
+				// 主动发起的深度清理，与手工 /ban 同类」，但类比错了：手工 /ban 是主人说
+				// 「封了他」，处置动作就是主人的决定；/rescreen 只是主人说「把窗口里的人再筛
+				// 一遍」—— 封不封是机器人自己判的。把机器人的自动判定当成主人的手工动作，
+				// 等于给自动判定开了一条免检通道：主人只想复查，结果两个号被直接踢出所有群。
+				//
+				// 改用 muteAllFirst，与 cron 主动扫描轨道（enforceAdDetection 的另一个调用点）
+				// 完全一致 —— 两条轨道的处境本来就一样：都没有「单一时点的当前群」语义，
+				// 复判用的 chatId 只是名册/台账里记的群。所以渐进式在这条轨道上的等价物
+				// 同样是「禁言所有治理群」：首次一律禁言、不踢出不拉黑，再犯才升级全群封禁。
+				// 这与 09-19 cron 轨道的修正是同一个结论，当时只是把 /rescreen 漏在外面。
+				const outcome = await enforceAdDetection(env, {
 					userId,
 					chatId: targetChatId,
 					chatTitle: '',
 					messageId: null
-				}, evaluation, { config, whitelist, forceGlobal: true });
-				banned.push(userId + '(' + evaluation.score + ')');
+				}, evaluation, { config, whitelist, muteAllFirst: true });
+				// 回复里写清这次到底是禁言还是封禁 —— 走渐进式之后两者都会出现在这里，
+				// 只写「已封禁」会让主人以为人被踢了（这正是 2026-09-24 那次报障的观感来源）。
+				// blacklistCode === 'ADDED' 是「进了黑名单」的唯一信号，也就是真的全群封禁了。
+				handled.push(userId + '(' + evaluation.score + '·'
+					+ (outcome?.blacklistCode === 'ADDED' ? '全群封禁' : '全群禁言') + ')');
 			} else if (evaluation.verdict === 'observe') {
 				await upsertAdScreening(env, userId, {
 					chatId: targetChatId,
@@ -16481,23 +16504,24 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 		'<b>🔄 观察窗口复判完成</b>',
 		'本次处理 <b>' + rows.length + '</b> 人（上限 ' + limit + '）',
 		'',
-		'判定为广告并封禁：<b>' + banned.length + '</b>',
+		'判定为广告并处置：<b>' + handled.length + '</b>',
+		'（首次一律全群禁言，再犯才升级全群封禁）',
 		'继续观察：<b>' + kept.length + '</b>',
 		'解除观察：<b>' + cleared.length + '</b>',
 		'复判失败：<b>' + failed.length + '</b>'
 	];
-	if (banned.length) {
+	if (handled.length) {
 		lines.push('');
-		lines.push('已封禁：');
-		for (const item of banned.slice(0, 10)) lines.push('· <code>' + escapeHtml(item) + '</code>');
+		lines.push('已处置：');
+		for (const item of handled.slice(0, 10)) lines.push('· <code>' + escapeHtml(item) + '</code>');
 	}
 	if (failed.length) {
 		lines.push('');
 		lines.push('失败：' + failed.slice(0, 10).map((id) => escapeHtml(id)).join('、'));
 	}
-	if (banned.length) {
+	if (handled.length) {
 		lines.push('');
-		lines.push('每个封禁都已生成快照，用 /pending 查看，判错用 /ignore 序号 回滚。');
+		lines.push('每个人的处置都已生成快照，用 /pending 查看，判错用 /ignore 序号 回滚。');
 	}
 	await sendTelegramMessageChunks(chatId, lines.join('\n'));
 }

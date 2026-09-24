@@ -217,7 +217,9 @@ const OWNER_ID = 10001;
 // 自动判定（可能误判）不能把它堵死（见 _worker.js 的 isSelfUnbanContactGroup）。
 // 若沿用「唯一治理群就是主群」的老夹具，GROUP_ID 会同时是治理群和主群，
 // 于是所有自动处置都被豁免，测出来的不是产品行为而是夹具的漏洞。
-// 人工路径（/ban、/spam、/rescreen、通知按钮）不受豁免，那些断言保持不变。
+// 人工路径（/ban、/spam、通知按钮）不受豁免，那些断言保持不变。
+// 【2026-09-24 起 /rescreen 从这个括号里去掉了】它只走 enforceAdDetection，
+// 那条路一律传 excludeContactGroup: true —— 它从来就没覆盖过主群，之前写在这里是错的。
 const CONTACT_GROUP_ID = '-1009999999999';
 
 function makeEnv(extra = {}) {
@@ -1502,13 +1504,33 @@ section('[10] 状态、白名单与观察窗口复判（adstats / whitelist / re
 	const rsText = await cmdApi(envRs, '/rescreen', adProfileApi);
 	assert('/rescreen 回执标题正确', rsText.includes('观察窗口复判完成'), rsText);
 	assert('/rescreen 统计本次处理人数', rsText.includes('本次处理 <b>1</b> 人'), rsText);
-	assert('/rescreen 命中指纹后判定封禁', rsText.includes('判定为广告并封禁：<b>1</b>'), rsText);
-	assert('/rescreen 列出被封用户', rsText.includes('70004'), rsText);
+	// 【2026-09-24 第三轮】原先 /rescreen 传 forceGlobal: true，一次就全群踢出 + 拉黑。
+	// 主人报障「只是想复查一下，两个号被直接踢出群了」之后改成渐进式，与 cron 扫描轨道一致。
+	assert('★ /rescreen 首次命中回执写「处置」而非「封禁」', rsText.includes('判定为广告并处置：<b>1</b>'), rsText);
+	assert('★ /rescreen 回执写明首次一律全群禁言', rsText.includes('首次一律全群禁言，再犯才升级全群封禁'), rsText);
+	assert('★ /rescreen 回执标出这次到底是禁言还是封禁', rsText.includes('全群禁言'), rsText);
+	assert('/rescreen 列出被处置用户', rsText.includes('70004'), rsText);
 	assert('/rescreen 引导用 /pending 复核', rsText.includes('/pending'), rsText);
-	assert('/rescreen 封禁后移出观察窗口', envRs.DB.query("SELECT COUNT(*) AS c FROM ad_user_screening WHERE user_id = '70004'")[0].c === 0);
-	assert('/rescreen 封禁写入黑名单', envRs.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '70004'")[0].c === 1);
-	assert('/rescreen 封禁生成待确认快照', envRs.DB.query("SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE user_id = '70004'")[0].c === 1, JSON.stringify(envRs.DB.query('SELECT seq, user_id FROM ad_pending_snapshots')));
-	assert('/rescreen 调用了全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('/rescreen 处置后移出观察窗口', envRs.DB.query("SELECT COUNT(*) AS c FROM ad_user_screening WHERE user_id = '70004'")[0].c === 0);
+	assert('★ /rescreen 首次处置【不】写黑名单（不踢出不拉黑）', envRs.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '70004'")[0].c === 0, JSON.stringify(envRs.DB.query('SELECT id FROM blacklist')));
+	assert('★ /rescreen 首次处置【不】调用全群封禁', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+	assert('★ /rescreen 首次处置调用全群禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('★ /rescreen 首次处置落入渐进式台账（供再犯升级）', envRs.DB.query("SELECT COUNT(*) AS c FROM ad_ban_scope WHERE user_id = '70004'")[0].c === 1, JSON.stringify(envRs.DB.query('SELECT * FROM ad_ban_scope')));
+	assert('/rescreen 处置生成待确认快照', envRs.DB.query("SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE user_id = '70004'")[0].c === 1, JSON.stringify(envRs.DB.query('SELECT seq, user_id FROM ad_pending_snapshots')));
+
+	// ★ 再犯才升级：同一个人第二次进复判 → 台账已有记录 → 升级全群封禁（这次才踢 + 拉黑）。
+	await W.upsertAdScreening(envRs, '70004', {
+		chatId: GROUP_ID,
+		score: 6,
+		reasons: ['第二次露头'],
+		snapshot: { name: '待复判用户', text: '长期收购网赚账号 USDT' },
+		layer: 'score'
+	}, rsConfig);
+	const rsSecond = await cmdApi(envRs, '/rescreen', adProfileApi);
+	assert('★ /rescreen 第二次露头升级全群封禁', rsSecond.includes('全群封禁'), rsSecond);
+	assert('★ /rescreen 升级后调用全群封禁', countCalls('banChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('★ /rescreen 升级后写入黑名单', envRs.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '70004'")[0].c === 1, JSON.stringify(envRs.DB.query('SELECT id FROM blacklist')));
+	assert('★ /rescreen 升级后台账标记为 global', envRs.DB.query("SELECT scope_state FROM ad_ban_scope WHERE user_id = '70004'")[0].scope_state === 'global', JSON.stringify(envRs.DB.query('SELECT user_id, scope_state FROM ad_ban_scope')));
 
 	// 已在黑名单的人不重复处置：复判时直接解除观察。
 	// 【必须显式插黑名单】首次命中改成本群禁言且不拉黑之后，70009 的自动处置不再写黑名单，
@@ -1526,7 +1548,7 @@ section('[10] 状态、白名单与观察窗口复判（adstats / whitelist / re
 		chatId: GROUP_ID, score: 9, reasons: ['误入观察窗口'], snapshot: { name: 'Owner' }, layer: 'score'
 	}, rsConfig);
 	const rsOwner = await cmdApi(envRs, '/rescreen', adProfileApi);
-	assert('/rescreen 主人不会被复判封禁', !rsOwner.includes('判定为广告并封禁：<b>1</b>'), rsOwner);
+	assert('/rescreen 主人不会被复判处置', !rsOwner.includes('判定为广告并处置：<b>1</b>'), rsOwner);
 	assert('/rescreen 主人被移出观察窗口', envRs.DB.query("SELECT COUNT(*) AS c FROM ad_user_screening WHERE user_id = '" + OWNER_ID + "'")[0].c === 0);
 	assert('/rescreen 主人未被写入黑名单', envRs.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '" + OWNER_ID + "'")[0].c === 0);
 
@@ -1539,7 +1561,7 @@ section('[10] 状态、白名单与观察窗口复判（adstats / whitelist / re
 		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } })
 	});
 	assert('/rescreen 数量参数被裁到上限 30', rsLimit.includes('（上限 30）'), rsLimit);
-	assert('/rescreen 干净资料不会误封', rsLimit.includes('判定为广告并封禁：<b>0</b>'), rsLimit);
+	assert('/rescreen 干净资料不会被误判处置', rsLimit.includes('判定为广告并处置：<b>0</b>'), rsLimit);
 	assert('/rescreen 空窗口再次给出提示', (await cmd(envRs, '/rescreen')).includes('观察窗口内没有待复判的用户'), lastSent());
 }
 
