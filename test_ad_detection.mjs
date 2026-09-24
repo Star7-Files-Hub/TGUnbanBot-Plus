@@ -3004,21 +3004,41 @@ section('[18] 方案 C · 私有群邀请链接单独计分（不动主人指定
 	assert('误封面 · 技术群主豁免照吃（-3 命中豁免词）', okTech.reasons.some((r) => r.startsWith('-3 命中豁免词')), okTech.reasons.join(' / '));
 	assert('误封面 · 无链接的正常资料仍 0 分', W.scoreAdProfile({ first_name: '李四', username: 'lisi', bio: '喜欢摄影和旅行' }).score === 0);
 
-	// 【真实存在的误封面，如实钉死在测试里】只放私有邀请链接、又没有任何技术词的人
-	// （社群运营 / 读书会 / 拼团群主）在 7 分下【直接封】。主人已明确接受：
-	// 「E 虽然会误封。但是可以判断 误封之后我再修改。」误封后 /ignore 回滚，样本与指纹都删得掉。
-	// 这是 5→7 的代价，不藏。
+	// 【2026-09-24 第三轮：这处误封面已被消除】只放私有邀请链接、又没有任何技术词的人
+	// （社群运营 / 读书会 / 拼团群主）此前在 +7 下【直接封】；主人当时接受的原话是
+	// 「E 虽然会误封。但是可以判断 误封之后我再修改」。本轮主人要求
+	// 「频道私聊的判定再优化下，降低误封概率」，于是孤立链接降到观察线：
+	// 不封、不禁言、不推快照、不进历史分。
+	// 线上证据（主人自己的 /ignore 放行库）：`频道私聊：…`、`私聊请通过这个联系 …`、
+	// `私信请通过频道…`、`有事请联系频道：…` 四条同形态正常资料卡，其中两条在旧规则下得 7 分被封。
 	const bizOps = W.scoreAdProfile({ first_name: '小美', username: 'xiaomei', bio: '读书会成员进群 t.me/+abcdefghij' });
-	assert('已知误报面 · 纯私有链接无技术词 → 7 分直接封', bizOps.score >= 7, bizOps.score + ' | ' + bizOps.reasons.join(' / '));
-	assert('已知误报面 · 分项就是私有邀请链接 + 剔豁免', bizOps.reasons.some((r) => r.includes('私有群一次性邀请链接')) && bizOps.reasons.some((r) => r.includes('不吃')), bizOps.reasons.join(' / '));
-	// 加一个真实豁免词（cdn 在 AD_EXEMPT_KEYWORDS 表内）立即回到 PASS —— 分流器活着的证据。
+	assert('★ 孤立私有链接（无广告旁证）→ 只到观察线，不再撞封禁线',
+		bizOps.score === 5, bizOps.score + ' | ' + bizOps.reasons.join(' / '));
+	assert('★ 观察线档位的分项写明「无广告旁证」（主人复盘时要能一眼看出为什么没封）',
+		bizOps.reasons.some((r) => r.includes('私有群一次性邀请链接') && r.includes('无广告旁证')), bizOps.reasons.join(' / '));
+	// 加一个真实豁免词（cdn 在 AD_EXEMPT_KEYWORDS 表内）继续往下降 —— 分流器活着的证据。
 	// 【刻意的边界说明】「交流cd」这种夹着的 c/d 不算豁免词，它不在表里 ——
 	// 豁免靠的是完整词条命中，不是子串，所以「cd」「交流cd」都救不了这张卡。这是设计而非缺陷。
 	const bizOpsCdn = W.scoreAdProfile({ first_name: '小美', username: 'xiaomei', bio: '读书会成员进群 t.me/+abcdefghij 欢迎交流cdn' });
-	assert('误封面 · 纯私有链接 + 真实豁免词 cdn 立即回 PASS', bizOpsCdn.score < 7, bizOpsCdn.score + ' | ' + bizOpsCdn.reasons.join(' / '));
+	assert('误封面 · 孤立私有链接 + 真实豁免词 cdn 继续降到 PASS', bizOpsCdn.score < 5, bizOpsCdn.score + ' | ' + bizOpsCdn.reasons.join(' / '));
 	assert('误封面 · cdn 命中豁免（-3 命中豁免词）', bizOpsCdn.reasons.some((r) => r.startsWith('-3 命中豁免词')), bizOpsCdn.reasons.join(' / '));
-	// 而「交流cd」（c/d 非表内词）救不了 —— 钉死「完整词条才豁免」的语义。
-	assert('误封面 · 「交流cd」不是豁免词，仍 7 分', W.scoreAdProfile({ first_name: '小美', username: 'xiaomei', bio: '读书会成员进群 t.me/+abcdefghij 欢迎交流cd' }).score >= 7);
+	// 「交流cd」不是豁免词，所以停在观察线 —— 钉死「完整词条才豁免」的语义。
+	assert('误封面 · 「交流cd」不是豁免词 → 停在观察线（旧规则下是 7 分封禁）',
+		W.scoreAdProfile({ first_name: '小美', username: 'xiaomei', bio: '读书会成员进群 t.me/+abcdefghij 欢迎交流cd' }).score === 5);
+	// ★ 反向保险：链接 + 广告旁证必须照旧撞封禁线，否则这次改动就成了「一刀切降级」。
+	// 三种旁证各钉一条，与 _worker.js 里 corroborated 的三项一一对应。
+	const bizOpsSolicit = W.scoreAdProfile({ first_name: '小美', username: 'xiaomei', bio: '加群看项目 t.me/+abcdefghij' });
+	assert('★ 链接 + 招揽文案旁证 → 照旧撞封禁线',
+		bizOpsSolicit.score >= 7 && bizOpsSolicit.reasons.some((r) => r.includes('招揽文案')),
+		bizOpsSolicit.score + ' | ' + bizOpsSolicit.reasons.join(' / '));
+	const bizOpsName = W.scoreAdProfile({ first_name: 'Maybell Tillman', username: 'xiaomei', bio: '读书会成员进群 t.me/+abcdefghij' });
+	assert('★ 链接 + 机器生成昵称旁证 → 照旧撞封禁线',
+		bizOpsName.score >= 7 && bizOpsName.reasons.some((r) => r.includes('机器生成昵称')),
+		bizOpsName.score + ' | ' + bizOpsName.reasons.join(' / '));
+	const bizOpsTrade = W.scoreAdProfile({ first_name: '小美', username: 'xiaomei', bio: '长期收购网赚账号 t.me/+abcdefghij' });
+	assert('★ 链接 + 交易词×业务词旁证 → 照旧撞封禁线',
+		bizOpsTrade.score >= 7 && bizOpsTrade.reasons.some((r) => r.includes('交易词×业务词')),
+		bizOpsTrade.score + ' | ' + bizOpsTrade.reasons.join(' / '));
 
 	// —— 正文一个字都没动（本次授权只覆盖资料卡）——
 	const bodyPriv = W.scoreAdMessageText('进群 https://t.me/+abcdefghij');
@@ -3032,10 +3052,9 @@ section('[18] 方案 C · 私有群邀请链接单独计分（不动主人指定
 	// （7 分下命中即封、不再走 observe，写入筛查表这条路径只在 observe 分支出现，
 	//  所以这里不做「观察记录不含资料分」的端到端断言——那属于 observe 路径，仍由既有测试覆盖。）
 
-	// —— 端到端：真用户进群、bio 含纯私有链接（无技术词）→ 直接封 ——
-	// 这是 5→7 的核心兑现：图 1 那一类「昵称+广告简介、链接是私有群邀请码」的号，
-	// 现在进群那一刻就被封，不再「永远漏」。仿照 [1] 段广告号进群的判定链路，
-	// getChat 返回 bio（检测端靠它拿资料卡简介）。
+	// —— 端到端：真用户进群、bio 含孤立私有链接（无广告旁证）→ 只进观察，不封不禁言 ——
+	// 2026-09-24 第三轮的兑现：这一类「昵称 + 资料卡里一条私有群链接」的号，
+	// 旧规则（+7 单独撞线）在进群那一刻就禁言；新规则降到观察线，什么都不做。
 	const envP = makeEnv();
 	resetCalls();
 	setApi({
@@ -3044,9 +3063,26 @@ section('[18] 方案 C · 私有群邀请链接单独计分（不动主人指定
 		getChatAdministrators: () => ({ ok: true, result: [] })
 	});
 	await sendUpdate({ message: joinMessage([{ id: 60002, first_name: '小美' }]) }, envP);
-	assert('端到端 · 纯私有链接进群即禁言', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.filter((c) => c.method === 'restrictChatMember').map((c) => c.body)));
-	assert('端到端 · 首次命中不入黑名单（渐进式）', envP.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '60002'")[0].c === 0, JSON.stringify(envP.DB.query('SELECT id, reason FROM blacklist')));
-	assert('端到端 · 观察窗口不留残留（命中即封不写筛查表）', envP.DB.query('SELECT COUNT(*) AS c FROM ad_user_screening')[0].c === 0);
+	assert('★ 端到端 · 孤立私有链接进群不再禁言/封禁',
+		countCalls('restrictChatMember') === 0 && countCalls('banChatMember') === 0,
+		JSON.stringify(calls.filter((c) => c.method === 'restrictChatMember' || c.method === 'banChatMember').map((c) => c.body)));
+	assert('端到端 · 不在黑名单', envP.DB.query("SELECT COUNT(*) AS c FROM blacklist WHERE id = '60002'")[0].c === 0, JSON.stringify(envP.DB.query('SELECT id, reason FROM blacklist')));
+	assert('★ 端到端 · 转入观察窗口留档（不处置但留痕，主人复盘有据可查）',
+		envP.DB.query('SELECT COUNT(*) AS c FROM ad_user_screening')[0].c === 1, JSON.stringify(envP.DB.query('SELECT * FROM ad_user_screening')));
+	assert('★ 端到端 · 观察记录只存行为分（资料分不进历史，杜绝累积误封）',
+		envP.DB.query('SELECT score FROM ad_user_screening')[0].score === 0, JSON.stringify(envP.DB.query('SELECT * FROM ad_user_screening')));
+	// 反向保险：同形态 bio 只要加上广告旁证，进群那一刻照旧处置 —— 收窄不是放水。
+	const envP2 = makeEnv();
+	resetCalls();
+	setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: '小美', bio: '加群看项目 t.me/+abcdefghij' } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	await sendUpdate({ message: joinMessage([{ id: 60004, first_name: '小美' }]) }, envP2);
+	assert('★ 端到端 · 链接 + 广告旁证进群照旧被处置',
+		countCalls('restrictChatMember') + countCalls('banChatMember') >= 1,
+		JSON.stringify(calls.filter((c) => c.method === 'restrictChatMember' || c.method === 'banChatMember').map((c) => c.body)));
 	// 对照组：技术群主（bio 带 cdn 撑豁免）进群不封 —— 分流器端到端活着。
 	const envQ = makeEnv();
 	resetCalls();
@@ -4238,7 +4274,14 @@ section('[23] 2026-09-24 中秋误封事故回归：学习取材必须按【定�
 		.map((c) => String(c.body?.text || '')).join('\n');
 
 	const GREETING = '月圆人团圆，好礼一起抽！🎁';
-	const SPAM_BIO = '有事请联系频道：https://t.me/+UiEnLbXCD0JhMWRl';
+	// 【2026-09-24 第三轮追加】事故原样资料卡「有事请联系频道：https://t.me/+…」现在
+	// 连封禁线都够不到（孤立链接 → 观察线），这条事故链从【入口】就被掐断了，
+	// 不再只依赖「学习端按定罪字段收窄」这第二道闸。
+	const INCIDENT_BIO = '有事请联系频道：https://t.me/+UiEnLbXCD0JhMWRl';
+	assert('★ 23.1 事故原样资料卡（孤立链接）已够不到封禁线',
+		W.scoreAdProfile({ first_name: '肆哥', username: 'kuss888', bio: INCIDENT_BIO }).score < 7);
+	// 下面仍然把第二道闸（按定罪字段收窄）钉死，所以这里换成一张【真能定罪】的广告资料卡。
+	const SPAM_BIO = '加群看项目 一天赚8千 https://t.me/+UiEnLbXCD0JhMWRl';
 	const GREETING_RE = /月圆|好礼|团圆|一起抽/;
 
 	// 伪 AI 必须让【资料卡】与【祝福语】落在正交维度上。
@@ -4781,6 +4824,104 @@ section('[26] 判定通知按钮：所有主人都能点（不限于第一主人
 		JSON.stringify(envB.DB.query('SELECT id FROM blacklist')));
 
 	W.invalidateAdProfileCache();
+}
+
+// ============================================================================
+// [27] 私有群邀请链接两档计分 · 真实资料卡回归表（2026-09-24 第三轮）
+// ----------------------------------------------------------------------------
+// 主人原话：「频道私聊的判定再优化下，降低误封概率」。
+// 规则：t.me/+ 链接【单独出现】只算引流信号 → 观察线（不封、不禁言、不推快照、不进历史分）；
+//       链接 + 任一广告旁证（招揽文案 / 机器生成昵称 / 交易词×业务词）→ 封禁线。
+// 左侧 8 条是【线上真实正常资料卡】（来自主人自己的 /ignore 放行库与本次复盘），
+// 右侧 19 条是【线上真实广告资料卡】（指纹库现存样本 + 2026-09-09 主人给的两张漏封样本）。
+// 判据：正常卡一条都不许撞封禁线，广告卡一条都不许掉出封禁线。
+// 这张表就是「降低误封概率」这句话的回归闸门 —— 以后谁再动分值，先过它。
+// ============================================================================
+section('[27] 私有群邀请链接两档计分 · 真实资料卡回归表');
+{
+	const THRESHOLD = 7;
+	// [昵称, 资料卡] —— 逐条照抄线上原文，不做任何改写。
+	const NORMAL_CARDS = [
+		['piaoliang', '频道私聊：https://t.me/+uHizKBQdpvFhZjM1'],
+		['匿名時', '私聊请通过这个联系 https://t.me/+aHkFhL6hnTA2ZTc1'],
+		['Bear', 'https://t.me/+EEQ4LdDOgkA2N2E1 频道私聊'],
+		['Bolinxxlin', '私信请通过频道https://t.me/+PLWSIaVF7MYwYzc1'],
+		['普通用户', 'https://t.me/+abcdefghij'],
+		['读书会', '读书会交流群 https://t.me/+abcdefghij'],
+		['技术群主', 'CDN 技术交流，进群 t.me/+abcdefghij'],
+		['普通用户', '有事请联系频道：https://t.me/+UiEnLbXCD0JhMWRl']
+	];
+	const AD_CARDS = [
+		['普通用户', '了解详情点击这里 https://t.me/+x5vN5dPplQ44YWRh'],
+		['Luz Band', 'https://t.me/+ue0-PILh6PpiZjg9 加群看项目 一天赚8千！💰 💰'],
+		['Misty Muz', 'https://t.me/+Hu6TXXBBuoViNmM1 加群看项目 一天赚8千！💰 💰'],
+		['Nicole Roon', 'https://t.me/+BPCiolMYcIcwMmVl 加群看项目 一天赚8千！💰 💰'],
+		['T某', 'T点击下方链接进群了解更多详细赚钱流程，日入过万看看也不吃亏✨✨✨：https://t.me/+1JIBT0ZqK1'],
+		['某', '进群了解详情 https://t.me/+gPkAsEnG7JxlYzQ0'],
+		['U某', 'U安全简单 一天稳定5万来找我小白也可以带，进群链接: https://t.me/+iCA3WuHKZhk1YmQ8'],
+		['6某', '6点击下方链接进群了解更多详细赚钱流程，日入过万看看也不吃亏✨✨✨：https://t.me/+1JIBT0ZqK1'],
+		['PpxR', 'PpxR点击下方链接进群了解更多详细赚钱流程，日入过万看看也不吃亏✨✨✨https://t.me/+h2Mowyoq'],
+		['某', '包..养..大..学..生…进：https://t.me/+nEnGi-Lc_pIzYTJl 代发：@fjdf18'],
+		['某', '免.税水.果18pro 只要6k多 https://t.me/+HUOheZsF86U1ODI0'],
+		['某', '全.新免.税苹.果18找我.定 https://t.me/+zjzbJfDgOrI3N2Y8'],
+		['某', '全…掴…包…养…进：https://t.me/+BS4RAFqar1w5MTQ1 广告戴发：@fjdf18'],
+		['某', '全新免。税苹。果１8接预‍.定 https://t.me/+FImpC9fbDbY3MGFk'],
+		['某', 'https://t.me/+TrahdqoUByk4Y2Qx 进群了解项目日入八千+'],
+		['Alejandra Sto', '做跑分 日入9K'],
+		['Shay None', 'https://t.me/+abcdefghij 加群看项目 一天赚8千！💰 💰'],
+		['🌟此号不回复', '加入2大裙 https://t.me/+abcdefghij'],
+		['亚博', '此号不回复！！！24h做单入口: https://t.me/+XFOCZC0tZxUyODg9 💎']
+	];
+	const scoreOf = (name, bio) => W.scoreAdProfile({ first_name: name, bio, status: 'member' }).score;
+
+	const falsePositives = NORMAL_CARDS.filter(([n, b]) => scoreOf(n, b) >= THRESHOLD);
+	assert('★ 27.1 真实正常资料卡零误封（8 条全部低于封禁线）', falsePositives.length === 0, JSON.stringify(falsePositives));
+	const falseNegatives = AD_CARDS.filter(([n, b]) => scoreOf(n, b) < THRESHOLD);
+	assert('★ 27.2 真实广告资料卡零漏放（19 条全部不低于封禁线）', falseNegatives.length === 0, JSON.stringify(falseNegatives));
+
+	// 27.3 逐条钉死本次改动直接救回来的 4 个线上账号 —— 旧规则下这 4 条都得 7 分被封。
+	// （`频道私聊：` / `私聊请通过这个联系` / `https://t.me/+… 频道私聊` 靠「私聊」豁免降到 2 分；
+	//   `私信请通过频道…` / 纯链接 / `读书会交流群 …` / `有事请联系频道：…` 停在观察线 5 分。）
+	const rescued = [
+		['piaoliang', '频道私聊：https://t.me/+uHizKBQdpvFhZjM1', 2],
+		['匿名時', '私聊请通过这个联系 https://t.me/+aHkFhL6hnTA2ZTc1', 2],
+		['Bear', 'https://t.me/+EEQ4LdDOgkA2N2E1 频道私聊', 2],
+		['Bolinxxlin', '私信请通过频道https://t.me/+PLWSIaVF7MYwYzc1', 5]
+	];
+	for (const [name, bio, expected] of rescued) {
+		assert(`★ 27.3 线上误封账号「${name}」回到 ${expected} 分（旧规则 7 分封禁）`,
+			scoreOf(name, bio) === expected, scoreOf(name, bio) + ' | ' + bio);
+	}
+
+	// 27.4 观察线档位的分项必须写明「无广告旁证」—— 主人复盘时要能一眼看出为什么没封。
+	const lone = W.scoreAdProfile({ first_name: '普通用户', bio: 'https://t.me/+abcdefghij' });
+	assert('★ 27.4 孤立链接档位的 reasons 写明「无广告旁证」',
+		lone.reasons.some((r) => r.includes('无广告旁证')), lone.reasons.join(' / '));
+	// 封禁线档位的 reasons 必须写明是哪一种旁证成立（三种各验一次）。
+	const bySolicit = W.scoreAdProfile({ first_name: '普通用户', bio: '进群了解详情 https://t.me/+gPkAsEnG7JxlYzQ0' });
+	assert('★ 27.5 纯 CTA 型资料卡（无利益词）靠「招揽文案」升档，reasons 写明',
+		bySolicit.score >= 7 && bySolicit.reasons.some((r) => r.includes('招揽文案')), bySolicit.score + ' | ' + bySolicit.reasons.join(' / '));
+	const byName = W.scoreAdProfile({ first_name: 'Maybell Tillman', bio: 'https://t.me/+abcdefghij' });
+	assert('★ 27.6 孤立链接 + 机器生成昵称升档，reasons 写明「机器生成昵称」',
+		byName.score >= 7 && byName.reasons.some((r) => r.includes('机器生成昵称')), byName.score + ' | ' + byName.reasons.join(' / '));
+
+	// 27.7 去混淆：线上广告用双点 / 省略号 / 1 字组与 2 字组混排三种写法躲词表，
+	// 这三种【一条都不命中】现有的 AD_CHAR_SPLIT_RE_* 签名，靠本判据内的局部归一化兜住。
+	// 若哪天有人把那层归一化删掉，这三条会一起掉到观察线，这里会立刻红。
+	const obfuscated = [
+		['某', '包..养..大..学..生…进：https://t.me/+nEnGi-Lc_pIzYTJl 代发：@fjdf18'],
+		['某', '全…掴…包…养…进：https://t.me/+BS4RAFqar1w5MTQ1 广告戴发：@fjdf18'],
+		['某', '全新免。税苹。果１8接预‍.定 https://t.me/+FImpC9fbDbY3MGFk']
+	];
+	for (const [name, bio] of obfuscated) {
+		assert(`★ 27.7 去混淆资料卡仍撞封禁线：${bio.slice(0, 16)}…`, scoreOf(name, bio) >= THRESHOLD, scoreOf(name, bio) + '');
+	}
+
+	// 27.8 正文一个字都没动（本次授权只覆盖资料卡）—— 与 27 段之前的口径逐字一致。
+	const bodyPriv27 = W.scoreAdMessageText('进群 https://t.me/+abcdefghij');
+	assert('★ 27.8 正文路径不受本次改动影响（仍 -3，无私有链接分项）',
+		bodyPriv27.score === -3 && !bodyPriv27.reasons.some((r) => r.includes('私有群一次性邀请链接')),
+		bodyPriv27.score + ' | ' + bodyPriv27.reasons.join(' / '));
 }
 
 console.log('');
