@@ -1079,18 +1079,29 @@ section('[8] 命令层端到端（权限、快照闭环、指纹与样本维护�
 	});
 	const samplesBeforeFresh = env.DB.query('SELECT COUNT(*) AS c FROM ad_sample_embeddings')[0].c;
 	await sendUpdate({ message: joinMessage([{ id: 70003, first_name: '资源对接小助手' }]) }, env);
+	// ★ 2026-09-24 二次误封复盘后的新口径：入群筛查【没有正文】，资料卡单独定罪时不再写
+	// AI 样本（详见 _worker.js 里「AI 样本必须带正文」那段说明）。旧实现在这里学出
+	// 「资源对接小助手 长期收购网du商宝账号…」这种「昵称 + 资料卡」的公式化短样本，
+	// 而 AI 查询端永远是 name + bio + text —— 于是它既会自己命中自己（线上 #172 在自己被
+	// 判定的同一秒把自己硬命中 0.8189），也会把资料卡形状相似的路人硬命中
+	// （6 秒后 Bear 被 #172 命中 0.8094，两人除「资料卡里有 t.me/+ 链接」外毫无共同点）。
 	const autoSampleRows = env.DB.query("SELECT sample_text, source, embedding FROM ad_sample_embeddings WHERE source = 'auto'");
-	assert('自动封禁已写入 source=auto 的 AI 样本', autoSampleRows.length === 1, JSON.stringify(autoSampleRows));
-	assert('自动学入的样本含现场昵称', autoSampleRows.some((r) => String(r.sample_text).includes('资源对接小助手')), JSON.stringify(autoSampleRows));
-	assert('自动学入的样本向量留空待懒加载', autoSampleRows.every((r) => r.embedding === null || r.embedding === undefined), JSON.stringify(autoSampleRows.map((r) => r.embedding)));
-	assert('自动学入后样本库 +1', env.DB.query('SELECT COUNT(*) AS c FROM ad_sample_embeddings')[0].c === samplesBeforeFresh + 1);
-	// 回执通知里也要报出来，主人才知道 AI 学到了东西。
+	assert('★ 无正文的入群筛查不再写 AI 样本（资料卡不进语义库）', autoSampleRows.length === 0, JSON.stringify(autoSampleRows));
+	assert('无正文时样本库数量不变', env.DB.query('SELECT COUNT(*) AS c FROM ad_sample_embeddings')[0].c === samplesBeforeFresh);
+	// 反向保险：收窄不等于「什么都不学」，更不等于「放过」。70003 的 bio 是刻意沿用已入库
+	// 指纹的（否则它不会被判广告），所以本次不会有新增指纹 —— 指纹库仍在被写入这件事
+	// 由 23.1 那段（资料卡定罪 → autoFp.length > 0）专门钉住。这里钉的是另外两件事：
+	// ① 该账号照旧被判广告并推送判定通知（检测力没被削）；② 指纹库仍覆盖这条 bio 特征。
+	assert('★ 收窄后 bio 特征仍被指纹库覆盖（检测力不降）',
+		env.DB.query("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE source = 'auto' AND value LIKE '%长期收购网%'")[0].c > 0,
+		JSON.stringify(env.DB.query("SELECT type, value, source FROM ad_fingerprints WHERE source = 'auto'")));
 	// 回执通知里也要报出来，主人才知道 AI 学到了东西。
 	// [8] 段没有 [6] 段那个 ownerNoticeText 局部辅助，这里就地从 calls 里取。
 	const freshNotice = calls
 		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(OWNER_ID))
 		.map((c) => String(c.body?.text || '')).join('\n');
-	assert('封禁通知报告已加 AI 样本', freshNotice.includes('已加 1 条 AI 样本'), freshNotice);
+	assert('★ 收窄后该账号仍被判定并推送通知（检测力不降）', freshNotice.includes('70003'), freshNotice);
+	assert('封禁通知不再谎报「已加 1 条 AI 样本」', !freshNotice.includes('已加 1 条 AI 样本'), freshNotice);
 
 	// /confirm 不再被广告命令入口接管。断言的是「不产生 /confirm 的那套回执、不动快照」，
 	// 而不是「有报错」—— 未知命令交回既有命令层处理，那不是本段的职责。
@@ -4273,8 +4284,12 @@ section('[23] 2026-09-24 中秋误封事故回归：学习取材必须按【定�
 		!sampleRows.some((r) => GREETING_RE.test(String(r.sample_text))),
 		JSON.stringify(autoSamples));
 	// 反向保险：收窄不等于「什么都不学」。资料卡该学还得学，否则真广告的批量识别就废了。
-	assert('23.1 收窄后仍然学到东西（bio 指纹 + AI 样本，不是一刀切停学）',
-		autoFp.length > 0 && autoSamples.length > 0,
+	// ★ 2026-09-24 二次误封复盘后进一步收紧：资料卡单独定罪【不写 AI 样本】，
+	// 只学 bio 指纹。原因是 AI 查询端永远是 name + bio + text，而「昵称 + 资料卡」这种
+	// 公式化短样本既会自己命中自己、也会把资料卡形状相似的路人硬命中
+	// （线上 #172 六秒内封掉完全无关的 Bear）。资料卡是结构化评分 + 指纹库的地盘。
+	assert('★ 23.1 收窄后 bio 指纹照学、但资料卡不再单独进 AI 语义库',
+		autoFp.length > 0 && autoSamples.length === 0,
 		JSON.stringify({ autoFp, autoSamples }));
 
 	// ★ 机制断言：同一份 payload，收窄前会抽出祝福语候选，收窄后一条都抽不出来。
@@ -4589,6 +4604,29 @@ section('[25] 正文进 AI 样本库的多因素门槛（≥2 因素才入库，
 		candidateOf(snapshotOf(envProf, '66007')) === null, JSON.stringify(candidateOf(snapshotOf(envProf, '66007'))));
 	assert('★ 25.5 资料卡定罪 + 正文零信号：正文不进样本库',
 		samplesLike(envProf, '月圆').length === 0, JSON.stringify(samplesLike(envProf, '月圆')));
+
+	// ===== 25.6 ★ 回滚必须能删掉「字段子集」形态的样本（2026-09-24 二次误封复盘）=====
+	// 25.4 那个场景里真正参与定罪的字段【只有 text】（昵称「普通用户」、bio 为空都没定罪），
+	// 所以学习端写进库的是「只有正文」这一条；而回滚端手上只有整份 payload，
+	// 它拿 buildAdSampleText(payload)（= 昵称 + bio + 正文）去算 hash 必然对不上。
+	// 旧实现因此在【字段子集】这条路上静默删不掉样本 —— 线上 #169/#170/#172 三条错样本
+	// 在主人四次 /ignore 之后全部幸存，而 AI 层是硬命中即封、不看豁免词也不看总分，
+	// 留下的错样本会继续把正常用户硬命中封掉（#172 六秒内就封掉了完全无关的 Bear）。
+	// 修法：学习端把【真正写进库的那条样本】的 hash 存进快照（snapshot.learnedSampleHash），
+	// 回滚端按它精确删（removeAdSampleByHash）。
+	const autoRow = snapshotOf(envAuto, '66005');
+	const autoSnapJson = (() => { try { return JSON.parse(String(autoRow?.snapshot || '{}')); } catch { return {}; } })();
+	assert('★ 25.6 快照里记下了真正入库的那条样本的 hash',
+		typeof autoSnapJson.learnedSampleHash === 'string' && autoSnapJson.learnedSampleHash.length > 0,
+		JSON.stringify(autoSnapJson));
+	assert('25.6 前置：该样本此刻确实在库',
+		samplesLike(envAuto, BODY_MARK).length === 1, JSON.stringify(samplesLike(envAuto, BODY_MARK)));
+	resetCalls();
+	await sendUpdate(cbUpdate(ENFORCE_PREFIX + 'A:66005:' + autoRow.seq), envAuto);
+	assert('★ 25.6 误判放行按 hash 精确删掉了字段子集形态的样本（旧实现静默删不掉）',
+		samplesLike(envAuto, BODY_MARK).length === 0, JSON.stringify(samplesLike(envAuto, BODY_MARK)));
+	assert('25.6 回执写明样本已删除 1 条',
+		ownerText().includes('AI 样本：已删除 <b>1</b> 条'), ownerText().slice(0, 1200));
 
 	W.invalidateAdProfileCache();
 }

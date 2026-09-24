@@ -13061,6 +13061,31 @@ async function removeAdSampleByText(env, rawText) {
 }
 
 // /clearsamples 底层：清空全部样本（含种子）。调用方负责二次确认。
+// 按【已存样本的 text_hash】精确删除。给 /ignore 与「误判放行」按钮用。
+//
+// 【为什么必须有它】2026-09-24 二次误封复盘：字段级收窄之后，学习端写进库的 sample_text
+// 可能只是定罪字段的一个【子集】（例如只凭资料卡定罪时，写进去的是 name + bio，不含正文），
+// 而回滚端手上只有整份 payload —— 它拿 buildAdSampleText(payload) 去算 hash 必然对不上，
+// 样本于是永远删不掉。线上实测：#169/#170/#172 三条错样本在主人四次 /ignore 之后全部幸存，
+// 而 AI 层是【硬命中即封、不看豁免词也不看总分】，留下的错样本会继续封人。
+// 所以学习端把当时写进去的 hash 一并存进快照，回滚端按它精确删。
+async function removeAdSampleByHash(env, hash) {
+	const h = String(hash || '').trim();
+	if (!h) return { ok: false, reason: 'no_hash' };
+	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+	try {
+		const result = await env.DB
+			.prepare("DELETE FROM ad_sample_embeddings WHERE text_hash = ? AND COALESCE(source, '') NOT IN ('seed', 'seed-core')")
+			.bind(h).run();
+		const removed = Number(result?.meta?.changes || 0);
+		if (removed > 0) AD_SAMPLE_EMBEDDING_CACHE.delete(env.DB);
+		return { ok: true, removed };
+	} catch (error) {
+		console.error('[广告检测] 按 hash 删除语义样本失败:', error);
+		return { ok: false, reason: 'error' };
+	}
+}
+
 async function clearAdSamples(env) {
 	if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
 	try {
@@ -14795,6 +14820,9 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	// 【失败绝不影响主流程】黑名单、全群封禁、消息删除都已经做完了，
 	// 样本写不进去最多是少学一条，不能因此让回执报错或中断通知。
 	let sampleAdded = false;
+	// 真正写进样本库的那条样本的 hash。回滚端（/ignore、误判放行按钮）按它精确删样本，
+	// 详见 removeAdSampleByHash 的说明 —— 不带它，字段子集形态的样本永远删不掉。
+	let learnedSampleHash = '';
 	try {
 		// options.sampleText 让调用方覆盖取材口径。目前唯一的覆盖方是 /spam 的回复学习：
 		// 那条路径碰到「本人正文一个字母 + 广告全在引用块里」时会拿引用体当样本，
@@ -14815,13 +14843,30 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			// 自动路径必须按定罪字段收窄：只学【本次真正参与定罪】的字段，
 			// 否则「资料卡是广告 + 正文是正常祝福」会把那句祝福学进全群共享的样本库。
 			// 详见 scopeAdLearningPayload 的说明。
-			: buildAdSampleText(scopeAdLearningPayload(evaluation.payload, sampleFields));
+			//
+			// 【AI 样本必须带正文】2026-09-24 二次误封复盘（月圆祝福语仍在被误封）：
+			// 资料卡单独定罪时学出来的样本，是「昵称 + 资料卡」这种极短的公式化文本，
+			// 而 AI 层的查询端永远是 name + bio + text，于是同时踩中两个坑：
+			//   ① 自己比自己 —— 实测 #172「piaoliang 频道私聊： 私有群邀请链接」在自己被判定的
+			//      同一秒（16:11:04）就把它自己硬命中 0.8189，本人 score 只有 4 也被定罪；
+			//   ② 跨用户聚类 —— 6 秒后 Bear（正文为空，资料卡只是形状相似）被 #172 硬命中 0.8094，
+			//      两人除了「资料卡里有 t.me/+ 链接」之外没有任何共同点，双双被封。
+			// 资料卡本来就是【结构化评分 + 指纹库】的地盘（+7 私有群邀请链接、bio 型指纹都是
+			// 确定性的、可解释的），塞进语义库只会让语义层退化成资料卡聚类器 ——
+			// 语义层该装的是【消息正文】的签名。所以自动路径下没有正文证据就不写 AI 样本；
+			// 指纹照学、结构化分照算，对资料卡型广告的检测力不降。
+			: (sampleFields.has('text')
+				? buildAdSampleText(scopeAdLearningPayload(evaluation.payload, sampleFields))
+				: '');
 		// 长度门槛与 addAdSample 内部一致（< 4 字符直接拒），这里先判一次是为了少一次 D1 往返。
 		// 引用体形态的号（本人正文只有一个字母）在这里拼出来的通常只有昵称，
 		// 短到 4 字符以下就跳过 —— 那种样本语义太稀薄，进库只会拉高误判面。
 		if (sampleText.length >= 4) {
 			const sample = await addAdSample(env, sampleText, { source: String(options.sampleSource || 'auto') });
 			sampleAdded = Boolean(sample?.ok && sample?.added);
+			// 记下【真正写进库的那条样本】的 hash：回滚端只有整份 payload，算不出这种
+			// 字段子集形态的 hash，不带它 /ignore 就永远删不掉样本（见 removeAdSampleByHash）。
+			if (sample?.text) learnedSampleHash = adTextHash(sample.text);
 		}
 	} catch (error) {
 		console.error('[广告检测] 自动学习语义样本失败:', error);
@@ -14836,7 +14881,12 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 			chatId,
 			score: evaluation.score,
 			reasons: evaluation.reasons,
-			snapshot: evaluation.snapshot
+			// 把本次真正写进 AI 样本库的那条样本的 hash 一并存进快照：
+			// /ignore 与「误判放行」按钮据此精确删样本，否则字段子集形态的错样本
+			// 会永久留在库里继续硬命中封人（详见 removeAdSampleByHash）。
+			snapshot: learnedSampleHash
+				? { ...evaluation.snapshot, learnedSampleHash }
+				: evaluation.snapshot
 		});
 		const learnNote = (learned ? '；已学入 ' + learned + ' 条指纹' : '')
 			+ (sampleAdded ? '；已加 1 条 AI 样本' : '');
@@ -15457,7 +15507,18 @@ async function rollbackAdPendingSnapshot(env, ownerId, seq, snapshot) {
 	// 删掉当初自动学进去的那条 AI 语义样本。在这批改动之前 /ignore 碰都没碰样本库 ——
 	// 于是指纹删了、号解封了，错样本却永久留在 AI 样本库里继续误伤相似的正常用户，
 	// 而 AI 层是硬命中即封、不看豁免词也不看总分的，一条错样本比一条错指纹更危险。
-	const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
+	// 【双路删样本】只按整份 payload 算 hash 已经不够了：字段级收窄之后，学习端写进去的
+	// sample_text 可能只是定罪字段的子集（只凭资料卡定罪时不含正文），两边 hash 必然对不上，
+	// 样本就静默删不掉 —— 线上实测 #169/#170/#172 在四次 /ignore 后全部幸存，继续封人。
+	// 所以：按整份 payload 算（存量兼容）+ 按学习端当时存下的 hash 精确删，两条都走。
+	const byText = await removeAdSampleByText(env, buildAdSampleText(payload));
+	// hash 必须从【原始快照】取：adPayloadFromSnapshot 只重建 name/username/bio/text，
+	// 不会带上学习端存下的 learnedSampleHash（payload.learnedSampleHash 恒为 undefined）。
+	const learnedSampleHash = String(snapshot?.snapshot?.learnedSampleHash || '');
+	const byHash = learnedSampleHash
+		? await removeAdSampleByHash(env, learnedSampleHash)
+		: { ok: true, removed: 0 };
+	const sampleRemoved = { ok: byText.ok || byHash.ok, removed: (byText.removed || 0) + (byHash.removed || 0) };
 	await deleteAdScreening(env, targetId);
 	// 同一并清掉渐进式封禁台账。留着它会让这个号下次被判定时【直接升级全群封禁】，
 	// 而它已被主人证明是误判 —— 等于一次误判永久提高了它后续的处置强度。
@@ -16426,7 +16487,17 @@ async function handleAdReplyLearning(message, env, ctx) {
 		// 同步清掉当初自动学进去的那条 AI 语义样本。拼法必须走 buildAdSampleText，
 		// 与 enforceAdDetection 写入时完全一致，否则 text_hash 对不上、静默删不掉，
 		// 错样本会永久留在库里继续把相似的正常用户往高相似度上拉（AI 层是硬命中即封）。
-		const sampleRemoved = await removeAdSampleByText(env, buildAdSampleText(payload));
+		// 【双路删样本】只按整份 payload 算 hash 已经不够了：字段级收窄之后，学习端写进去的
+		// sample_text 可能只是定罪字段的子集（只凭资料卡定罪时不含正文），两边 hash 必然对不上，
+		// 样本就静默删不掉 —— 线上实测 #169/#170/#172 在四次 /ignore 后全部幸存，继续封人。
+		// 所以：按整份 payload 算（存量兼容）+ 按学习端当时存下的 hash 精确删，两条都走。
+		const byText = await removeAdSampleByText(env, buildAdSampleText(payload));
+		// 回复式 /ignore 手上没有待确认快照，取不到学习端存下的 hash；但字段子集形态里
+		// 最常见的就是「只有正文」那一种，所以额外按【本条正文】试删一次。
+		const byBody = String(payload.text || '').trim().length >= 4
+			? await removeAdSampleByText(env, payload.text)
+			: { ok: true, removed: 0 };
+		const sampleRemoved = { ok: byText.ok || byBody.ok, removed: (byText.removed || 0) + (byBody.removed || 0) };
 		await deleteAdScreening(env, targetId);
 		// 与 /ignore 同一口径：管理员声明是误判，台账一并清掉，避免下次判定被直接升级。
 		await deleteAdBanScope(env, targetId);
