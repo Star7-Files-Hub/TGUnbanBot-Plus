@@ -7224,13 +7224,14 @@ async function resolveGroupLinkedChannelId(chatId) {
 // 直接调 getAdQuotedText 会把本群关联频道的原文也当成本人的字。
 async function resolveAdQuotedText(message) {
 	const raw = getAdQuotedText(message);
-	if (!raw) return raw;
+	// 绝大多数消息要么没有引用体，要么引用的不是频道 —— 一次字符串拼接就返回，
+	// 不进异步分支，也就不为它们付 getChat 的钱。isChannelOriginQuote 在这里是【真闸门】，
+	// 不是文档：判定逻辑只有这一条路径。
+	if (!raw || !isChannelOriginQuote(message)) return raw;
 	// ① 关联频道帖自动转发后被回复：is_automatic_forward 只可能来自本群自己的关联频道，直接豁免。
 	if (isChannelAutoForward(message?.reply_to_message)) return '';
 	// ② external_reply 的来源是频道：比对是不是本群关联频道，是自家的才豁免。
-	const origin = message?.external_reply?.origin;
-	if (String(origin?.type || '') !== 'channel') return raw;
-	const originChatId = String(origin?.chat?.id ?? '');
+	const originChatId = String(message?.external_reply?.origin?.chat?.id ?? '');
 	if (!originChatId) return raw;
 	const linkedId = await resolveGroupLinkedChannelId(message?.chat?.id);
 	return linkedId && linkedId === originChatId ? '' : raw;
