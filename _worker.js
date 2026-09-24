@@ -6868,8 +6868,13 @@ async function handleAdEnforceCallback(callbackQuery, env) {
 		await answerAdVoteCallback(callbackQuery?.id);
 		return;
 	}
-	if (!isPrimaryOwner(clickerId) || chatId !== clickerId) {
-		await answerAdVoteCallback(callbackQuery?.id, '仅限第一主人在私聊中操作', true);
+	// 【所有主人都能点，不限于第一主人】（2026-09-25 主人明确要求：
+	// 「主人包括第一主人以及其他主人，主人不管是第一主人还是其他主人都有所有权限」）。
+	// 原来这里是 isPrimaryOwner，副主人点这颗按钮会被回一句「仅限第一主人在私聊中操作」。
+	// 仍然要求「在自己私聊里点」：判定通知是私聊消息，群里的回调一律拒绝，
+	// 免得有人在群里转发/伪造回调把跨群不可逆动作触发掉。
+	if (!isOwner(clickerId) || chatId !== clickerId) {
+		await answerAdVoteCallback(callbackQuery?.id, '仅限主人在私聊中操作', true);
 		return;
 	}
 	if (!env?.DB) {
@@ -6879,7 +6884,21 @@ async function handleAdEnforceCallback(callbackQuery, env) {
 	const action = match[1];
 	const targetId = match[2];
 	const seq = parseInt(match[3], 10);
-	const snapshot = await readAdPendingSnapshot(env, clickerId, seq);
+	// 快照固定由【第一主人】持有（序号是 /ignore 的唯一入口，多人共用会互相抢号 —— 见
+	// enforceAdDetection 里 allocateAdPendingSnapshot 的注释），所以读取/回滚/删除都必须用
+	// 【快照归属者】而不是点击者：副主人点这颗按钮时 clickerId ≠ owner_id，
+	// 用 clickerId 查会一律返回 null，按钮就永远只会回「该判定已处理或已过期」。
+	// 先按当前第一主人查，再退回点击者本人 —— 后者兼容「OWNER_IDS 顺序被改过，
+	// 通知还挂在旧第一主人聊天里」这种历史归属，那时旧主人已经是副主人了。
+	let snapshotOwnerId = getOwnerNotifyTargets()[0] || clickerId;
+	let snapshot = await readAdPendingSnapshot(env, snapshotOwnerId, seq);
+	if (!snapshot && snapshotOwnerId !== clickerId) {
+		const fallback = await readAdPendingSnapshot(env, clickerId, seq);
+		if (fallback) {
+			snapshot = fallback;
+			snapshotOwnerId = clickerId;
+		}
+	}
 	if (!snapshot) {
 		// 序号已被复核过 / 已过期。顺手摘掉键盘，避免主人反复点一颗已经失效的按钮。
 		await answerAdVoteCallback(callbackQuery?.id, '该判定已处理或已过期', true);
@@ -6896,7 +6915,7 @@ async function handleAdEnforceCallback(callbackQuery, env) {
 	if (action === 'A') {
 		// 误判回滚：与 /ignore 走【同一个函数】，副作用逐项相同（解禁 + 解封 + 指纹纠正
 		// + 删错样本 + 清台账 + 登记放行库 + 标记快照已复核），只是入口从命令换成按钮。
-		const r = await rollbackAdPendingSnapshot(env, clickerId, seq, snapshot);
+		const r = await rollbackAdPendingSnapshot(env, snapshotOwnerId, seq, snapshot);
 		await clearAdNoticeKeyboard(chatId, messageId);
 		await answerAdVoteCallback(callbackQuery?.id, '已按误判回滚');
 		const lines = ['<b>♻️ 已按误判回滚（通知按钮）</b>', '序号：<b>#' + seq + '</b>'];
@@ -6947,7 +6966,7 @@ async function handleAdEnforceCallback(callbackQuery, env) {
 		}
 	}
 
-	await deleteAdPendingSnapshot(env, clickerId, seq);
+	await deleteAdPendingSnapshot(env, snapshotOwnerId, seq);
 	await clearAdNoticeKeyboard(chatId, messageId);
 	await answerAdVoteCallback(callbackQuery?.id, '已全群封禁');
 	const lines = [

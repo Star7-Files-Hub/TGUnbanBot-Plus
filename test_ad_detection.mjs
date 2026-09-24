@@ -4593,6 +4593,158 @@ section('[25] 正文进 AI 样本库的多因素门槛（≥2 因素才入库，
 	W.invalidateAdProfileCache();
 }
 
+section('[26] 判定通知按钮：所有主人都能点（不限于第一主人），但通知仍只发第一主人');
+{
+	// 【主人口径 2026-09-25】「主人包括第一主人以及其他主人，主人不管是第一主人还是
+	// 其他主人都有所有权限」，同时「待判定的通知还是只发第一主人」。
+	// 这两条【不矛盾】：序号是 /ignore 的唯一入口，多人各持一套序号会互相抢号，
+	// 所以通知（= 序号入口）只给第一主人；而按钮是「对某一条已存在的判定做决定」，
+	// 谁点都是同一个序号，没有抢号问题，所以放开给所有主人。
+	//
+	// 本节同时钉住一个隐藏陷阱：快照的 owner_id 是【第一主人】，
+	// 如果回滚/删除仍用点击者去查，副主人点下去只会看到「该判定已处理或已过期」。
+	const G1 = '-1001111111111';
+	const PRIMARY = String(OWNER_ID);	// 10001 第一主人
+	const SECOND = '10002';			// 副主人
+	const THIRD = '10003';			// 第二个副主人
+	const SUPER = '10004';			// 超级管理员：高级管理员，但【不是】主人
+	const OUTSIDER = '10005';		// 陌生人
+	const AD_NAME = '💚高价收网赚号💚';
+	const AD_BIO = '长期收购网 du 商宝账号，老账号优先加价';
+	const AD_TEXT = '招代理日结佣金 无需经验 加微详聊';
+
+	const multiEnv = (extra = {}) => makeEnv({
+		GROUP_ID: G1,
+		OWNER_IDS: [PRIMARY, SECOND, THIRD].join(','),
+		SUPER_ADMINS: SUPER,
+		...extra
+	});
+	const msgIn = (from, text) => ({
+		message_id: 800 + Math.floor(Math.random() * 1000),
+		date: Math.floor(Date.now() / 1000),
+		text,
+		chat: { id: Number(G1), type: 'supergroup', title: '治理群' },
+		from: { is_bot: false, ...from }
+	});
+	const adApi = () => setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: AD_NAME, bio: AD_BIO } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	const chatText = (id) => calls
+		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(id))
+		.map((c) => String(c.body?.text || '')).join('\n');
+	// 通知上挂出去的键盘。只认「带按钮」的那条私聊消息 —— 那才是主人真正看到的入口。
+	const keyboardOf = (id) => calls
+		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(id) && c.body?.reply_markup)
+		.map((c) => c.body.reply_markup).at(-1) || null;
+	const answerText = () => String(calls.filter((c) => c.method === 'answerCallbackQuery').at(-1)?.body?.text || '');
+	const banCallCount = () => calls.filter((c) => c.method === 'banChatMember').length;
+	const cbUpdate = (data, fromId, chatId, chatType = 'private') => ({
+		callback_query: {
+			id: 'cb-' + Math.floor(Math.random() * 1e9),
+			from: { id: Number(fromId), is_bot: false, first_name: 'Owner' },
+			chat_instance: '1',
+			data,
+			message: {
+				message_id: 4242,
+				date: Math.floor(Date.now() / 1000),
+				chat: { id: Number(chatId), type: chatType, first_name: 'Owner' }
+			}
+		}
+	});
+	// 触发一次自动判定，返回通知上两颗按钮的回调数据。uid 每次换，避免渐进台账互相影响。
+	const triggerAndGetButtons = async (env, uid) => {
+		resetCalls();
+		adApi();
+		await sendUpdate({ message: msgIn({ id: uid, first_name: AD_NAME }, AD_TEXT) }, env);
+		const kb = keyboardOf(PRIMARY);
+		return {
+			kb,
+			undo: kb?.inline_keyboard?.[0]?.[0]?.callback_data,
+			ban: kb?.inline_keyboard?.[0]?.[1]?.callback_data
+		};
+	};
+
+	// ===== 26.1 通知（含按钮）只发第一主人 =====
+	const envB = multiEnv();
+	await W.ensureD1Table(envB);
+	const b1 = await triggerAndGetButtons(envB, 67001);
+	const keyboardTargets = [...new Set(calls
+		.filter((c) => c.method === 'sendMessage' && c.body?.reply_markup)
+		.map((c) => String(c.body?.chat_id)))];
+	assert('★ 26.1 判定通知只发第一主人，副主人一条都收不到',
+		keyboardTargets.length === 1 && keyboardTargets[0] === PRIMARY, JSON.stringify(keyboardTargets));
+	assert('26.1 通知里的快照归属第一主人（owner_id = 第一主人）',
+		envB.DB.query('SELECT DISTINCT owner_id FROM ad_pending_snapshots').map((r) => String(r.owner_id)).join(',') === PRIMARY,
+		JSON.stringify(envB.DB.query('SELECT owner_id, seq, user_id FROM ad_pending_snapshots')));
+	assert('26.1 前置：拿到两颗按钮的回调数据', Boolean(b1.undo && b1.ban), JSON.stringify(b1.kb));
+
+	// ===== 26.2 副主人点「全群封禁」→ 必须成功（原来会被「仅限第一主人」挡掉）=====
+	resetCalls();
+	await sendUpdate(cbUpdate(b1.ban, SECOND, SECOND), envB);
+	assert('★ 26.2 副主人点「全群封禁」成功，不再被「仅限第一主人」拒绝',
+		chatText(SECOND).includes('已全群封禁'), chatText(SECOND).slice(0, 400) || answerText());
+	assert('★ 26.2 副主人点击确实写入了全局黑名单',
+		envB.DB.query(`SELECT COUNT(*) AS c FROM blacklist WHERE id = '67001'`)[0].c === 1,
+		JSON.stringify(envB.DB.query('SELECT id, reason FROM blacklist')));
+	assert('★ 26.2 副主人点击确实执行了全群封禁', banCallCount() >= 1, String(banCallCount()));
+	assert('★ 26.2 快照按【快照归属者】而非点击者标记已复核（隐藏陷阱）',
+		Number(envB.DB.query(`SELECT expires_at FROM ad_pending_snapshots WHERE user_id = '67001'`)[0]?.expires_at) === 0,
+		JSON.stringify(envB.DB.query('SELECT owner_id, seq, user_id, expires_at FROM ad_pending_snapshots')));
+
+	// ===== 26.3 第二个副主人点「误判放行」→ 同样必须成功 =====
+	const b2 = await triggerAndGetButtons(envB, 67002);
+	assert('26.3 前置：拿到新一条判定的按钮', Boolean(b2.undo), JSON.stringify(b2.kb));
+	resetCalls();
+	await sendUpdate(cbUpdate(b2.undo, THIRD, THIRD), envB);
+	assert('★ 26.3 第二个副主人点「误判放行」成功（回滚与 /ignore 走同一函数）',
+		chatText(THIRD).includes('已按误判回滚'), chatText(THIRD).slice(0, 400) || answerText());
+	assert('26.3 快照被标记已复核（回滚路径也用的是快照归属者）',
+		Number(envB.DB.query(`SELECT expires_at FROM ad_pending_snapshots WHERE user_id = '67002'`)[0]?.expires_at) === 0,
+		JSON.stringify(envB.DB.query('SELECT user_id, expires_at FROM ad_pending_snapshots')));
+
+	// ===== 26.4 超级管理员不是主人 → 仍然拒绝 =====
+	// 用不存在的序号：权限门排在读快照之前，被拒时【不应】产生任何封禁动作。
+	resetCalls();
+	await sendUpdate(cbUpdate('ade:B:67003:999', SUPER, SUPER), envB);
+	assert('★ 26.4 超级管理员（高级管理员但非主人）点按钮被拒',
+		answerText().includes('主人'), answerText());
+	// 只在这里钉一次新文案：'仅限第一主人' → '仅限主人' 是本次的对外可见变化。
+	// 26.5 / 26.6 不断言具体措辞 —— 它们测的是【行为没变】（非主人仍被拒），
+	// 措辞一变就红会让读者误以为权限回归了。
+	assert('★ 26.4 拒绝文案已从「仅限第一主人」改为「仅限主人」',
+		answerText().includes('仅限主人在私聊中操作'), answerText());
+	assert('★ 26.4 被拒时没有产生任何封禁/黑名单写入',
+		banCallCount() === 0 && envB.DB.query(`SELECT COUNT(*) AS c FROM blacklist WHERE id = '67003'`)[0].c === 0,
+		JSON.stringify({ bans: banCallCount(), blacklist: envB.DB.query('SELECT id FROM blacklist') }));
+
+	// ===== 26.5 陌生人 → 拒绝 =====
+	resetCalls();
+	await sendUpdate(cbUpdate('ade:B:67004:999', OUTSIDER, OUTSIDER), envB);
+	assert('★ 26.5 陌生人点按钮被拒', answerText().includes('主人'), answerText());
+	assert('26.5 被拒时没有产生任何封禁', banCallCount() === 0, String(banCallCount()));
+
+	// ===== 26.6 主人但【在群里】点 → 拒绝（判定通知是私聊消息，群回调一律不认）=====
+	resetCalls();
+	await sendUpdate(cbUpdate('ade:B:67005:999', PRIMARY, G1, 'supergroup'), envB);
+	assert('★ 26.6 在群里点判定按钮被拒（挡住群内伪造/转发回调）',
+		answerText().includes('主人'), answerText());
+	assert('26.6 群里点击没有产生任何封禁', banCallCount() === 0, String(banCallCount()));
+
+	// ===== 26.7 第一主人仍然可用（回归）=====
+	const b3 = await triggerAndGetButtons(envB, 67006);
+	resetCalls();
+	await sendUpdate(cbUpdate(b3.ban, PRIMARY, PRIMARY), envB);
+	assert('★ 26.7 第一主人点「全群封禁」照旧成功',
+		chatText(PRIMARY).includes('已全群封禁'), chatText(PRIMARY).slice(0, 400) || answerText());
+	assert('26.7 第一主人点击写入黑名单',
+		envB.DB.query(`SELECT COUNT(*) AS c FROM blacklist WHERE id = '67006'`)[0].c === 1,
+		JSON.stringify(envB.DB.query('SELECT id FROM blacklist')));
+
+	W.invalidateAdProfileCache();
+}
+
 console.log('');
 console.log('='.repeat(60));
 console.log(`广告检测测试汇总：通过 ${pass} 条，失败 ${fail} 条`);
