@@ -695,6 +695,84 @@ section('[5] AI 语义层三分支（硬命中 / 软加分 / 未绑定降级）'
 	assert('/warmup 遇陈旧向量时不误报已就绪', !dimWarm.includes('向量已就绪'), dimWarm);
 }
 
+section('[5b] 孤立链接卡：AI 硬命中不得单独定罪（2026-09-24 第四轮）');
+{
+	// 【线上事故形态，快照 seq94/95】资料卡只有「私有群邀请链接 + 私聊措辞」，
+	// 结构化分只有 4（+5 链接 −3 私聊豁免），却因 AI 相似度 0.811/0.810 被硬命中封禁。
+	// 根因是 URL 归一成「私有群邀请链接」占位符后，这类卡之间只剩「都有个私有群链接」
+	// 一个共同点，语义层把它们聚成了一类 —— 实测 12 张已确认正常的资料卡里有 1 张越线 0.8013。
+	const linkAdMapper = (text) => {
+		const base = new Array(EMBED_DIM).fill(0);
+		// 在 adVector 的词表上补一个「私有群邀请链接」：归一化后带私有群链接的卡会与
+		// 带链接的广告样本落到同一向量，余弦 1.0，稳定触发硬命中分支。
+		const adLike = /收购|网赚|USDT|代理|洗急|稳宝|辣妞|风口|高价收|日结|私有群邀请链接/.test(text);
+		if (adLike) { base[0] = 1; base[1] = 0.5; } else { base[2] = 1; base[3] = 0.5; }
+		return base;
+	};
+	const loneCard = {
+		profile: { firstName: '匿名時', bio: '私聊请通过这个联系 https://t.me/+aHkFhL6hnTA2ZTc1', status: 'member' },
+		text: '',
+		forwardChat: null
+	};
+
+	// 前置：确认这确实是「孤立链接卡」——走 5 分那一档，总分不到封禁线。
+	const envLoneNoAi = makeEnv();
+	await W.adDetectionReady(envLoneNoAi);
+	const loneNoAi = await W.evaluateAdSuspect(envLoneNoAi, loneCard, {});
+	assert('孤立链接卡前置：结构化分低于封禁线', loneNoAi.score < 7, String(loneNoAi.score));
+	assert('孤立链接卡前置：依据写明「无广告旁证」', loneNoAi.reasons.some((r) => r.includes('无广告旁证')), JSON.stringify(loneNoAi.reasons));
+	assert('孤立链接卡前置：无 AI 时 verdict 不是 ban', loneNoAi.verdict !== 'ban', JSON.stringify(loneNoAi));
+
+	const envLone = makeEnv({ AI: makeFakeAI(linkAdMapper) });
+	await W.adDetectionReady(envLone);
+	const lone = await W.evaluateAdSuspect(envLone, loneCard, {});
+	assert('★ 孤立链接卡：AI 硬命中被降级，verdict 不是 ban', lone.verdict !== 'ban', JSON.stringify(lone));
+	assert('★ 孤立链接卡：aiSuppressed 标记为真', lone.aiSuppressed === true, JSON.stringify(lone));
+	assert('★ 孤立链接卡：判定层不冒充 ai 层', lone.layer !== 'ai', lone.layer);
+	assert('★ 孤立链接卡：留痕写明未单独定罪', lone.reasons.some((r) => r.includes('未单独定罪')), JSON.stringify(lone.reasons));
+	assert('★ 孤立链接卡：AI 相似度仍被记录（可观测，不是静默丢弃）', lone.aiSimilarity >= 0.78, String(lone.aiSimilarity));
+
+	// 反保险 ①：链接卡有广告旁证 → 走 7 分那一档，结构化分自己就撞线，降级逻辑不该救它。
+	const corrobCard = {
+		profile: { firstName: 'Misty Muz', bio: 'https://t.me/+ue0-PILh6PpiZjg9 加群看项目 一天赚8千！', status: 'member' },
+		text: '',
+		forwardChat: null
+	};
+	const envCorrob = makeEnv({ AI: makeFakeAI(linkAdMapper) });
+	await W.adDetectionReady(envCorrob);
+	const corrob = await W.evaluateAdSuspect(envCorrob, corrobCard, {});
+	assert('★ 反保险：有旁证的链接卡照样封禁', corrob.verdict === 'ban', JSON.stringify(corrob));
+	assert('★ 反保险：有旁证的链接卡不触发降级', corrob.aiSuppressed !== true, JSON.stringify(corrob));
+
+	// 反保险 ②：正文自己有广告证据时不得降级 —— 否则「正文就是广告、资料卡顺带放个链接」
+	// 的真广告会被误放。守卫是 behaviorScore > 0，这条用例把它钉死。
+	// 正文只带一个非白名单链接（+2），总分仍低于封禁线，所以这次定罪纯粹来自 AI ——
+	// 正是「AI 单独定罪」的场景，唯一的区别是正文不是干净的。
+	const bodyAdCard = {
+		profile: { firstName: '匿名時', bio: '私聊请通过这个联系 https://t.me/+aHkFhL6hnTA2ZTc1', status: 'member' },
+		text: 'http://evil-shop.top',
+		forwardChat: null
+	};
+	const envBodyNoAi = makeEnv();
+	await W.adDetectionReady(envBodyNoAi);
+	const bodyBase = await W.evaluateAdSuspect(envBodyNoAi, bodyAdCard, {});
+	assert('★ 反保险前置：该正文确实贡献了正分证据', bodyBase.behaviorScore > 0, JSON.stringify({ b: bodyBase.behaviorScore, r: bodyBase.reasons }));
+	assert('★ 反保险前置：无 AI 时总分仍低于封禁线', bodyBase.score < 7, String(bodyBase.score));
+	const envBody = makeEnv({ AI: makeFakeAI(linkAdMapper) });
+	await W.adDetectionReady(envBody);
+	const bodyAd = await W.evaluateAdSuspect(envBody, bodyAdCard, {});
+	assert('★ 反保险：正文有广告证据时不降级', bodyAd.aiSuppressed !== true, JSON.stringify(bodyAd));
+	assert('★ 反保险：正文有广告证据时 AI 硬命中照样定罪', bodyAd.verdict === 'ban', JSON.stringify(bodyAd));
+
+	// 反保险 ③：不带链接的卡完全不受影响 —— 降级只针对孤立链接卡，不能顺手削弱整个 AI 层。
+	const plainAdCard = { profile: { firstName: '路人甲', bio: '洗急两分钟一单', status: 'member' }, text: '', forwardChat: null };
+	const envPlain = makeEnv({ AI: makeFakeAI(linkAdMapper) });
+	await W.adDetectionReady(envPlain);
+	const plain = await W.evaluateAdSuspect(envPlain, plainAdCard, {});
+	assert('★ 反保险：无链接卡的 AI 硬命中不受影响', plain.verdict === 'ban', JSON.stringify(plain));
+	assert('★ 反保险：无链接卡不触发降级', plain.aiSuppressed !== true, JSON.stringify(plain));
+}
+
 section('[6] 入群检测端到端（webhook → 封禁 → 快照 → 私聊通知）');
 {
 	const ownerNoticeText = () => calls

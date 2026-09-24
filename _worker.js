@@ -11657,6 +11657,10 @@ function scoreAdProfile(profile, options = {}) {
 	// 【只管资料卡、不管正文】主人这次说的是「资料卡昵称 + 广告简介」。正文里发群链接
 	// （「这个群不错 t.me/+xxx」）在正常群聊里远比写进个人简介常见，所以 scoreAdMessageText
 	// 一个字都不动 —— 要扩到正文得另开一轮，不在本次授权范围内。
+	// 【孤立链接卡】本函数把「资料卡只有私有群邀请链接、且无任何广告旁证」这个事实透给检测端：
+	// 语义层（AI）不得把这种卡单独定成广告 —— 详见 evaluateAdSuspect 里 aiSuppressed 的说明。
+	// 判定与下面的两档计分同源，不另立判据：走 AD_PRIVATE_INVITE_SCORE 那一档就是孤立链接卡。
+	let lonePrivateInvite = false;
 	const privateInvite = hasAdPrivateInviteLink(combined);
 	if (privateInvite) {
 		// 链接本身只说明「有个入口」，文案才说明「这是广告」。三种旁证任一成立即升回封禁线；
@@ -11675,6 +11679,7 @@ function scoreAdProfile(profile, options = {}) {
 				+ [solicitCopy ? '招揽文案' : '', generatedName ? '机器生成昵称' : '', tradeCombo ? '交易词×业务词' : '']
 					.filter(Boolean).join('、'));
 		} else {
+			lonePrivateInvite = true;
 			add(AD_PRIVATE_INVITE_SCORE, '资料卡含私有群一次性邀请链接（t.me/+ 或 joinchat），但无广告旁证：'
 				+ '只算引流信号，按观察线计分（不封、不禁言）');
 		}
@@ -11710,7 +11715,8 @@ function scoreAdProfile(profile, options = {}) {
 	if (displayName && !AD_HAS_EMOJI_RE.test(displayName) && !bio && !options.skipMissingBioPenalty) add(-1, '名称无 emoji 且无 Bio');
 
 	// 下限 AD_SCORE_FLOOR（-3）而非 0：夹到 0 会让豁免词减分完全失效，详见该常量说明。
-	return { score: Math.max(AD_SCORE_FLOOR, score), rawScore: score, reasons, tradeHits, businessHits };
+	// lonePrivateInvite：本次的资料卡是不是「孤立链接卡」（见上方该变量的说明）。
+	return { score: Math.max(AD_SCORE_FLOOR, score), rawScore: score, reasons, tradeHits, businessHits, lonePrivateInvite };
 }
 
 // 评分消息正文：入群后首条消息的兜底判定。
@@ -14045,6 +14051,9 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	// 换成函数调用后行为与改动前唯一的差别就是「URL 被换成语义占位符」，
 	// 这也正是要的效果 —— 比对时剥链接、学习时也剥链接，两边看到的是同一种文本。
 	const semanticText = buildAdSampleText(payload);
+	// AI 命中会把 layer 改写成 'ai'。若这次命中稍后被降级（孤立链接卡不得单独定罪），
+	// 必须把 layer 还原成 AI 之前的层，否则回执与观察记录会宣称「AI 层定的罪」而实际没有。
+	const layerBeforeAi = layer;
 	if (config.aiEnabled && semanticText.length >= 6) {
 		ai = await checkAdAiSimilarity(env, semanticText, { config });
 		if (ai.isMatch) {
@@ -14182,7 +14191,38 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		};
 	})();
 
-	const hardHit = fingerprintBan || Boolean(ai.isMatch) || structureBan;
+	// ===== 孤立链接卡：AI 不得单独定罪（2026-09-24 第四轮）=====
+	//
+	// 【要治的病】语义层退化成「资料卡聚类器」。实测（线上快照 seq94/95）：
+	//   piaoliang  score=4  AI 0.811     Bear  score=4  AI 0.810
+	// 结构化分只有 4 —— `+7 私有群邀请链接` 被「私聊」豁免扣回 -3 之后【根本不到封禁线 7】，
+	// 是 AI 硬命中把它判成了封禁。而 AI 之所以命中，是因为 URL 被归一成
+	// `私有群邀请链接` 占位符之后，【所有只含一个私有群链接的资料卡在语义上互相高度相似】：
+	// 拿放行库里 12 张已确认正常的资料卡当新用户测，最高 0.8013 越线，次高 0.7580 只差 0.022。
+	//
+	// 【为什么不许它单独定罪】两档链接规则（2026-09-24 第三轮）已经定过口径：
+	// 孤立链接是【引流信号】不是【广告意图】，所以它只到观察线、不封不禁言。
+	// AI 层如果能把同一个孤立信号升级成定罪，那条口径就被绕过了 ——
+	// 检测端与评分端必须同口径，否则「两档」只是评分器内部的自娱自乐。
+	// 语义层该干的是【给有旁证的广告补一刀】，不是【把没有旁证的引流信号放大成广告】。
+	//
+	// 【三个条件必须同时成立才降级】任何一个不成立都说明这次定罪不是「只有孤立链接」：
+	//   ① aiAlone —— AI 是本次【唯一】的硬命中来源，且非 AI 分数没到封禁线。
+	//      指纹库或结构查杀命中时不动（那是确定性判据，本来就该独立定罪）。
+	//   ② lonePrivateInvite —— 资料卡的私有群链接确实无广告旁证（走的是 5 分那一档）。
+	//   ③ behaviorScore <= 0 —— 正文自己没贡献任何广告证据。
+	//      缺了这条，一条「正文就是广告、资料卡顺带放了个链接」的真广告会被误放。
+	const aiAlone = Boolean(ai.isMatch) && !fingerprintBan && !structureBan && score < config.scoreThreshold;
+	const aiSuppressed = aiAlone && profileResult.lonePrivateInvite === true && behaviorScore <= 0;
+	const aiConvicted = Boolean(ai.isMatch) && !aiSuppressed;
+	if (aiSuppressed) {
+		// 必须留痕：主人追问「这条 AI 明明很像广告为什么没封」时，唯一能解释的就是这一行。
+		reasons.push('（AI 相似度 ' + ai.similarity.toFixed(3) + ' 未单独定罪：资料卡只有孤立私有群邀请链接、'
+			+ '无广告旁证，且正文无广告证据 —— 语义层不得把引流信号升级成广告意图，与两档链接规则同口径）');
+		layer = layerBeforeAi;
+	}
+
+	const hardHit = fingerprintBan || aiConvicted || structureBan;
 	const verdict = (score >= config.scoreThreshold || hardHit)
 		? 'ban'
 		// observe 模式下的结构命中不封，但必须留观察记录 + 推快照给主人人工过目，
@@ -14193,8 +14233,11 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		verdict,
 		score,
 		layer: structureBan ? structure.channel
-			: (hardHit ? (ai.isMatch ? 'ai' : 'fingerprint')
+			: (hardHit ? (aiConvicted ? 'ai' : 'fingerprint')
 				: (structure.guilty ? structure.channel : layer)),
+		// aiSuppressed 透传给处置端与观察记录：被降级的 AI 命中不该再被当成定罪证据
+		// （学习端据 evidenceFields 收窄取材，这里如实标注「语义层没定罪」）。
+		aiSuppressed,
 		reasons,
 		threshold: config.scoreThreshold,
 		fingerprintHits: fingerprint.hits,
