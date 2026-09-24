@@ -6924,6 +6924,29 @@ async function handleAdEnforceCallback(callbackQuery, env) {
 	// 标了会让下次直接走 already_global 而不再重试，等于升级被静默吞掉。
 	// 台账里本来没有这一行（例如 AD_BAN_SCOPE_MODE=global）时 UPDATE 影响 0 行，同样无害。
 	if (okCount > 0) await markAdBanScopeEscalated(env, targetId, summary);
+
+	// ===== 候选正文提升入库 =====
+	// 主人点这颗按钮 = 第三个因素（主人判定）到位，正文候选样本才真正进 AI 样本库。
+	// 这就是主人口径里的「AI 判定 + 主人判定」：AI 那一票在自动判定时已经投过（否则不会有候选），
+	// 这里补上主人那一票，两个因素齐备才入库。
+	//
+	// ⚠️ 必须排在 deleteAdPendingSnapshot【之前】：快照一删，候选正文就再也找不回来了。
+	// 入库失败只记日志、不打断处置 —— 黑名单与全群封禁都已经做完，
+	// 少学一条样本的代价远小于让主人的这次点击报错。
+	let candidateNote = '';
+	const candidate = snapshot?.snapshot?.sampleCandidate;
+	if (candidate?.text) {
+		try {
+			const promoted = await addAdSample(env, candidate.text, { source: 'auto-confirmed' });
+			if (promoted?.added) candidateNote = 'AI 样本：候选正文已学入 1 条';
+			else if (promoted?.ok) candidateNote = 'AI 样本：候选正文与库内已有样本重复，未新增';
+			else candidateNote = 'AI 样本：候选正文被拒（' + String(promoted?.reason || '未知') + '）';
+		} catch (error) {
+			console.error('[判定通知] 候选样本入库失败:', error);
+			candidateNote = 'AI 样本：候选正文入库失败（已记日志）';
+		}
+	}
+
 	await deleteAdPendingSnapshot(env, clickerId, seq);
 	await clearAdNoticeKeyboard(chatId, messageId);
 	await answerAdVoteCallback(callbackQuery?.id, '已全群封禁');
@@ -6936,6 +6959,7 @@ async function handleAdEnforceCallback(callbackQuery, env) {
 		'',
 		'解封出口：<code>/unban ' + escapeHtml(targetId) + '</code>（会同时解除禁言与全群封禁）'
 	];
+	if (candidateNote) lines.splice(lines.length - 2, 0, escapeHtml(candidateNote));
 	await sendTelegramMessageChunks(chatId, lines.join('\n'));
 }
 
@@ -7112,10 +7136,114 @@ function isChannelAutoForward(message) {
 	return message?.is_automatic_forward === true && Boolean(message?.sender_chat);
 }
 
+// 这条消息【引用的那条】是不是频道帖。两个形态都算：
+//   · reply_to_message.is_automatic_forward —— 关联频道帖自动转发进讨论组后被回复
+//   · external_reply.origin.type === 'channel' —— 跨聊天/跨频道回复，客户端渲染与上一种一模一样
+//
+// 【要治的病】（2026-09-25 主人反馈）群友回复本群关联频道的帖子，被 quoted 通道判成广告号禁言。
+// getAdQuotedText 一视同仁地把频道原文当「他引用的广告」收下，
+// 于是「本人正文近乎为空 + 引用体像广告」两个门槛同时成立 —— 定罪了，可那些字是频道的。
+//
+// 【为什么该豁免】引用通道的立法意图是抓「正文一个字母 + 广告全塞在引用块里」的规避形态，
+// 前提是【引用块里的字也是发言者自己写的】。频道帖不是他写的：普通成员根本无权往频道发帖，
+// 把他人的文字算成他的罪证，等于让主人自己的频道内容变成群友的雷。
+//
+// ⚠️ 但【绝不能按「来源是频道」一概豁免】—— 那等于把整条通道关掉：
+// 2026-09-08 线上漏放 50+ 个号的真实形态就是「正文一个字母 c + 引用【外部频道】bxbd 的广告」，
+// 引用体里照样全是广告词。区分的责任交给 resolveAdQuotedText：只有【本群自己的关联频道】才豁免。
+//
+// 【为什么只认这两个信号，不认 forward_origin】转发进来的频道帖同样是「别人的字」，
+// 但它多一道人工动作，且广告号确实会用「转发自己的广告帖 + 回一个字母」来规避 ——
+// 那种形态必须继续被抓。
+function isChannelOriginQuote(message) {
+	const ext = message?.external_reply || null;
+	if (String(ext?.origin?.type || '') === 'channel') return true;
+	return isChannelAutoForward(message?.reply_to_message);
+}
+
+// ===== 本群「关联频道」是谁：群 id → 频道 id =====
+//
+// external_reply 只告诉你「引用来源是个频道」，不告诉你是谁的。要区分
+// 「本群自己的关联频道」与「别人家的频道」（bxbd 那类），必须知道这个映射。
+//
+// 【两个来源，自动转发优先】：
+//   ① 关联频道帖自动转发进讨论组时，sender_chat.id 就是关联频道 —— Telegram 只会把
+//      【本群关联频道】的帖子自动转发进来，所以这是 100% 可信的一手信号，见到就记。
+//   ② 兜底问一次 getChat 读 linked_chat_id（10 分钟缓存）。
+// 先看 ①：它既省一次 API，又比 ② 更准 —— bot 不是频道管理员时 getChat 可能根本不返回
+// linked_chat_id，那种情况下只有 ① 能救。
+//
+// 【取不到时一律【不豁免】】（fail closed）：宁可漏放一个引用自家频道的群友，
+// 也不能因为一次 API 抖动把整条引用通道关掉，把 bxbd 那 50 个号重新放回来。
+const AD_LINKED_CHANNEL_CACHE = new Map();
+const AD_LINKED_CHANNEL_TTL_MS = 10 * 60 * 1000;
+
+function rememberGroupLinkedChannel(chatId, channelId) {
+	const key = String(chatId || '');
+	const id = channelId != null ? String(channelId) : '';
+	if (!key || !id) return;
+	AD_LINKED_CHANNEL_CACHE.set(key, { id, at: Date.now(), learned: true });
+}
+
+// 清空关联频道映射缓存。与 invalidateAdProfileCache / invalidateAdAdminCache 同款，
+// 供测试用例之间隔离状态（缓存是模块级的，跨用例存活）。
+function invalidateAdLinkedChannelCache() {
+	AD_LINKED_CHANNEL_CACHE.clear();
+}
+
+async function resolveGroupLinkedChannelId(chatId) {
+	const key = String(chatId || '');
+	if (!key) return null;
+	const cached = AD_LINKED_CHANNEL_CACHE.get(key);
+	const now = Date.now();
+	// 从自动转发帖学到的映射不设过期：关联频道几乎不会变，而它是 100% 可信的。
+	if (cached?.learned) return cached.id;
+	if (cached && now - cached.at < AD_LINKED_CHANNEL_TTL_MS) return cached.id;
+	let id = null;
+	try {
+		const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: key })
+		});
+		const result = await response.json();
+		const value = result?.result?.linked_chat_id;
+		id = value != null ? String(value) : null;
+	} catch (error) {
+		console.error('[广告检测] 查询群关联频道失败:', error);
+		id = null;
+	}
+	// 学到过就不让一次失败的 getChat 把它覆盖掉。
+	if (!(AD_LINKED_CHANNEL_CACHE.get(key)?.learned)) {
+		AD_LINKED_CHANNEL_CACHE.set(key, { id, at: now, learned: false });
+	}
+	return id;
+}
+
+// 引用体正文（已按「频道来源」豁免）。这是 handleMessage 唯一该调的入口 ——
+// 直接调 getAdQuotedText 会把本群关联频道的原文也当成本人的字。
+async function resolveAdQuotedText(message) {
+	const raw = getAdQuotedText(message);
+	if (!raw) return raw;
+	// ① 关联频道帖自动转发后被回复：is_automatic_forward 只可能来自本群自己的关联频道，直接豁免。
+	if (isChannelAutoForward(message?.reply_to_message)) return '';
+	// ② external_reply 的来源是频道：比对是不是本群关联频道，是自家的才豁免。
+	const origin = message?.external_reply?.origin;
+	if (String(origin?.type || '') !== 'channel') return raw;
+	const originChatId = String(origin?.chat?.id ?? '');
+	if (!originChatId) return raw;
+	const linkedId = await resolveGroupLinkedChannelId(message?.chat?.id);
+	return linkedId && linkedId === originChatId ? '' : raw;
+}
+
 async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 频道关联群自动转发帖直接放行:不删、不缓存、不当命令。
 	// 放在最顶部,先于一切治理逻辑,保证任意频道内容(不只是像广告的)都不被误删误取消置顶。
 	if (isChannelAutoForward(message)) {
+		// 顺手记下「这个群的关联频道是谁」。自动转发帖是唯一 100% 可信的一手来源
+		// （Telegram 只会把本群关联频道的帖子自动转发进来），判定引用来源时要用它比对。
+		// 详见 rememberGroupLinkedChannel / resolveAdQuotedText。
+		rememberGroupLinkedChannel(message.chat?.id, message.sender_chat?.id);
 		return;
 	}
 
@@ -12624,6 +12752,39 @@ function buildAdSampleText(payload) {
 	return normalizeAdSemanticText([payload?.name, payload?.bio, payload?.text].filter(Boolean).join(' ').trim());
 }
 
+// ===== 学习取材收窄：只保留【本次真正参与定罪】的字段（2026-09-24）=====
+//
+// 【要治的病】学习端取「name + bio + text 全拼」，定罪端却可能只凭其中一个字段定罪，
+// 两者解耦 → 定罪证据落在 A 字段，B 字段却被一起学成广告素材。
+// 线上事故（2026-09-24 中秋）：用户资料卡含 t.me/+ 私有群链接（+7 分定罪），
+// 正文只是一句「月圆人团圆，好礼一起抽！🎁」；bot 把这句祝福学成 keyword 指纹 + AI 样本，
+// 随后 3 分钟内 44 条快照、6 个号被 AI 硬命中（相似度 0.78~0.88）批量误封，
+// 而那句祝福本身的结构化评分是 0 分、无链接、无交易动词、无业务词。
+//
+// 【为什么置空字段，而不是逐条过滤候选】
+// 指纹候选（按词截取的 keyword 短语、domain）与 AI 样本都是从 name + bio + text 拼出来的，
+// 逐条改抽取逻辑要在五处同步维护，改漏一处就漏一条污染路径。
+// 把没证据的字段置空之后，现有的抽取与拼装逻辑【自然】只看得到有证据的字段，
+// 改动面最小、可验证性最强。
+//
+// 【domains 必须跟着重算】payload.domains 也是从 name + bio + text 抽出来的，
+// 不重算的话「资料卡定罪」仍会把正文里的域名带进 domain 指纹（domain 权重 1，单条即定罪）。
+function scopeAdLearningPayload(payload, fields) {
+	const allow = fields instanceof Set ? fields : new Set(Array.isArray(fields) ? fields : []);
+	const pick = (field) => (allow.has(field) ? String(payload?.[field] ?? '') : '');
+	const name = pick('name');
+	const bio = pick('bio');
+	const text = pick('text');
+	return {
+		...payload,
+		name,
+		username: pick('username'),
+		bio,
+		text,
+		domains: extractAdDomains([name, bio, text].filter(Boolean).join('\n'))
+	};
+}
+
 // /addsample 底层：新增语义样本，向量留空由懒加载补齐。
 //
 // 【入口统一归一化】这里再套一次 normalizeAdSemanticText 不是多余：/addsample 是主人手打的
@@ -13765,6 +13926,95 @@ async function evaluateAdSuspect(env, input, options = {}) {
 	}
 	const structureBan = structure.guilty && config.structureKill === 'ban';
 
+	// ===== 定罪字段（2026-09-24）=====
+	// 学习端只能取【本次真正参与定罪的字段】。返回值 evidenceFields 供 enforceAdDetection
+	// 调 scopeAdLearningPayload 收窄取材，详见那个函数的说明。
+	//
+	// 【要治的病】原实现无条件把 name + bio + text 全拼着学，而定罪可能只凭其中一个字段：
+	// 资料卡含 t.me/+ 私有群链接（+7）的人发一句正常祝福，bot 会把【那句祝福】也学成
+	// keyword 指纹 + AI 样本；随后所有发同一句祝福的正常用户都被 AI 硬命中
+	// （实测相似度 0.78~0.88 ≥ 阈值 0.78 即定罪）批量误封。
+	// 2026-09-24 中秋当天线上 52 条快照、6 个号被封，源头就是这一条链。
+	//
+	// 【归属规则】只认【独立证据】：评分层的分项、指纹命中值回落到哪个字段、结构查杀的通道。
+	//
+	// 【AI 语义相似度刻意不算独立证据】它是拿【正在被写入的那个库】比出来的 ——
+	// 拿它当学习凭据就是自激振荡：学一条 → 下一条更像 → 再学一条。
+	// 本次事故里那句祝福语的第二代污染样本（#133）正是这么来的。
+	// 不把 AI 命中算作学习凭据之后，学习回路从「自激」变成「收敛」：
+	// 只有评分层 / 指纹层 / 结构层这些【不依赖样本库】的证据才能扩充样本库。
+	const evidenceFields = new Set();
+	// 资料卡（昵称 / 简介）在 scoreAdProfile 里是按 combined = 昵称 + 简介 一起算的，
+	// 拿不到更细的归属，故两者一起授权。风险可接受：资料卡是这个人【自己恒定】的属性，
+	// 学错的影响面限于与他资料卡雷同的人，远小于把一条群发正文学进全群共享的匹配面。
+	if (profileResult.rawScore > 0) { evidenceFields.add('name'); evidenceFields.add('bio'); }
+	if (textResult.score > 0) evidenceFields.add('text');
+	if (fingerprint.hits.length) {
+		const normName = normalizeAdFingerprintValue(payload.name);
+		const normBio = normalizeAdFingerprintValue(payload.bio);
+		const normText = normalizeAdFingerprintValue(payload.text);
+		const owns = (hay, needle) => Boolean(needle) && Boolean(hay) && hay.includes(needle);
+		for (const hit of fingerprint.hits) {
+			if (hit.type === 'username') { evidenceFields.add('username'); continue; }
+			if (hit.type === 'bio') { evidenceFields.add('bio'); continue; }
+			// keyword / domain 都是从 name + bio + text 拼出来的，按【命中值本身】
+			// 回落到具体字段：命中值出现在哪个字段里，就只授权哪个字段。
+			const needle = String(hit.normalized ?? '');
+			if (owns(normText, needle)) evidenceFields.add('text');
+			if (owns(normBio, needle)) evidenceFields.add('bio');
+			if (owns(normName, needle)) evidenceFields.add('name');
+			// 归属不到任何字段（例如恰好跨字段边界拼出来的串）→ 一个字段都不授权。
+			// 宁可少学一条，也不把没定罪的正文带进库里。
+		}
+	}
+	if (structure.guilty) {
+		const channel = String(structure.channel || '');
+		if (channel === 'card') { evidenceFields.add('name'); evidenceFields.add('username'); evidenceFields.add('bio'); }
+		else if (channel === 'identity') { evidenceFields.add('name'); evidenceFields.add('bio'); }
+		else if (channel === 'body') { evidenceFields.add('bio'); evidenceFields.add('text'); }
+		// quoted 通道刻意不授权任何字段：定罪的依据是【别人写的那段引用文字】，
+		// 本人正文近乎为空（「恭喜恭喜」那类）。把别人的话学成他的特征本来就是错的
+		//（payload.quoted 一直不进学习取材，这里保持一致）。
+	}
+
+	// ===== 正文进 AI 样本库的多因素门槛（2026-09-25 主人口径）=====
+	// 主人的原话：「正文可以进样本库，但是得通过多因素核查，如 AI 判定 + 主人判定才可进样本库」。
+	//
+	// 【三个因素】
+	//   F1 正文自己的证据 —— 结构化评分撞线 / 指纹命中归属于正文 / body 结构通道定罪
+	//   F2 AI 语义        —— 与样本库里已有广告的相似度 ≥ 软命中线（AD_AI_SOFT_BONUS_FLOOR）
+	//   F3 主人判定      —— 主人点判定通知的「全群封禁」，或直接 /spam 指认
+	//
+	// 【规则】F1、F2 两个自动因素【都】命中 → 正文直接进样本库（互相印证，不需要打扰主人）；
+	// 只命中其中一个 → 正文【不进库】，挂成「候选样本」写进主人通知，主人点「全群封禁」才入库
+	//（F3 + 那一个 = 两个因素）；主人点「误判放行」或干脆不管它，候选随快照一起作废。
+	//
+	// 【为什么正文要比资料卡严】资料卡是这个人的恒定属性，学错的匹配面只有「资料卡与他雷同的人」；
+	// 正文是【全群共享】的匹配面 —— 学错一句祝福语，全群发同一句话的人一起中招（2026-09-24 事故）。
+	// 所以资料卡沿用 evidenceFields 收窄，正文再叠一道多因素门槛。
+	//
+	// 【为什么候选只挂不直接入库】F2 是拿【正在被写入的那个库】比出来的，单靠它入库就是自激振荡；
+	// 拉主人进来当第二个因素，学习回路才有外部锚点。
+	const sampleGate = (() => {
+		const body = String(payload?.text || '').trim();
+		if (!body) return { mode: 'none', text: '', bodyEvidence: false, ai: false, similarity: 0 };
+		// F1 直接复用 evidenceFields —— 「什么算正文自己的证据」这件事全文件只该有一个定义，
+		// 另写一套判据迟早与定罪端分叉（2026-09-24 事故就是定罪端与学习端两套口径分叉造成的）。
+		const bodyEvidence = evidenceFields.has('text');
+		const aiHit = Boolean(ai.isMatch || ai.isSoft);
+		const count = (bodyEvidence ? 1 : 0) + (aiHit ? 1 : 0);
+		return {
+			// auto：两个自动因素齐备，正文直接入库
+			// candidate：只有一个因素，挂候选等主人确认
+			// none：正文没有任何广告信号，不进库也不挂候选
+			mode: count >= 2 ? 'auto' : (count === 1 ? 'candidate' : 'none'),
+			text: body,
+			bodyEvidence,
+			ai: aiHit,
+			similarity: Number(ai.similarity) || 0
+		};
+	})();
+
 	const hardHit = fingerprintBan || Boolean(ai.isMatch) || structureBan;
 	const verdict = (score >= config.scoreThreshold || hardHit)
 		? 'ban'
@@ -13796,6 +14046,12 @@ async function evaluateAdSuspect(env, input, options = {}) {
 		aiSimilarity: ai.similarity,
 		aiSample: ai.sample,
 		payload,
+		// evidenceFields：本次【真正参与定罪】的字段集合（name / username / bio / text）。
+		// 处置端据此收窄学习取材 —— 没定罪的字段一律不学。详见本函数内那段说明。
+		evidenceFields,
+		// sampleGate：正文进 AI 样本库的多因素门槛判定结果（auto / candidate / none）。
+		// 处置端据此决定正文是直接入库、挂候选等主人确认、还是根本不进库。
+		sampleGate,
 		// allowlist：本次命中的放行维度（未命中为 null）。透传给处置端只为可观测 ——
 		// 快照与日志据此能看出「这条为什么得分这么低」。
 		allowlist: allow,
@@ -13813,7 +14069,20 @@ async function evaluateAdSuspect(env, input, options = {}) {
 			bio: String(rawProfile.bio || '').slice(0, 200),
 			text: rawText.slice(0, 300),
 			status: String(rawProfile.status || ''),
-			forwardTitle: String(input?.forwardChat?.title || '').slice(0, 120)
+			forwardTitle: String(input?.forwardChat?.title || '').slice(0, 120),
+			// 候选样本：只有单因素时才有值（详见 sampleGate 的说明）。
+			// 主人点「全群封禁」时按这里的 text 提升入库（主人判定 = 第二个因素）；
+			// 点「误判放行」或干脆不管它，候选随快照一起作废，绝不进库。
+			// 存快照而不是另开一张表：候选的生命周期与这条判定完全一致，
+			// 分开存就要再处理一遍过期 / 复核 / 清理，三处都可能漏。
+			sampleCandidate: sampleGate.mode === 'candidate'
+				? {
+					text: sampleGate.text.slice(0, 300),
+					bodyEvidence: sampleGate.bodyEvidence,
+					ai: sampleGate.ai,
+					similarity: sampleGate.similarity
+				}
+				: null
 		}
 	};
 }
@@ -13889,11 +14158,32 @@ function renderAdDetectionNotice(evaluation, context) {
 	// 标签用「处置结果」而不是「封禁结果」：首次命中现在只禁言，
 	// 继续叫封禁结果会让主人以为人被踢出去了。
 	if (context?.banSummary) lines.push('处置结果：' + escapeHtml(String(context.banSummary)));
+
+	// 正文候选样本（多因素门槛只命中一个因素）。
+	// 必须写在通知里，而且要写清楚「点哪颗按钮才会入库」——
+	// 不写的话主人根本不知道那颗「全群封禁」还有第二重后果，候选就成了永远作废的摆设。
+	const candidate = evaluation?.snapshot?.sampleCandidate;
+	const hasCandidate = Boolean(candidate && candidate.text);
+	if (hasCandidate) {
+		const factors = [];
+		if (candidate.bodyEvidence) factors.push('正文自身判据');
+		if (candidate.ai) factors.push('AI 语义相似度 ' + Number(candidate.similarity || 0).toFixed(3));
+		lines.push('');
+		lines.push('<b>📎 正文候选样本（待你确认）</b>');
+		lines.push('正文：' + escapeHtml(String(candidate.text).slice(0, 200)));
+		lines.push('命中因素：' + escapeHtml(factors.join(' + ') || '未知'));
+		lines.push('只命中一个因素，暂不入 AI 样本库。点「🚫 全群封禁」确认后才会学进去；'
+			+ '点「♻️ 误判放行」或不管它，候选随快照作废。');
+	}
+
 	if (context?.seq) {
 		lines.push('');
 		// 判定正确不给出口：指纹与 AI 样本已在 enforceAdDetection 里自动学入，
 		// 主人【什么都不用做】。/confirm 已于 2026-09-08 删除。
-		lines.push('判定正确：无需任何操作（已自动学入指纹与 AI 样本）');
+		// 有候选样本时口径要改：正文还没进库，点「全群封禁」才是那第二个因素。
+		lines.push(hasCandidate
+			? '判定正确：点下方「🚫 全群封禁」确认（正文候选样本会一并学入 AI 样本库）'
+			: '判定正确：无需任何操作（已自动学入指纹与 AI 样本）');
 		// 两个出口并列写：按钮是最省事的路径，命令是它的兜底 ——
 		// 键盘塞不下（callback_data 超 64 字节）时按钮不会挂上，光写「点下方按钮」会指向空气。
 		lines.push('判定错误并解封：点下方按钮，或发 /ignore ' + context.seq);
@@ -14462,7 +14752,7 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		// 那道闸门是 source='auto' 唯一的前置条件，而本函数是 source='auto' 的唯一调用点，
 		// 且只在已定罪时走到这里 —— 主人的口径是「已经确定并执行封禁的就自动学习指纹」，
 		// 定罪本身就是学习凭据，不需要再问一遍「结构层同不同意」。
-		const learn = await learnAdFingerprints(env, evaluation.payload, {
+		const learn = await learnAdFingerprints(env, scopeAdLearningPayload(evaluation.payload, evaluation.evidenceFields), {
 			source: 'auto',
 			createdBy: 'system',
 			whitelist: options.whitelist
@@ -14490,9 +14780,22 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		// 那条路径碰到「本人正文一个字母 + 广告全在引用块里」时会拿引用体当样本，
 		// 比这里默认的 name + bio + text 准得多。有覆盖就用覆盖，避免同一次处置写两条样本
 		// （其中一条还是「英文人名 + 单字母」那种纯噪声）。
+		// 【覆盖是人工判定路径】/spam 是主人明确指认的，取材口径由调用方负责，这里不再收窄。
+		//
+		// 自动路径的取材字段 = evidenceFields 再叠一道「正文多因素门槛」：
+		// 正文只有在 F1（正文自己的证据）与 F2（AI 语义）两个自动因素齐备时才算数（mode === 'auto'）；
+		// 只有单因素时把正文从取材里摘掉 —— 它不进样本库，改挂候选样本，
+		// 等主人点「全群封禁」补上第二个因素（详见 evaluateAdSuspect 里 sampleGate 的说明）。
+		// 资料卡字段（name / username / bio）不受这道门槛约束：那是这个人自己的恒定属性，
+		// 匹配面只有「资料卡与他雷同的人」，远小于全群共享的正文。
+		const sampleFields = new Set(evaluation.evidenceFields || []);
+		if (String(evaluation.sampleGate?.mode || '') !== 'auto') sampleFields.delete('text');
 		const sampleText = options.sampleText != null
 			? String(options.sampleText).trim()
-			: buildAdSampleText(evaluation.payload);
+			// 自动路径必须按定罪字段收窄：只学【本次真正参与定罪】的字段，
+			// 否则「资料卡是广告 + 正文是正常祝福」会把那句祝福学进全群共享的样本库。
+			// 详见 scopeAdLearningPayload 的说明。
+			: buildAdSampleText(scopeAdLearningPayload(evaluation.payload, sampleFields));
 		// 长度门槛与 addAdSample 内部一致（< 4 字符直接拒），这里先判一次是为了少一次 D1 往返。
 		// 引用体形态的号（本人正文只有一个字母）在这里拼出来的通常只有昵称，
 		// 短到 4 字符以下就跳过 —— 那种样本语义太稀薄，进库只会拉高误判面。
@@ -14725,7 +15028,13 @@ async function detectAdOnMessage(message, env) {
 	// 引用体正文：这条消息引用/回复的那条【别人的】消息里的文字。
 	// 必须参与早退判断 —— 「正文为空 + 只引用一条广告」是漏放形态的极端版，
 	// 只看 text 与 forwardChat 会在这里就 return，后面四条通道一条都跑不到。
-	const quotedText = getAdQuotedText(message);
+	//
+	// 【频道来源的引用一律不算引用体】详见 isChannelOriginQuote / resolveAdQuotedText：
+	// 本群关联频道帖里的字是频道的，不是他的；但【外部频道】的广告帖被引用照旧定罪
+	//（2026-09-08 漏放 50+ 个号的真实形态），所以这里必须走异步解析去比对关联频道 id。
+	// 置空之后这条消息的 quoted 通道自然失效，本人正文与资料卡照常参与其余四条通道的判定 ——
+	// 豁免的只是「拿别人的话给他定罪」，不是给这个人发免死金牌。
+	const quotedText = await resolveAdQuotedText(message);
 	// 分享名片（contact）的显示名。名片消息的 text / caption 【恒为空】，
 	// 广告内容全写在名片显示名里（实例：昵称「假钞玩妹交流群🔥快递面交都可」+ 电话 +98 993 238 8241），
 	// 所以不取它 → 下面那道早退闸门会把整条消息当「空消息」return，四条通道一条都跑不到。
@@ -15036,10 +15345,14 @@ async function handleAdPendingCommand(env, chatId, ownerId, arg) {
 		lines.push('<b>#' + row.seq + '</b>　<code>' + escapeHtml(row.userId) + '</code>　得分 ' + row.score);
 		if (snap.name) lines.push('　名称：' + escapeHtml(String(snap.name).slice(0, 60)));
 		if (snap.text) lines.push('　消息：' + escapeHtml(String(snap.text).slice(0, 60)));
+		// 候选样本必须在这张列表上也标出来：主人完全可能走 /pending 复核而不是翻通知，
+		// 不标的话他看不到「这条的正文还没入库」，候选就永远不会被确认。
+		if (snap.sampleCandidate?.text) lines.push('　📎 正文候选样本：只命中一个因素，未入库（去通知上点「🚫 全群封禁」确认）');
 		lines.push('　时间：' + when + ' UTC');
 	}
 	lines.push('');
 	lines.push('判定正确：无需任何操作（指纹与 AI 样本已自动学入）');
+	lines.push('带 📎 的例外：正文只命中一个因素，暂未入样本库，点通知上的「🚫 全群封禁」确认后才学进去');
 	lines.push('判定错误并解封：/ignore 序号　支持批量 /ignore 3 5 7 与区间 /ignore 3-8');
 	await sendTelegramMessageChunks(chatId, lines.join('\n'));
 }

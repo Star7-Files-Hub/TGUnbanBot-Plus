@@ -4193,6 +4193,406 @@ section('[22] 联络入口：黑名单拒绝回执必须自带联系方式');
 	assert('自助解封成功回执仍然是「已解封」口径', textTo(63007).includes('已同意给予解封'), textTo(63007).slice(0, 300));
 }
 
+section('[23] 2026-09-24 中秋误封事故回归：学习取材必须按【定罪字段】收窄');
+{
+	// ===== 事故原样 =====
+	// 用户资料卡含 t.me/+ 私有群一次性邀请链接（AD_PRIVATE_INVITE_SCORE = 7，单凭资料卡即达阈值），
+	// 正文只是一句正常的中秋祝福「月圆人团圆，好礼一起抽！🎁」—— 那句祝福本身
+	// 结构化评分 0 分：无链接、无交易动词、无业务词、无豁免词。
+	//
+	// 旧实现无条件把 name + bio + text 全拼着学：定罪证据落在【资料卡】，那句祝福却被
+	// 一起学成 keyword 指纹 + AI 样本。随后 3 分钟内 44 条快照、6 个号被 AI 硬命中
+	// （实测相似度 0.78~0.88 ≥ 阈值 0.78）批量误封；第二代污染样本
+	//「肆哥 月圆人团圆，好礼一起抽！🎁」又把相似度顶到 0.8694。
+	//
+	// 本节把这条链完整钉住，两道闸：
+	//   23.1 资料卡定罪 → 只许学资料卡，正文一个字都不许进指纹库 / 样本库；
+	//   23.2 第二个发同一句祝福的正常人 → 不得被处置、不得产生判定通知。
+	// 缺任何一条，这条事故链就还能重演。
+	const G1 = '-1001111111111';
+	const G2 = '-1002222222222';
+	const makeMultiEnv = (extra = {}) => makeEnv({ GROUP_ID: `${G1},${G2}`, ...extra });
+	const msgIn = (chatId, chatTitle, from, text, extra = {}) => ({
+		message_id: 800 + Math.floor(Math.random() * 1000),
+		date: Math.floor(Date.now() / 1000),
+		text,
+		chat: { id: Number(chatId), type: 'supergroup', title: chatTitle },
+		from: { is_bot: false, ...from },
+		...extra
+	});
+	const bannedChats = () => calls.filter((c) => c.method === 'banChatMember').map((c) => String(c.body?.chat_id));
+	const mutedChats = () => calls.filter((c) => c.method === 'restrictChatMember').map((c) => String(c.body?.chat_id));
+	const ownerText = () => calls
+		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(OWNER_ID))
+		.map((c) => String(c.body?.text || '')).join('\n');
+
+	const GREETING = '月圆人团圆，好礼一起抽！🎁';
+	const SPAM_BIO = '有事请联系频道：https://t.me/+UiEnLbXCD0JhMWRl';
+	const GREETING_RE = /月圆|好礼|团圆|一起抽/;
+
+	// 伪 AI 必须让【资料卡】与【祝福语】落在正交维度上。
+	// 不能直接用默认 adVector：它的广告词表里没有「私有群邀请链接」也没有「月圆」，
+	// 两者都会被映射成同一个「非广告」向量（相似度 1.0），凭空造出一个与线上无关的
+	// AI 硬命中，把 23.1 变成假阳性。正交之后：资料卡向量 ≠ 祝福语向量，
+	// AI 层对本次判定不贡献任何命中，定罪完全由资料卡评分驱动 —— 与线上一致。
+	const ai = makeFakeAI((text) => {
+		const v = new Array(EMBED_DIM).fill(0);
+		if (/t\.me\/\+|私有群邀请链接/.test(text)) v[0] = 1;
+		else if (GREETING_RE.test(text)) v[1] = 1;
+		else v[2] = 1;
+		return v;
+	});
+	const env = makeMultiEnv({ AI: ai });
+	await W.ensureD1Table(env);
+
+	// ===== 23.1 资料卡定罪 → 只许学资料卡 =====
+	resetCalls();
+	setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: '肆哥', username: 'kuss888', bio: SPAM_BIO } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: 64001, first_name: '肆哥', username: 'kuss888' }, GREETING) }, env);
+
+	const fpRows = env.DB.query('SELECT type, value, source FROM ad_fingerprints');
+	const sampleRows = env.DB.query('SELECT sample_text, source FROM ad_sample_embeddings');
+	const autoFp = fpRows.filter((r) => r.source === 'auto');
+	const autoSamples = sampleRows.filter((r) => r.source === 'auto');
+
+	// 前置：本次确实是【资料卡】定罪的。不成立的话下面两条断言就是空转。
+	assert('23.1 前置：资料卡私有群链接已自动学入 bio 指纹',
+		autoFp.some((r) => r.type === 'bio' && String(r.value).includes('t.me/+UiEnLbXCD0JhMWRl')),
+		JSON.stringify(autoFp));
+
+	// ★ 核心断言 1：正文没参与定罪 → 正文一个字都不许进指纹库
+	assert('★ 23.1 正文未参与定罪 → 正文不得学成指纹（旧实现在此学出 keyword「月圆人团圆…」）',
+		!fpRows.some((r) => GREETING_RE.test(String(r.value))),
+		JSON.stringify(autoFp));
+	// ★ 核心断言 2：正文没参与定罪 → 正文一个字都不许进 AI 样本库（事故的直接弹药）
+	assert('★ 23.1 正文未参与定罪 → 正文不得进 AI 语义样本库（事故的直接弹药）',
+		!sampleRows.some((r) => GREETING_RE.test(String(r.sample_text))),
+		JSON.stringify(autoSamples));
+	// 反向保险：收窄不等于「什么都不学」。资料卡该学还得学，否则真广告的批量识别就废了。
+	assert('23.1 收窄后仍然学到东西（bio 指纹 + AI 样本，不是一刀切停学）',
+		autoFp.length > 0 && autoSamples.length > 0,
+		JSON.stringify({ autoFp, autoSamples }));
+
+	// ★ 机制断言：同一份 payload，收窄前会抽出祝福语候选，收窄后一条都抽不出来。
+	// 这条不依赖处置链，直接把「按定罪字段收窄」这个改动本身钉死 ——
+	// 将来谁把 scopeAdLearningPayload 从学习链路上摘掉，这里立刻红。
+	const fullPayload = { name: '肆哥', username: 'kuss888', bio: SPAM_BIO, text: GREETING };
+	const fullCands = W.extractAdFingerprintCandidates(fullPayload, new Set());
+	assert('★ 23.1 机制：完整 payload 确实能抽出祝福语指纹候选（证明旧实现会把它学进去）',
+		fullCands.some((c) => GREETING_RE.test(String(c.value))), JSON.stringify(fullCands));
+	const scoped = W.scopeAdLearningPayload(fullPayload, new Set(['name', 'bio']));
+	const scopedCands = W.extractAdFingerprintCandidates(scoped, new Set());
+	assert('★ 23.1 机制：按定罪字段收窄后，祝福语候选一条都不剩',
+		!scopedCands.some((c) => GREETING_RE.test(String(c.value))), JSON.stringify(scopedCands));
+	assert('★ 23.1 机制：收窄后 AI 样本取材也不含祝福语',
+		!GREETING_RE.test(W.buildAdSampleText(scoped)), W.buildAdSampleText(scoped));
+	// domains 是从 name + bio + text 抽出来的，必须跟着字段一起重算 ——
+	// 否则「资料卡定罪」仍会把正文里的域名带进 domain 指纹（权重 1，单条即定罪）。
+	const scopedDomains = W.scopeAdLearningPayload(
+		{ name: '', username: '', bio: '正常简介', text: '看这个 evil-shop.top' }, new Set(['bio']));
+	assert('★ 23.1 机制：收窄后域名按字段重算（正文域名不得混进 domain 指纹）',
+		scopedDomains.domains.length === 0 && scopedDomains.text === '',
+		JSON.stringify(scopedDomains));
+
+	// ===== 23.2 第二个发同一句祝福的正常人不得被处置 =====
+	resetCalls();
+	setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: '桃气', username: 'taoqipro', bio: '' } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	await sendUpdate({ message: msgIn(G2, '第二治理群', { id: 64002, first_name: '桃气', username: 'taoqipro' }, GREETING) }, env);
+	assert('★ 23.2 同一句祝福的第二个正常人不被禁言', mutedChats().length === 0, JSON.stringify(mutedChats()));
+	assert('★ 23.2 同一句祝福的第二个正常人不被封禁', bannedChats().length === 0, JSON.stringify(bannedChats()));
+	assert('★ 23.2 同一句祝福的第二个正常人不产生主人判定通知（事故时这里会刷屏）',
+		!ownerText().includes('广告号自动'), ownerText().slice(0, 400));
+	assert('23.2 未落观察快照',
+		env.DB.query("SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE user_id = '64002'")[0].c === 0,
+		JSON.stringify(env.DB.query('SELECT user_id, score FROM ad_pending_snapshots')));
+
+	W.invalidateAdProfileCache();
+}
+
+section('[24] 引用关联频道内容不得定罪（quoted 通道只认本人写的字）');
+{
+	// 【主人反馈 2026-09-25】群友回复本群关联频道的帖子，被 quoted 通道判成广告号禁言。
+	// 关联频道的帖子会自动转发进讨论组，群友在下面回复时 Telegram 把频道原文放进
+	// external_reply（origin.type='channel'）或 reply_to_message（is_automatic_forward=true）；
+	// getAdQuotedText 一视同仁地把它当「他引用的广告」收下，
+	// 于是「本人正文近乎为空 + 引用体像广告」两个门槛同时成立 —— 可那些字是频道的。
+	const G1 = '-1001111111111';
+	const G2 = '-1002222222222';
+	const LINKED_CH = '-1001234567890';	// 本群自己的关联频道
+	const EXTERNAL_CH = '-1009999999';	// 别人家的频道（线上实例 bxbd 那类）
+	const makeMultiEnv = (extra = {}) => makeEnv({ GROUP_ID: `${G1},${G2}`, ...extra });
+	const msgIn = (chatId, chatTitle, from, text, extra = {}) => ({
+		message_id: 900 + Math.floor(Math.random() * 1000),
+		date: Math.floor(Date.now() / 1000),
+		text,
+		chat: { id: Number(chatId), type: 'supergroup', title: chatTitle },
+		from: { is_bot: false, ...from },
+		...extra
+	});
+	const mutedChats = () => calls.filter((c) => c.method === 'restrictChatMember').map((c) => String(c.body?.chat_id));
+	const bannedChats = () => calls.filter((c) => c.method === 'banChatMember').map((c) => String(c.body?.chat_id));
+	const ownerText = () => calls
+		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(OWNER_ID))
+		.map((c) => String(c.body?.text || '')).join('\n');
+	// getChat 同时服务两种用途，必须分开返回：
+	//   · 查群 → 要 linked_chat_id（判定「本群关联频道是谁」）
+	//   · 查用户 → 要 first_name / bio
+	// 混在一起会让「本群关联频道是谁」永远拿到用户的资料，豁免逻辑就静默失效了。
+	const cleanApi = () => setApi({
+		getChat: (body) => {
+			const id = String(body?.chat_id ?? '');
+			if (id === G1 || id === G2) {
+				return { ok: true, result: { id: Number(id), type: 'supergroup', title: '治理群', linked_chat_id: Number(LINKED_CH) } };
+			}
+			return { ok: true, result: { id: body?.chat_id, first_name: '群友', bio: '' } };
+		},
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	const snapshotCount = (env, uid) => env.DB.query(
+		`SELECT COUNT(*) AS c FROM ad_pending_snapshots WHERE user_id = '${uid}'`)[0].c;
+	const quotedMsg = (chatId, from, text, replyExtra) => msgIn(chatId, '治理群', from, text, replyExtra);
+
+	// 缓存是模块级的，跨用例存活 —— 每个用例前清一次，避免互相污染。
+	W.invalidateAdLinkedChannelCache();
+
+	// 引用体本身是标准的「招揽 ∧ 行业」广告（实测 quoted 通道 guilty、正文 6 分），
+	// 本人正文只有一个「谢谢」—— 这正是 quoted 通道要抓的规避形态。
+	// 拿它当对照组，才能证明豁免的是「本群关联频道」而不是「把整个通道关掉」。
+	const AD_QUOTED = '高价收购USDT 支持各种支付方式 加微详聊';
+
+	// ===== 24.1 单元：频道来源判定 =====
+	assert('24.1 关联频道自动转发帖被回复 → 认定频道来源',
+		W.isChannelOriginQuote({ reply_to_message: { is_automatic_forward: true, sender_chat: { id: -1001 }, text: AD_QUOTED } }) === true);
+	assert('24.1 external_reply 的 origin 是频道 → 认定频道来源',
+		W.isChannelOriginQuote({ external_reply: { origin: { type: 'channel', chat: { id: -1001 } }, text: AD_QUOTED } }) === true);
+	assert('24.1 普通群友的消息被回复 → 不算频道来源',
+		W.isChannelOriginQuote({ reply_to_message: { text: AD_QUOTED } }) === false);
+	assert('★ 24.1 手动转发进来的频道帖【不算】频道来源（「转发自己的广告 + 回一个字母」必须继续被抓）',
+		W.isChannelOriginQuote({ reply_to_message: { forward_origin: { type: 'channel', chat: { id: -1001 } }, text: AD_QUOTED } }) === false);
+	// 自动转发帖是「本群关联频道是谁」的一手信号：见到就记，之后不用再问 getChat。
+	W.invalidateAdLinkedChannelCache();
+	W.rememberGroupLinkedChannel(G1, LINKED_CH);
+	assert('24.1 自动转发帖记下的关联频道可直接解析出来',
+		(await W.resolveGroupLinkedChannelId(G1)) === LINKED_CH, String(await W.resolveGroupLinkedChannelId(G1)));
+	W.invalidateAdLinkedChannelCache();
+
+	// ===== 24.2 关联频道自动转发帖被回复 → 不处置 =====
+	const envCh = makeMultiEnv();
+	await W.ensureD1Table(envCh);
+	resetCalls();
+	cleanApi();
+	await sendUpdate({
+		message: quotedMsg(G1, { id: 65001, first_name: '群友' }, '谢谢', {
+			reply_to_message: {
+				message_id: 501,
+				date: Math.floor(Date.now() / 1000),
+				is_automatic_forward: true,
+				sender_chat: { id: Number(LINKED_CH), type: 'channel', title: '关联频道' },
+				text: AD_QUOTED
+			}
+		})
+	}, envCh);
+	assert('★ 24.2 回复关联频道帖不被禁言', mutedChats().length === 0, JSON.stringify(mutedChats()));
+	assert('★ 24.2 回复关联频道帖不被封禁', bannedChats().length === 0, JSON.stringify(bannedChats()));
+	assert('★ 24.2 回复关联频道帖不产生判定通知', !ownerText().includes('广告号'), ownerText().slice(0, 400));
+	assert('24.2 回复关联频道帖不落观察快照', snapshotCount(envCh, '65001') === 0,
+		JSON.stringify(envCh.DB.query('SELECT seq, user_id FROM ad_pending_snapshots')));
+
+	// ===== 24.3 external_reply 形态（回复关联频道帖的另一种载荷）→ 同样不处置 =====
+	W.invalidateAdLinkedChannelCache();
+	resetCalls();
+	cleanApi();
+	await sendUpdate({
+		message: quotedMsg(G1, { id: 65002, first_name: '群友' }, '好的', {
+			external_reply: {
+				origin: { type: 'channel', chat: { id: Number(LINKED_CH), type: 'channel', title: '关联频道' }, message_id: 502, date: Math.floor(Date.now() / 1000) },
+				text: AD_QUOTED
+			}
+		})
+	}, envCh);
+	assert('★ 24.3 external_reply 形态回复关联频道帖也不被禁言', mutedChats().length === 0, JSON.stringify(mutedChats()));
+	assert('★ 24.3 external_reply 形态回复关联频道帖不产生判定通知', !ownerText().includes('广告号'), ownerText().slice(0, 400));
+
+	// ===== 24.4 对照组：引用【普通群友】的同一段广告 → 照旧定罪 =====
+	// 没有这条断言，24.2 / 24.3 用「把 quoted 通道整个删掉」也能通过。
+	W.invalidateAdLinkedChannelCache();
+	resetCalls();
+	cleanApi();
+	await sendUpdate({
+		message: quotedMsg(G2, { id: 65003, first_name: '群友' }, '谢谢', {
+			reply_to_message: {
+				message_id: 503,
+				date: Math.floor(Date.now() / 1000),
+				from: { id: 65999, is_bot: false, first_name: '广告号' },
+				text: AD_QUOTED
+			}
+		})
+	}, envCh);
+	assert('★ 24.4 对照组：引用普通群友的广告仍然定罪（豁免只针对本群关联频道）',
+		mutedChats().includes(G2) || bannedChats().includes(G2), JSON.stringify({ muted: mutedChats(), banned: bannedChats() }));
+	assert('24.4 对照组：产生判定通知', ownerText().includes('广告号'), ownerText().slice(0, 400));
+
+	// ===== 24.5 关键回归：引用【外部频道】的广告帖 → 照旧定罪 =====
+	// 这条才是 quoted 通道存在的理由：2026-09-08 线上漏放 50+ 个号的真实形态就是
+	// 「正文一个字母 c + 引用外部频道 bxbd 的广告」。如果豁免只看「来源是不是频道」，
+	// 这里就会重新漏放 —— 那是把整条通道关掉，不是修 bug。
+	W.invalidateAdLinkedChannelCache();
+	resetCalls();
+	cleanApi();
+	await sendUpdate({
+		message: quotedMsg(G2, { id: 65005, first_name: 'Maybell Tillman' }, 'c', {
+			external_reply: {
+				origin: { type: 'channel', chat: { id: Number(EXTERNAL_CH), type: 'channel', title: 'bxbd', username: 'bxbdzxc' }, message_id: 12, date: Math.floor(Date.now() / 1000) },
+				chat: { id: Number(EXTERNAL_CH), type: 'channel', title: 'bxbd', username: 'bxbdzxc' },
+				text: AD_QUOTED
+			}
+		})
+	}, envCh);
+	assert('★ 24.5 引用【外部频道】广告帖仍然定罪（bxbd 形态，绝不能豁免）',
+		mutedChats().includes(G2) || bannedChats().includes(G2), JSON.stringify({ muted: mutedChats(), banned: bannedChats() }));
+	assert('24.5 外部频道形态产生判定通知', ownerText().includes('广告号'), ownerText().slice(0, 400));
+
+	W.invalidateAdLinkedChannelCache();
+	W.invalidateAdProfileCache();
+}
+
+section('[25] 正文进 AI 样本库的多因素门槛（≥2 因素才入库，单因素挂候选等主人确认）');
+{
+	// 【主人口径 2026-09-25】「正文可以进样本库，但是得通过多因素核查，
+	// 如 AI 判定 + 主人判定才可进样本库」。
+	// 本节把三种组合逐条钉死：单因素挂候选、主人确认后入库、两自动因素齐备直接入库。
+	const G1 = '-1001111111111';
+	const makeMultiEnv = (extra = {}) => makeEnv({ GROUP_ID: G1, ...extra });
+	const msgIn = (chatId, chatTitle, from, text, extra = {}) => ({
+		message_id: 950 + Math.floor(Math.random() * 1000),
+		date: Math.floor(Date.now() / 1000),
+		text,
+		chat: { id: Number(chatId), type: 'supergroup', title: chatTitle },
+		from: { is_bot: false, ...from },
+		...extra
+	});
+	const ownerText = () => calls
+		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(OWNER_ID))
+		.map((c) => String(c.body?.text || '')).join('\n');
+	const cleanApi = () => setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: '普通用户', bio: '' } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	const samplesLike = (env, needle) => env.DB.query('SELECT sample_text, source FROM ad_sample_embeddings')
+		.filter((r) => String(r.sample_text).includes(needle));
+	const snapshotOf = (env, uid) => env.DB.query(
+		`SELECT seq, snapshot FROM ad_pending_snapshots WHERE user_id = '${uid}'`)[0] || null;
+	const candidateOf = (row) => {
+		try { return JSON.parse(String(row?.snapshot || '{}')).sampleCandidate || null; } catch { return null; }
+	};
+
+	// 正文实测 8 分（交易动词 ∧ 业务词 +6，非白名单引流链接 +2）—— 单凭正文即可定罪。
+	const BODY = '长期收购网赚账号 高价回收 加微信详聊 https://evil-shop.top 电报@boss';
+	const BODY_MARK = '长期收购网赚账号';
+	const ENFORCE_PREFIX = src.match(/const AD_ENFORCE_BUTTON_PREFIX = '([^']+)'/)?.[1] || '';
+	assert('25 前置：解析到判定通知按钮前缀', ENFORCE_PREFIX.length > 0, ENFORCE_PREFIX);
+	const cbUpdate = (data) => ({
+		callback_query: {
+			id: 'cb-' + Math.floor(Math.random() * 1e9),
+			from: { id: OWNER_ID, is_bot: false, first_name: 'Owner' },
+			chat_instance: '1',
+			data,
+			message: {
+				message_id: 4242,
+				date: Math.floor(Date.now() / 1000),
+				chat: { id: OWNER_ID, type: 'private', first_name: 'Owner' },
+				text: '判定通知'
+			}
+		}
+	});
+
+	// ===== 25.1 单因素（只有正文自身判据，AI 不命中）→ 正文不入库，改挂候选 =====
+	// 用【不绑 AI】的 env：F2 必然为假，只剩 F1，正是「单因素」形态。
+	const envCand = makeMultiEnv();
+	await W.ensureD1Table(envCand);
+	resetCalls();
+	cleanApi();
+	await sendUpdate({ message: msgIn(G1, '治理群', { id: 66001, first_name: '普通用户' }, BODY) }, envCand);
+	assert('★ 25.1 只命中一个因素：正文不进 AI 样本库',
+		samplesLike(envCand, BODY_MARK).length === 0, JSON.stringify(samplesLike(envCand, BODY_MARK)));
+	const candRow = snapshotOf(envCand, '66001');
+	const cand = candidateOf(candRow);
+	assert('★ 25.1 单因素正文挂成候选样本（写进快照，随判定一起复核）', Boolean(cand?.text), JSON.stringify(cand));
+	assert('25.1 候选记下命中的是哪个因素（正文自身判据 true / AI false）',
+		cand?.bodyEvidence === true && cand?.ai === false, JSON.stringify(cand));
+	assert('★ 25.1 主人通知写明候选样本', ownerText().includes('正文候选样本'), ownerText().slice(0, 1200));
+	assert('★ 25.1 主人通知的「判定正确」口径改为「点按钮确认才入库」',
+		ownerText().includes('点下方「🚫 全群封禁」确认'), ownerText().slice(0, 1200));
+	// 主人完全可能走 /pending 复核而不是翻通知，那张列表上也得标出来。
+	resetCalls();
+	await sendUpdate({ message: privateMessage(OWNER_ID, '/pending') }, envCand);
+	const pendingText = ownerText();
+	assert('★ 25.1 /pending 列表同样标出候选样本',
+		pendingText.includes('正文候选样本'), pendingText.slice(0, 900));
+
+	// ===== 25.2 主人点「全群封禁」→ 主人判定补上第二个因素 → 候选提升入库 =====
+	resetCalls();
+	await sendUpdate(cbUpdate(ENFORCE_PREFIX + 'B:66001:' + candRow.seq), envCand);
+	const promoted = samplesLike(envCand, BODY_MARK);
+	assert('★ 25.2 主人确认后候选正文入库（source = auto-confirmed）',
+		promoted.length === 1 && promoted[0].source === 'auto-confirmed', JSON.stringify(promoted));
+	assert('25.2 回执写明候选正文已学入', ownerText().includes('候选正文已学入'), ownerText().slice(0, 800));
+
+	// ===== 25.3 主人点「误判放行」→ 候选随快照作废，绝不入库 =====
+	const envDrop = makeMultiEnv();
+	await W.ensureD1Table(envDrop);
+	resetCalls();
+	cleanApi();
+	await sendUpdate({ message: msgIn(G1, '治理群', { id: 66003, first_name: '普通用户' }, BODY) }, envDrop);
+	const dropRow = snapshotOf(envDrop, '66003');
+	assert('25.3 前置：单因素正文同样挂上候选', Boolean(candidateOf(dropRow)?.text), JSON.stringify(candidateOf(dropRow)));
+	resetCalls();
+	await sendUpdate(cbUpdate(ENFORCE_PREFIX + 'A:66003:' + dropRow.seq), envDrop);
+	assert('★ 25.3 主人判为误判后候选作废，绝不入库',
+		samplesLike(envDrop, BODY_MARK).length === 0, JSON.stringify(samplesLike(envDrop, BODY_MARK)));
+
+	// ===== 25.4 两个自动因素齐备（正文自身判据 + AI 语义）→ 正文直接入库，不打扰主人 =====
+	const envAuto = makeMultiEnv({ AI: makeFakeAI(adVector) });
+	await W.ensureD1Table(envAuto);
+	resetCalls();
+	cleanApi();
+	await sendUpdate({ message: msgIn(G1, '治理群', { id: 66005, first_name: '普通用户' }, BODY) }, envAuto);
+	const autoRows = samplesLike(envAuto, BODY_MARK);
+	assert('★ 25.4 正文自身判据 + AI 语义都命中 → 正文直接入库（source = auto）',
+		autoRows.length === 1 && autoRows[0].source === 'auto', JSON.stringify(autoRows));
+	const autoSnap = snapshotOf(envAuto, '66005');
+	assert('25.4 两因素齐备时不挂候选（正文已经入库，没有第二重后果要主人确认）',
+		candidateOf(autoSnap) === null, JSON.stringify(candidateOf(autoSnap)));
+
+	// ===== 25.5 资料卡定罪 + 正文无任何信号 → 既不进库也不挂候选 =====
+	// 2026-09-24 事故原样：那些祝福语连候选都不该出现，否则主人一次误点就把它请进库。
+	const envProf = makeMultiEnv();
+	await W.ensureD1Table(envProf);
+	resetCalls();
+	setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: '肆哥', bio: '有事请联系频道：https://t.me/+UiEnLbXCD0JhMWRl' } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	await sendUpdate({ message: msgIn(G1, '治理群', { id: 66007, first_name: '肆哥' }, '月圆人团圆，好礼一起抽！🎁') }, envProf);
+	assert('★ 25.5 资料卡定罪 + 正文零信号：祝福语连候选都不挂',
+		candidateOf(snapshotOf(envProf, '66007')) === null, JSON.stringify(candidateOf(snapshotOf(envProf, '66007'))));
+	assert('★ 25.5 资料卡定罪 + 正文零信号：正文不进样本库',
+		samplesLike(envProf, '月圆').length === 0, JSON.stringify(samplesLike(envProf, '月圆')));
+
+	W.invalidateAdProfileCache();
+}
+
 console.log('');
 console.log('='.repeat(60));
 console.log(`广告检测测试汇总：通过 ${pass} 条，失败 ${fail} 条`);
