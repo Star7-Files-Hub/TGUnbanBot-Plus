@@ -3694,7 +3694,18 @@ section('[20] 渐进式处置（AD_BAN_SCOPE_MODE：首次只禁言当前群 →
 	// detectAdOnMessage → decideAdBanScope 读到台账 single → reason='escalated' → 全群封禁。
 	// 这比原先「一冒头就升级」更精确：只有真的再发广告才升级。
 	resetCalls();
-	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: AD_ID, first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊') }, envA);
+	const escalateTriggerMid = 987654;
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: AD_ID, first_name: AD_NAME }, '招代理日结佣金 无需经验 加微聊', { message_id: escalateTriggerMid }) }, envA);
+
+	// ★ 顺序断言（用户指定的处置顺序）：先删当前触发群的广告消息，再执行全群封禁/预封。
+	// 用固定 message_id 精确定位那条触发消息，避免被别的 deleteMessage 蒙混过关。
+	{
+		const deleteIdx = calls.findIndex((c) => c.method === 'deleteMessage' && Number(c.body?.message_id) === escalateTriggerMid);
+		const banIdx = calls.findIndex((c) => c.method === 'banChatMember');
+		assert('★ 顺序：先删当前触发群的触发消息，再执行全群封禁/预封',
+			deleteIdx !== -1 && banIdx !== -1 && deleteIdx < banIdx,
+			JSON.stringify({ deleteIdx, banIdx, methods: calls.map((c) => c.method).slice(0, 12) }));
+	}
 
 	const escalateBans = bannedChats();
 	assert('★ 升级：三个群全部封禁',

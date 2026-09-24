@@ -6586,14 +6586,16 @@ async function enforceApprovedAdVote(env, state) {
 		by: state.creatorUserId,
 		note: ('群内 /ad 举报投票通过' + (state.reason ? '：' + state.reason : '')).slice(0, 500),
 	});
-	const banResults = await banUserFromAllGroups(state.targetUserId, { probeMembership: true, revokeMessages: true });
+	// 先删当前触发群的被举报广告消息，再执行全群封禁/预封（用户指定的顺序）。
+	// deleteMessage 失败只返回 {ok:false} 不抛异常，因此放在封禁之前不会中断处置。
+	const deleteResult = state.reportedMessageId
+		? await deleteMessage(state.chatId, state.reportedMessageId)
+		: null;
 	const historyFallback = state.reportedMessageId
 		? null
 		: await cleanupAdVoteSourceChatMessages(env, state.chatId, state.targetUserId);
 	if (historyFallback) state.historyFallback = historyFallback;
-	const deleteResult = state.reportedMessageId
-		? await deleteMessage(state.chatId, state.reportedMessageId)
-		: null;
+	const banResults = await banUserFromAllGroups(state.targetUserId, { probeMembership: true, revokeMessages: true });
 	state.enforcementComplete = true;
 	state.enforcedAt = new Date().toISOString();
 	state.deleteStatus = state.reportedMessageId ? classifyAdDeleteOutcome(deleteResult).status : 'no_message';
@@ -7357,6 +7359,12 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				const lines = [`🎬 操作:举报加黑(/spam)`];
 				let flashText;
 				if (result.success || alreadyExists) {
+					// 先删当前触发群的广告消息，再执行全群封禁/预封（用户指定的顺序）。
+					// 仅群内执行时做 —— 私聊没有"当前群"的概念；批量路径也不做
+					// （N 个目标 × 最多 200 条会直接撞 Cloudflare 子请求上限）。
+					const cleanupResult = isInGroup
+						? await cleanupCurrentChatUserMessages(env, chatId, valid[0])
+						: null;
 					const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
 					targetMention = formatTargetFromBanResults(valid[0], banResults);
 					lines.push(`🎯 目标用户:${targetMention}`);
@@ -7365,6 +7373,16 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 						lines.push('⚠️ <b>该用户已在黑名单中,本次已继续执行 Telegram 群封禁/预封</b>');
 					}
 					lines.push(await renderBanResultsDetail(banResults, null, { userId: valid[0], retryCommand: '/spam' }));
+					if (cleanupResult) {
+						lines.push(renderCurrentChatCleanupResult(cleanupResult));
+						if (cleanupResult.failed > 0 && cleanupResult.errors.length > 0) {
+							const previews = cleanupResult.errors.slice(0, 3).map((item) => {
+								const { 中文, 建议 } = translateTelegramError(item.error);
+								return `<code>${escapeHtml(String(item.messageId))}</code>:${escapeHtml(中文)}；建议:${escapeHtml(建议)}`;
+							});
+							lines.push(`⚠️ 清扫失败明细:${previews.join('；')}`);
+						}
+					}
 					flashText = `${result.success ? '✅ 已加黑' : '⚠️ 已存在并清扫'} <code>${valid[0]}</code>\n` + renderBanResults(banResults);
 				} else {
 					lines.push(`🎯 目标用户:${targetMention}`);
@@ -7440,10 +7458,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const linkedUserId = `<a href="tg://user?id=${repliedUserId}">${repliedUserId}</a>`;
 
 		if (result.success || alreadyExists) {
-			// 加黑成功或已存在 → Telegram 群封禁/预封(revoke_messages 默认 true:封禁同时删该用户在各群全部消息)
-			//   + 缓存清扫兜底(补删 revoke 偶尔漏的、当前群近期消息)
-			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true });
+			// 先删当前触发群的广告消息（被回复的消息 + 缓存的近期消息），再执行全群封禁/预封。
+			// Telegram 的 revoke_messages 只对【仍在群里】的成员生效，
+			// 目标若已退群/已被别人踢过就变成预封，历史发言一条都撤不掉。
+			// 这里补一层兜底：从 moderation_messages 捞出该 TGID 在【当前群】缓存的消息 ID
+			// 逐条 deleteMessage，并把被回复的广告消息 ID 一并传入优先删除。
 			const cleanupResult = await cleanupCurrentChatUserMessages(env, chatId, repliedUserId, [repliedMsg.message_id]);
+			const banResults = await banUserFromAllGroups(repliedUserId, { probeMembership: true });
 
 			const lines = [
 				`🎬 操作:举报加黑(/spam)`,
@@ -8268,8 +8289,8 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			const lines = [`🎬 操作:加入黑名单`];
 			let flashText;
 			if (result.success || alreadyExists) {
-				const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
-				// 与 /spam 对齐：Telegram 的 revoke_messages 只对【仍在群里】的成员生效，
+				// 先删当前触发群的广告消息，再执行全群封禁/预封（用户指定的顺序）。
+				// Telegram 的 revoke_messages 只对【仍在群里】的成员生效，
 				// 目标若已退群/已被别人踢过就变成预封，历史发言一条都撤不掉。
 				// 这里补一层兜底：从 moderation_messages 捞出该 TGID 在【当前群】缓存的消息 ID
 				// 逐条 deleteMessage。仅群内执行时做 —— 私聊没有"当前群"的概念；
@@ -8277,6 +8298,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 				const cleanupResult = isInGroup
 					? await cleanupCurrentChatUserMessages(env, chatId, valid[0])
 					: null;
+				const banResults = await banUserFromAllGroups(valid[0], { probeMembership: true });
 				targetMention = formatTargetFromBanResults(valid[0], banResults);
 				lines.push(`🎯 目标用户:${targetMention}`);
 				lines.push('');
@@ -14294,6 +14316,15 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		? 'contact_group_exempt'
 		: (singleScope ? 'mute_single' : (allMuteScope ? 'mute_all' : 'ban_global'));
 	let fallbackNote = '';
+	// 先删当前触发群的广告消息，再执行全群封禁/预封（用户指定的顺序）。
+	// revoke_messages 只对该群自己生效，服务消息也偶发残留，这里先单独删一次触发消息。
+	if (chatId && input?.messageId) {
+		try {
+			await deleteMessage(chatId, input.messageId);
+		} catch (error) {
+			console.error('[广告检测] 删除触发消息失败:', error);
+		}
+	}
 	let banResults = [];
 	let cleanupResult = null;
 	try {
@@ -14424,15 +14455,6 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 		console.error('[广告检测] 台账写入失败:', error);
 	}
 	banSummary += scopeNote;
-
-	// 触发消息再单独删一次：revoke_messages 只对该群自己生效，服务消息也偶发残留。
-	if (chatId && input?.messageId) {
-		try {
-			await deleteMessage(chatId, input.messageId);
-		} catch (error) {
-			console.error('[广告检测] 删除触发消息失败:', error);
-		}
-	}
 
 	let learned = 0;
 	try {
