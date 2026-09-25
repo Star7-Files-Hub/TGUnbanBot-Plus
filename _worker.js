@@ -1942,6 +1942,35 @@ function isBotOperator(user) {
 	return Boolean(user?.is_bot) && String(user?.id || '') !== ANON_ADMIN_BOT_ID;
 }
 
+// 判断一条消息是不是【本机器人自己】发的。
+//
+// 【2026-09-25 修】黑名单拦截与消息缓存原先都写的是 `!message.from.is_bot`，
+// 但两处注释的本意都只是「排除机器人自己」。守卫写宽之后，【所有】bot 都被挡在
+// 审核流水线之外：主人 /spam 一个广告 bot，黑名单记录写进去了、
+// banUserFromAllGroups 也确实调了，但之后它再发消息时没人删、没人踢 ——
+// 拦截层第一行就把它跳过了。线上实例：8937515732 / 8344759694 / 8882358801
+// 三个 bot 于 08:58 被 /spam，之后照发不误，主人报障「这三个 bot 一直杀不死」。
+// 它们在 ad_group_members / moderation_messages / ad_ban_scope 里全是空白记录，
+// 因为消息驱动的三条路径（拦截、缓存、广告检测）全部跳过 bot。
+//
+// 黑名单是主人的明确决定，必须对 bot 同样生效。这里只排除机器人自己：
+// 一旦它自己被误写进黑名单，它会开始删自己的消息并尝试封自己。
+// 匿名管理员 bot 不在此列 —— 它是主人侧的发言人、不是本机器人，且它有自己的
+// 豁免路径（isBotOperator / isPrivilegedManager），不该在这里被顺手放过。
+async function isSelfBotSender(from) {
+	if (!from || !from.is_bot) return false;
+	const fromId = String(from.id ?? '');
+	if (!fromId) return false;
+	try {
+		const selfId = await getBotId();
+		return Boolean(selfId) && String(selfId) === fromId;
+	} catch (error) {
+		// 取不到自身 ID 时【不排除】：宁可多查一次黑名单，也不能再出现「跳过 bot」的漏洞。
+		console.error('[审核流水线] 取自身 bot id 失败:', error);
+		return false;
+	}
+}
+
 function isAnonymousAdminMessage(message) {
 	const sentAsCurrentGroup = message?.chat?.type !== 'private'
 		&& isConfiguredGroup(message?.chat?.id)
@@ -4787,6 +4816,9 @@ const BOT_MODERATION_LOG_LABELS = {
 	'new-member-admin-status': '已查询新入群机器人在群里的身份',
 	'skip:new-member-admin-status-check-failed': '跳过：无法确认新入群机器人是否为管理员，为避免误伤不处理',
 	'skip:new-member-admin-bot': '跳过：新入群机器人是群管理员',
+	'action:ban-blacklisted-new-bot:start': '开始处理：新入群机器人已在黑名单，踢出',
+	'action:ban-blacklisted-new-bot:result': '处理结果：踢出已拉黑的新入群机器人',
+	'action:ban-blacklisted-new-bot:failed': '处理失败：踢出已拉黑的新入群机器人时异常',
 	'action:mute-new-bot:start': '开始处理：禁言新入群的非管理员机器人',
 	'action:mute-new-bot:success': '处理成功：已禁言新入群的非管理员机器人',
 	'action:mute-new-bot:failed': '处理失败：禁言新入群机器人失败',
@@ -4832,7 +4864,7 @@ function getNewMemberLogInfo(message, member) {
 	};
 }
 
-async function handleNewChatMemberBots(message) {
+async function handleNewChatMemberBots(message, env) {
 	const chat = message.chat;
 	const newMembers = message.new_chat_members;
 
@@ -4869,6 +4901,35 @@ async function handleNewChatMemberBots(message) {
 				...logInfo,
 				当前机器人ID: currentBotId
 			});
+			continue;
+		}
+
+		// 【2026-09-25 修】已拉黑的广告 bot 被加回群时，直接踢出去，而不是只禁言。
+		// 主人的要求原话：「已经加黑的 bot 进群直接踢出」。
+		//
+		// 只禁言的问题：它人还留在群里 —— 禁言一旦被撤销（管理员手滑、或别的机器人
+		// 反过来把它解禁），它立刻又能刷广告；而且主人看到的是「这号还在群里」，
+		// 分不清它到底有没有被处理掉。踢出去才是「处理完了」。
+		//
+		// 放在管理员判定【之前】：黑名单是主人的明确决定，不该因为对方恰好有管理权限
+		// 就悄悄降级成禁言。真踢不动时 Telegram 会拒绝，下面的日志会记下失败原因，
+		// 主人能看到，而不是被无声吞掉。
+		const newBotBlacklist = await checkBlacklist(member.id, env);
+		if (newBotBlacklist.isBlacklisted) {
+			try {
+				logBotModeration('action:ban-blacklisted-new-bot:start', logInfo);
+				const banResult = await banUserFromGroup(chat.id, member.id);
+				logBotModeration('action:ban-blacklisted-new-bot:result', {
+					...logInfo,
+					踢人结果: banResult.ok ? '成功' : `失败:${banResult.error}`
+				});
+				await notifyOwnerBlacklistIntercept(member, chat, '新机器人入群拦截', newBotBlacklist, banResult);
+			} catch (error) {
+				logBotModeration('action:ban-blacklisted-new-bot:failed', {
+					...logInfo,
+					错误: error.message
+				});
+			}
 			continue;
 		}
 
@@ -4953,7 +5014,21 @@ async function handleChatMemberUpdate(chatMember, env) {
 	const fromIdStr = String(fromUser.id);
 
 	// 跳过：被操作用户是机器人（不要把别的机器人加入黑名单 / 误踢）
-	if (targetUser.is_bot) return;
+	//
+	// 【2026-09-25 修】原为一句 `if (targetUser.is_bot) return;`，把【所有】bot 都放过了，
+	// 包括已经被 /spam 拉黑的广告 bot。后果正是主人报障的「这三个 bot 一直杀不死」：
+	// /spam 确实把它们踢出了全部群（那条路径上没有 bot 守卫），但只要有人把它们
+	// 重新拉回群，复入群拦截在这里第一行就 return —— 不会重新踢，于是它们一直回来。
+	// 这比「发言不删」更致命：发言拦截只在它开口时生效，复入群拦截才是把它挡在门外的那个。
+	//
+	// 收窄成：只放过【不在黑名单里】的机器人。原注释的本意就是「别把正常机器人
+	// 误当广告号」，那个意图由「不在黑名单」精确表达；已黑的 bot 走下面复入群拦截，
+	// 照踢。代价是已黑 bot 复入群时多查一次 D1（下面 enteredGroup 分支还会再查一次），
+	// 但这条路径只在 bot 入群时触发，频率可以忽略。
+	if (targetUser.is_bot) {
+		const botBlacklistCheck = await checkBlacklist(targetIdStr, env);
+		if (!botBlacklistCheck.isBlacklisted) return;
+	}
 
 	// 复入群拦截：用户从非成员状态变为 member/restricted（被拉进群、点链接加群、unban 后自加回）
 	// 先于"操作人 === 用户本人"检查，因为自加群时 from === target，会被后面跳过逻辑拦掉
@@ -7273,7 +7348,7 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 只做「拉资料 → 评分 → 封禁或写观察窗口」，绝不短路既有的 bot 静音与进群消息清理逻辑。
 	await detectAdOnJoin(message, env, ctx);
 
-	if (await handleNewChatMemberBots(message)) {
+	if (await handleNewChatMemberBots(message, env)) {
 		return;
 	}
 
@@ -7322,10 +7397,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 而它会 return，根本到不了下面的 detectAdOnMessage —— 所以「该号在其他群再次露头」
 	// 这个信号只能在这里捕获。这比等它再发一条够阈值的广告更早、更可靠：
 	// 黑名单用户【只要开口】就说明它在别的群仍然活跃，这本身就是升级凭据。
+	// 【2026-09-25 修】第三个条件原为 `!message.from.is_bot`，把【所有】bot 都排除了，
+	// 但本行注释的本意只是「排除 bot 自身」。后果见 isSelfBotSender 的说明：
+	// 已黑 bot 在群里刷广告时，这里第一行就跳过，删消息 + 踢人一次都不会发生。
+	// 黑名单是主人的明确决定，必须对 bot 同样生效；只排除机器人自己。
 	if (
 		isConfiguredGroup(chatId) &&
 		message.from &&
-		!message.from.is_bot
+		!(await isSelfBotSender(message.from))
 	) {
 		const blacklistCheck = await checkBlacklist(userId, env);
 		if (blacklistCheck.isBlacklisted) {
@@ -7430,9 +7509,13 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 	// 缓存配置群普通用户消息 ID，供 /spam 引用回复后只清扫当前群、该用户的近期消息。
 	// 必须排除服务消息（置顶/入群/改群名等）：它们不是用户发言，被缓存后会在清扫时
 	// 连带删除 —— 删掉 pinned_message 服务消息在群里就表现为「取消置顶」。
+	// 【2026-09-25 修】同样把 `!message.from.is_bot` 收窄成「排除机器人自己」。
+	// 缓存的意义是让 /spam 能清扫目标在本群的近期发言；跳过 bot 就等于
+	// 「/spam 一个广告 bot，它之前刷的那一串一条都扫不掉」。只排除机器人自己：
+	// 它自己的消息永远不可能是 /spam 的目标，缓存它们纯属浪费。
 	if (
 		env.DB && isConfiguredGroup(chatId) &&
-		message.from && !message.from.is_bot &&
+		message.from && !(await isSelfBotSender(message.from)) &&
 		message.message_id &&
 		!isTelegramServiceMessage(message) &&
 		!(text && text.startsWith('/'))

@@ -4271,6 +4271,116 @@ section('[21] 主群豁免自动处置 + 判定通知按钮（解除禁言 / 全
 	assert('★ 复入群拦截（普通群）：自动加黑的号照旧踢回',
 		bannedChats().includes(G1), JSON.stringify(bannedChats()));
 
+	// ===== 21.8 bot 也在审核流水线里（2026-09-25 修）=====
+	// 主人报障「这三个 bot 一直杀不死」：08:58 连着 /spam 了 8937515732 / 8344759694 /
+	// 8882358801 三个广告 bot，黑名单记录写进去了、banUserFromAllGroups 也确实调了，
+	// 它们照发不误。根因是拦截层第一个条件写的是 `!message.from.is_bot` ——
+	// 那行注释的本意只是「排除机器人自己」，守卫写宽之后【所有】bot 都被挡在流水线外，
+	// 已黑 bot 发言没人删、没人踢，黑名单对它形同虚设。
+	// 三个 bot 在 ad_group_members / moderation_messages / ad_ban_scope 里全是空白记录，
+	// 正是「消息驱动的路径全部跳过 bot」的直接后果。
+	const SELF_BOT_ID = '777000'; // 与 mock 的 getMe 返回值一致
+	envBL.DB.prepare("INSERT INTO blacklist (id, reason, by_user, at, note) VALUES (?, 'ad_auto', 'system', '2026-09-25T00:00:00Z', '')").bind('70001').run();
+	envBL.DB.prepare("INSERT INTO blacklist (id, reason, by_user, at, note) VALUES (?, 'ad_auto', 'system', '2026-09-25T00:00:00Z', '')").bind(SELF_BOT_ID).run();
+	const adBot = { id: '70001', is_bot: true, first_name: '广告bot' };
+	const cleanBot = { id: '70002', is_bot: true, first_name: '正经bot' };
+
+	// ① 已黑 bot 在普通治理群发言 → 删消息 + 踢出。这就是主人要的那一步。
+	resetCalls();
+	await sendUpdate({ message: msgIn(G1, '第一治理群', adBot, '@qjaosbot @plzmobot @oksnzbot') }, envBL);
+	assert('★ 已黑 bot 发言：消息被删（修前一条都不删）',
+		countCalls('deleteMessage') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('★ 已黑 bot 发言：被踢出该群（修前完全不处理）',
+		bannedChats().includes(G1), JSON.stringify(bannedChats()));
+	assert('★ 已黑 bot 发言：主人收到拦截通知',
+		ownerText().includes('发言拦截'), ownerText().slice(0, 500));
+
+	// ② 主群豁免对 bot 同样适用：只删消息、不踢人 —— 豁免口径不能因为对方是 bot 就变。
+	resetCalls();
+	await sendUpdate({ message: msgIn(CONTACT_GROUP_ID, '联络主群', adBot, '广告') }, envBL);
+	assert('★ 已黑 bot 在主群：消息仍被删（主群不会被刷屏）',
+		countCalls('deleteMessage') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	assert('★ 已黑 bot 在主群：自动加黑照样豁免踢人（与真人同口径）',
+		!bannedChats().includes(CONTACT_GROUP_ID), JSON.stringify(bannedChats()));
+
+	// ③ 机器人自己必须排除：否则一旦它自己被误写进黑名单，
+	//    它会开始删自己的消息、并尝试把自己封掉，整个治理功能当场报废。
+	resetCalls();
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: SELF_BOT_ID, is_bot: true, first_name: 'AdGuardTestBot' }, '治理 bot 自己的消息') }, envBL);
+	assert('★ 机器人自己发言：不被踢（自封会毁掉整个治理功能）',
+		!bannedChats().includes(G1), JSON.stringify(bannedChats()));
+	assert('★ 机器人自己发言：消息不被删（否则它自己的回执会被自己吃掉）',
+		countCalls('deleteMessage') === 0, JSON.stringify(calls.map((c) => c.method)));
+
+	// ④ 没被拉黑的 bot 不受影响 —— 收窄守卫不等于「见 bot 就杀」。
+	resetCalls();
+	await sendUpdate({ message: msgIn(G1, '第一治理群', cleanBot, '大家早上好') }, envBL);
+	assert('★ 未拉黑的 bot：不被踢（收窄守卫不等于见 bot 就杀）',
+		!bannedChats().includes(G1), JSON.stringify(bannedChats()));
+	assert('★ 未拉黑的 bot：消息不被删',
+		countCalls('deleteMessage') === 0, JSON.stringify(calls.map((c) => c.method)));
+
+	// ⑤ 消息缓存也收窄了：普通 bot 的发言要进缓存，/spam 才扫得到它的历史发言。
+	//    （已黑 bot 走的是拦截分支，在那之前就 return 了，本来就不该缓存 —— 那条语义没变。）
+	await flushWaits();
+	const cachedBot = envBL.DB.query("SELECT COUNT(*) AS c FROM moderation_messages WHERE from_id = '70002'")[0].c;
+	assert('★ bot 消息进缓存（/spam 才扫得到 bot 的历史发言）', cachedBot >= 1, String(cachedBot));
+	resetWaits();
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: SELF_BOT_ID, is_bot: true, first_name: 'AdGuardTestBot' }, '治理 bot 自己的第二条') }, envBL);
+	await flushWaits();
+	const cachedSelf = envBL.DB.query("SELECT COUNT(*) AS c FROM moderation_messages WHERE from_id = '777000'")[0].c;
+	assert('★ 机器人自己的消息不进缓存（它永远不会是 /spam 的目标）', cachedSelf === 0, String(cachedSelf));
+
+	// ⑥ 复入群拦截 —— 这才是「一直杀不死」的主因。发言拦截只在 bot 开口时才生效，
+	//    而复入群拦截才是把它挡在门外的那个：/spam 确实把它踢了，但有人把它拉回来时，
+	//    修前这里 `if (targetUser.is_bot) return;` 直接放过，于是它一直回来。
+	const botMemberUpdate = (userId, firstName, chatId, { oldStatus = 'left', newStatus = 'member' } = {}) => ({
+		chat_member: {
+			chat: { id: Number(chatId), type: 'supergroup', title: '群' },
+			from: { id: 10001, is_bot: false, first_name: '拉人的人' },
+			date: Math.floor(Date.now() / 1000),
+			old_chat_member: { user: { id: Number(userId), is_bot: true, first_name: firstName }, status: oldStatus },
+			new_chat_member: { user: { id: Number(userId), is_bot: true, first_name: firstName }, status: newStatus }
+		}
+	});
+	resetCalls();
+	await sendUpdate(botMemberUpdate(70001, '广告bot', G1), envBL);
+	assert('★ 已黑 bot 复入群：被立刻踢回（修前直接放过 —— 「一直杀不死」的主因）',
+		bannedChats().includes(G1), JSON.stringify(bannedChats()));
+	assert('★ 已黑 bot 复入群：主人收到「复入群拦截」通知',
+		ownerText().includes('复入群拦截'), ownerText().slice(0, 500));
+
+	// ⑦ 未拉黑的 bot 复入群不受影响 —— 原注释的本意「别把正常机器人误当广告号」必须保住。
+	resetCalls();
+	await sendUpdate(botMemberUpdate(70002, '正经bot', G1), envBL);
+	assert('★ 未拉黑的 bot 复入群：不被踢（原意图保住了）',
+		!bannedChats().includes(G1), JSON.stringify(bannedChats()));
+
+	// ⑧ 主群豁免对 bot 同样成立：自动加黑的 bot 被拉回主群时不踢，通道口径与真人一致。
+	resetCalls();
+	await sendUpdate(botMemberUpdate(70001, '广告bot', CONTACT_GROUP_ID), envBL);
+	assert('★ 已黑 bot 复入主群：自动加黑照样豁免踢人（与真人同口径）',
+		!bannedChats().includes(CONTACT_GROUP_ID), JSON.stringify(bannedChats()));
+
+	// ⑨ 已拉黑的 bot 被加进群（走 new_chat_members 服务消息）→ 直接踢出，而不是只禁言。
+	//    主人的要求原话：「已经加黑的 bot 进群直接踢出」。
+	//    只禁言的问题：它人还留在群里，禁言一被撤销就又能刷；主人也看不出它有没有被处理掉。
+	resetCalls();
+	await sendUpdate({ message: joinMessage([{ id: 70001, first_name: '广告bot', is_bot: true, username: 'adbot' }]) }, envBL);
+	assert('★ 已黑 bot 入群：被直接踢出（不是只禁言）',
+		bannedChats().includes(G1), JSON.stringify(bannedChats()));
+	assert('★ 已黑 bot 入群：不再走禁言（踢出去才算处理完）',
+		mutedChats().length === 0, JSON.stringify(mutedChats()));
+	assert('★ 已黑 bot 入群：主人收到「新机器人入群拦截」通知',
+		ownerText().includes('新机器人入群拦截'), ownerText().slice(0, 600));
+
+	// ⑩ 未拉黑的 bot 入群照旧只禁言、不踢 —— 原行为不能被这次改动带偏。
+	resetCalls();
+	await sendUpdate({ message: joinMessage([{ id: 70002, first_name: '正经bot', is_bot: true, username: 'goodbot' }]) }, envBL);
+	assert('★ 未拉黑的 bot 入群：照旧只禁言、不踢（原行为保住了）',
+		mutedChats().length >= 1 && !bannedChats().includes(G1),
+		JSON.stringify({ muted: mutedChats(), banned: bannedChats() }));
+
 	resetCalls();
 	W.invalidateAdProfileCache();
 }
