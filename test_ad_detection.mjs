@@ -5134,6 +5134,433 @@ section('[27] 私有群邀请链接两档计分 · 真实资料卡回归表');
 		bodyPriv27.score + ' | ' + bodyPriv27.reasons.join(' / '));
 }
 
+// ===== [28] 用户白名单（高于黑名单）=====
+// 主人 2026-09-25 要求：「加一个高于黑名单的白名单，使用 /add_whitelist 添加」。
+// 语义（主人选定「完全豁免」）：名单里的用户在【所有】审核路径上都不被处置 ——
+// 不删消息、不踢、复入群不拦、入群不处置、广告检测不判。
+//
+// 本段的重心是【负控】：每条豁免断言都配一个「同条件下不在白名单的人照旧被处置」的对照。
+// 只验「白名单用户没被踢」是不够的 —— 如果整条链路因为别的原因压根没跑（消息没进治理
+// 流程、广告没判出来），断言照样会绿。有对照才能证明差异确实来自白名单。
+//
+// ⚠️ 本段必须留在文件最后：白名单是模块级 Set，跨请求存活。夹在中间会让后续段落读到
+// 上一段的名单（ID 段位不同不会真撞上，但依赖执行顺序的测试迟早出事）。
+section('[28] 用户白名单（高于黑名单）');
+{
+	const G1 = '-1001111111111';
+	const G2 = '-1002222222222';
+	const G3 = '-1003333333333';
+	const WL_ID = '71001';			// 进白名单的人
+	const CTRL_ID = '71002';		// 同样被拉黑、但不进白名单的对照
+	const AD_ID = '71003';			// 发广告的对照
+	const AD_NAME = '💚高价收网赚号💚';
+	const AD_BIO = '长期收购网 du 商宝账号，老账号优先加价';
+	const AD_TEXT = '招代理日结佣金 无需经验 加微详聊';
+
+	const makeMultiEnv = (extra = {}) => makeEnv({ GROUP_ID: `${G1},${G2},${G3}`, ...extra });
+	const msgIn = (chatId, chatTitle, from, text, extra = {}) => ({
+		message_id: 800 + Math.floor(Math.random() * 1000),
+		date: Math.floor(Date.now() / 1000),
+		text,
+		chat: { id: Number(chatId), type: 'supergroup', title: chatTitle },
+		from: { is_bot: false, ...from },
+		...extra
+	});
+	const bannedChats = () => calls.filter((c) => c.method === 'banChatMember').map((c) => String(c.body?.chat_id));
+	const mutedChats = () => calls.filter((c) => c.method === 'restrictChatMember').map((c) => String(c.body?.chat_id));
+	const deletedCount = () => calls.filter((c) => c.method === 'deleteMessage').length;
+	const unbannedChats = () => calls.filter((c) => c.method === 'unbanChatMember').map((c) => String(c.body?.chat_id));
+	const textTo = (chatId) => calls
+		.filter((c) => c.method === 'sendMessage' && String(c.body?.chat_id) === String(chatId))
+		.map((c) => String(c.body?.text || '')).join('\n');
+	const adApi = () => setApi({
+		getChat: (body) => ({ ok: true, result: { id: body?.chat_id, first_name: AD_NAME, bio: AD_BIO } }),
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] })
+	});
+	const memberUpdate = (userId, firstName, chatId = G1, { oldStatus = 'left', newStatus = 'member' } = {}) => ({
+		chat_member: {
+			chat: { id: Number(chatId), type: 'supergroup', title: '测试群' },
+			from: { id: Number(userId), is_bot: false, first_name: firstName },
+			date: Math.floor(Date.now() / 1000),
+			old_chat_member: { user: { id: Number(userId), is_bot: false, first_name: firstName }, status: oldStatus },
+			new_chat_member: { user: { id: Number(userId), is_bot: false, first_name: firstName }, status: newStatus }
+		}
+	});
+
+	const envW = makeMultiEnv();
+	resetCalls();
+	adApi();
+	// 建表是懒加载的：先发一条无害消息把 D1 核心表建起来，直接 INSERT 会撞 no such table。
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: '71000', first_name: '路人' }, '大家早上好') }, envW);
+	// INSERT OR REPLACE 而不是 INSERT：下面 28.8 与 28.12 需要把同一个 ID 反复放回黑名单
+	// （28.1 刚把 WL_ID 的黑名单行删掉），用 INSERT 会撞主键约束直接把测试打断。
+	const blacklist = (id, reason) => envW.DB
+		.prepare("INSERT OR REPLACE INTO blacklist (id, reason, by_user, at, note) VALUES (?, ?, 'system', '2026-09-25T00:00:00Z', '')")
+		.bind(id, reason).run();
+	blacklist(WL_ID, 'ad_auto');
+	blacklist(CTRL_ID, 'ad_auto');
+	// ⚠️ D1 mock 的 first()/all() 是 async：漏 await 得到的是 Promise，Boolean(Promise) 恒为 true，
+	// 断言会「永远为真」地假绿。本段第一次写就踩了这个坑，注释留在这儿防止复发。
+	const isBlacklisted = async (id) => Boolean(await envW.DB.prepare('SELECT id FROM blacklist WHERE id = ?').bind(id).first());
+
+	// ---- 28.1 命令层：/add_whitelist 写入 + 顺手解封 + 清黑名单行 ----
+	resetCalls();
+	await sendUpdate({ message: privateMessage(OWNER_ID, `/add_whitelist ${WL_ID} 主人特批`) }, envW);
+	const wlRow = await envW.DB.prepare('SELECT user_id, note, previous_blacklist_reason FROM ad_user_whitelist WHERE user_id = ?').bind(WL_ID).first();
+	assert('★ 28.1 /add_whitelist 写入 ad_user_whitelist',
+		wlRow && String(wlRow.user_id) === WL_ID, JSON.stringify(wlRow));
+	assert('28.1 备注落库', String(wlRow?.note || '') === '主人特批', String(wlRow?.note));
+	assert('★ 28.1 /add_whitelist 顺手删掉 D1 黑名单行（否则 /check、/unban 仍说他在黑名单）',
+		!(await isBlacklisted(WL_ID)), '仍在黑名单');
+	assert('★ 28.1 /add_whitelist 顺手全群解封（否则白名单用户仍被封着进不来）',
+		unbannedChats().length >= 3, JSON.stringify(unbannedChats()));
+	assert('28.1 原黑名单原因留档，审计痕迹不丢',
+		String(wlRow?.previous_blacklist_reason || '') === 'ad_auto', String(wlRow?.previous_blacklist_reason));
+	assert('28.1 回执写明已加入白名单', textTo(OWNER_ID).includes('已加入用户白名单'), textTo(OWNER_ID).slice(0, 300));
+
+	// ---- 28.2 发言路径：白名单用户不删不踢，对照组照旧删+踢 ----
+	resetCalls();
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: WL_ID, first_name: '白名单用户' }, '我在白名单里，正常说话') }, envW);
+	assert('★ 28.2 白名单用户发言：消息不被删', deletedCount() === 0, JSON.stringify(calls.map((c) => c.method)));
+	assert('★ 28.2 白名单用户发言：不被踢', bannedChats().length === 0, JSON.stringify(bannedChats()));
+
+	resetCalls();
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: CTRL_ID, first_name: '对照用户' }, '我不在白名单里') }, envW);
+	assert('★ 28.2 负控：同样被拉黑、但不在白名单的用户，发言照旧删+踢',
+		deletedCount() >= 1 && bannedChats().includes(G1),
+		JSON.stringify({ deleted: deletedCount(), banned: bannedChats() }));
+
+	// ---- 28.3 复入群路径 ----
+	resetCalls();
+	await sendUpdate(memberUpdate(WL_ID, '白名单用户', G1), envW);
+	assert('★ 28.3 白名单用户复入群：不被踢', bannedChats().length === 0, JSON.stringify(bannedChats()));
+	resetCalls();
+	await sendUpdate(memberUpdate(CTRL_ID, '对照用户', G1), envW);
+	assert('★ 28.3 负控：不在白名单的黑名单用户复入群照旧被踢',
+		bannedChats().includes(G1), JSON.stringify(bannedChats()));
+
+	// ---- 28.4 广告检测路径：白名单用户不进判定 ----
+	resetCalls();
+	adApi();
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: WL_ID, first_name: AD_NAME }, AD_TEXT) }, envW);
+	assert('★ 28.4 白名单用户发广告：不封不禁（完全豁免）',
+		bannedChats().length === 0 && mutedChats().length === 0,
+		JSON.stringify({ banned: bannedChats(), muted: mutedChats() }));
+
+	resetCalls();
+	adApi();
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: AD_ID, first_name: AD_NAME }, AD_TEXT) }, envW);
+	assert('★ 28.4 负控：同样的广告文案，不在白名单的用户照旧被处置',
+		bannedChats().length + mutedChats().length >= 1,
+		JSON.stringify({ banned: bannedChats(), muted: mutedChats() }));
+
+	// ---- 28.5 底层兜底：即使调用方忘了判断，也不能封/禁言 ----
+	const banAll = await W.banUserFromAllGroups(WL_ID);
+	assert('★ 28.5 兜底 banUserFromAllGroups：白名单用户全部 skipped、无一 ok',
+		banAll.length > 0 && banAll.every((r) => r.skipped === true && r.ok === false), JSON.stringify(banAll));
+	const banOne = await W.banUserFromGroup(G1, WL_ID);
+	assert('★ 28.5 兜底 banUserFromGroup：skipped', banOne?.skipped === true && banOne?.ok === false, JSON.stringify(banOne));
+	const banSingle = await W.banUserFromSingleGroup(WL_ID, G1);
+	assert('★ 28.5 兜底 banUserFromSingleGroup：skipped', banSingle?.[0]?.skipped === true, JSON.stringify(banSingle));
+	const muteAll = await W.muteUserFromAllGroups(WL_ID);
+	assert('★ 28.5 兜底 muteUserFromAllGroups：全部 skipped',
+		muteAll.length > 0 && muteAll.every((r) => r.skipped === true), JSON.stringify(muteAll));
+	const muteOne = await W.muteUserFromSingleGroup(WL_ID, G1);
+	assert('★ 28.5 兜底 muteUserFromSingleGroup：skipped', muteOne?.[0]?.skipped === true, JSON.stringify(muteOne));
+	let muteBotThrew = false;
+	let muteBot = null;
+	try { muteBot = await W.muteChatMember(G1, WL_ID); } catch { muteBotThrew = true; }
+	assert('★ 28.5 兜底 muteChatMember：跳过且不抛异常（抛了会被记成「处理失败」）',
+		muteBotThrew === false && muteBot?.skipped === true, JSON.stringify({ muteBotThrew, muteBot }));
+
+	// 负控：不在白名单的用户走真实路径，真的会调 banChatMember。
+	resetCalls();
+	const banCtrl = await W.banUserFromGroup(G1, '71999');
+	assert('★ 28.5 负控：不在白名单的用户仍然真的调用 banChatMember',
+		banCtrl?.ok === true && bannedChats().includes(G1), JSON.stringify({ banCtrl, banned: bannedChats() }));
+
+	// ---- 28.6 写黑名单闸门：白名单用户写不进去 ----
+	const addResult = await W.addToBlacklist(WL_ID, envW, { reason: 'spam', by: 'system' });
+	assert('★ 28.6 addToBlacklist 对白名单用户返回 WHITELISTED，且不落库',
+		addResult?.success === false && addResult?.code === 'WHITELISTED' && !(await isBlacklisted(WL_ID)),
+		JSON.stringify({ addResult, stillBlacklisted: (await isBlacklisted(WL_ID)) }));
+
+	// ---- 28.7 /spam 与 /ban 明确拒绝 ----
+	resetCalls();
+	await sendUpdate({ message: privateMessage(OWNER_ID, `/spam ${WL_ID}`) }, envW);
+	assert('★ 28.7 /spam 白名单用户：不落黑名单、不封人',
+		!(await isBlacklisted(WL_ID)) && bannedChats().length === 0,
+		JSON.stringify({ blacklisted: (await isBlacklisted(WL_ID)), banned: bannedChats() }));
+	assert('28.7 /spam 白名单用户：回执说明原因（不是含糊的「添加失败」）',
+		textTo(OWNER_ID).includes('白名单'), textTo(OWNER_ID).slice(0, 400));
+
+	resetCalls();
+	await sendUpdate({ message: privateMessage(OWNER_ID, `/ban ${WL_ID}`) }, envW);
+	assert('★ 28.7 /ban 白名单用户：不落黑名单、不封人',
+		!(await isBlacklisted(WL_ID)) && bannedChats().length === 0,
+		JSON.stringify({ blacklisted: (await isBlacklisted(WL_ID)), banned: bannedChats() }));
+
+	// ---- 28.8 解封链放行：白名单用户不能被「永远解不开」 ----
+	// 【必须先把他放回黑名单】28.1 已经把 WL_ID 的黑名单行删掉了（这正是 /add_whitelist 的
+	// 副作用）。不放回去的话 blocked.has(WL_ID) 为 false，断言会走 else 分支进 eligible ——
+	// 与白名单毫无关系，是一条恒真断言。复核实测：放回与不放回，输出逐字相同。
+	blacklist(WL_ID, 'ad_auto');
+	const eligibility = await W.checkManyUnbanEligibility([CTRL_ID, WL_ID], envW);
+	assert('★ 28.8 /unban 资格校验：白名单用户即使在黑名单里也算 eligible',
+		eligibility.eligible.includes(WL_ID) && eligibility.blacklisted.includes(CTRL_ID),
+		JSON.stringify(eligibility));
+	assert('28.8 负控：非白名单的黑名单用户仍被拒（资格判定没被整体放宽）',
+		eligibility.blacklisted.includes(CTRL_ID) && !eligibility.blacklisted.includes(WL_ID),
+		JSON.stringify(eligibility));
+
+	// 升级函数同理：没有台账时它对任何人都返回 false，断言会恒真。
+	// 所以先给两个 ID 各造一条台账，再验证「白名单拦住了、非白名单没被拦住」。
+	const banScope = (id) => envW.DB
+		.prepare("INSERT OR REPLACE INTO ad_ban_scope (user_id, scope_state, first_chat_id, first_chat_title, first_score, first_reasons, first_reason, ban_summary, trigger_count, created_at, updated_at, escalated_at) VALUES (?, 'single', ?, '测试群', 9, '', '', '', 1, 0, 0, NULL)")
+		.bind(id, G1).run();
+	banScope(WL_ID);
+	banScope(CTRL_ID);
+	const escalated = await W.maybeEscalateBlacklistedUser({}, envW, WL_ID, G1);
+	assert('★ 28.8 升级函数对白名单用户直接返回 false', escalated === false, String(escalated));
+	resetCalls();
+	const escalatedCtrl = await W.maybeEscalateBlacklistedUser({}, envW, CTRL_ID, G1);
+	assert('★ 28.8 负控：同样有台账的非白名单用户会被升级（证明上一条不是恒真断言）',
+		escalatedCtrl === true, String(escalatedCtrl));
+
+	// ---- 28.9 /whitelist_users 列表 ----
+	resetCalls();
+	await sendUpdate({ message: privateMessage(OWNER_ID, '/whitelist_users') }, envW);
+	assert('★ 28.9 /whitelist_users 列出白名单用户',
+		textTo(OWNER_ID).includes(WL_ID) && textTo(OWNER_ID).includes('用户白名单'),
+		textTo(OWNER_ID).slice(0, 400));
+
+	// ---- 28.10 /del_whitelist 移除后豁免立刻消失 ----
+	resetCalls();
+	await sendUpdate({ message: privateMessage(OWNER_ID, `/del_whitelist ${WL_ID}`) }, envW);
+	assert('★ 28.10 /del_whitelist 删除记录',
+		!(await envW.DB.prepare('SELECT user_id FROM ad_user_whitelist WHERE user_id = ?').bind(WL_ID).first()));
+	assert('28.10 回执确认已移除', textTo(OWNER_ID).includes('已从用户白名单移除'), textTo(OWNER_ID).slice(0, 300));
+
+	// 移除后必须【立刻】恢复普通待遇：重新拉黑 + 发言 → 照旧删+踢。
+	// 这条同时验证「白名单是运行时豁免、不是一次性状态」—— 删除后 Set 立刻重建。
+	blacklist(WL_ID, 'manual');
+	resetCalls();
+	await sendUpdate({ message: msgIn(G1, '第一治理群', { id: WL_ID, first_name: '前白名单用户' }, '我现在没有豁免了') }, envW);
+	assert('★ 28.10 移除白名单后：发言立刻恢复删+踢（豁免不是一次性的）',
+		deletedCount() >= 1 && bannedChats().includes(G1),
+		JSON.stringify({ deleted: deletedCount(), banned: bannedChats() }));
+
+	// ---- 28.11 命令正则不抢匹配：/whitelist 仍是域名白名单 ----
+	// 顶层 const 在 vm 沙箱里读不到（只有 function 声明会挂到全局对象），所以从源码文本提取。
+	// 这一段防的是「新命令把老命令吃掉」：`whitelist` 是 `whitelist_users` 的前缀，
+	// 一旦有人把 `(?:\s|$)` 锚定删掉，/whitelist_users 就会被解析成 /whitelist（域名白名单），
+	// 主人的白名单列表会变成域名列表 —— 静默且难查。
+	const reSrc = src.match(/const AD_COMMAND_RE = (\/.*?\/i);/)?.[1] || '';
+	assert('★ 28.11 能从源码提取到 AD_COMMAND_RE', reSrc.length > 0, reSrc);
+	const AD_RE = new RegExp(reSrc.slice(1, reSrc.lastIndexOf('/')), 'i');
+	const cmdOf = (s) => String(AD_RE.exec(s)?.[1] || '');
+	assert('★ 28.11 /whitelist add github.com 仍解析为 whitelist（域名白名单没被抢走）',
+		cmdOf('/whitelist add github.com') === 'whitelist', cmdOf('/whitelist add github.com'));
+	assert('★ 28.11 /whitelist_users 解析为 whitelist_users（不被 whitelist 前缀吃掉）',
+		cmdOf('/whitelist_users') === 'whitelist_users', cmdOf('/whitelist_users'));
+	assert('★ 28.11 /add_whitelist@机器人名 123 解析为 add_whitelist',
+		cmdOf('/add_whitelist@SomeBot 123') === 'add_whitelist', cmdOf('/add_whitelist@SomeBot 123'));
+	assert('★ 28.11 /del_whitelist 123 解析为 del_whitelist',
+		cmdOf('/del_whitelist 123') === 'del_whitelist', cmdOf('/del_whitelist 123'));
+
+	// ---- 28.12 泄漏路径：删消息不走底层兜底，必须逐点自查 ----
+	// 【为什么单开一段】底层 banUserFromGroup / muteUser* 的兜底只能拦住「改成员状态」的动作。
+	// deleteMessage(chatId, messageId) 的签名里【没有 userId】—— 它无从判断这条消息是不是
+	// 白名单用户发的。所以「完全豁免」里「不删消息」这半句只能靠每个删消息的调用点自己判一次，
+	// 兜底层永远救不了。复核实测：连带清扫、批量任务、/ad 投票、回复「广告」这四条路径
+	// 原先照样删白名单用户的消息。本段就是钉住它们。
+	//
+	// 【必须先重新加回白名单】28.10 已经把他 /del_whitelist 掉了（那正是 28.10 要验证的事）。
+	// 不重新加回来的话，本段所有断言测的都是「非白名单用户」，会全部假绿或假红。
+	// 白名单是模块级 Set，由请求入口重建 —— 所以必须走一次真实 webhook，不能直接写库。
+	resetCalls();
+	await sendUpdate({ message: privateMessage(OWNER_ID, `/add_whitelist ${WL_ID} 28.12 前置`) }, envW);
+	// 再把他放回黑名单，还原「他之前被误封过，主人用 /add_whitelist 救人」的真实场景。
+	blacklist(WL_ID, 'ad_auto');
+
+	// (a) 连带清扫：删消息 + 加黑 + 全群封禁三件套，白名单用户一件都不该挨
+	resetCalls();
+	const linkedDone = await W.enforceLinkedSpamTargets(envW, [
+		{ userId: WL_ID, messageIds: [{ chatId: G1, mid: 9001 }] },
+		{ userId: CTRL_ID, messageIds: [{ chatId: G1, mid: 9002 }] }
+	], { operatorId: 'system', note: '测试连带' });
+	const deletedMids = () => calls.filter((c) => c.method === 'deleteMessage').map((c) => String(c.body?.message_id));
+	assert('★ 28.12 连带清扫：白名单用户的消息不被删',
+		!deletedMids().includes('9001'), JSON.stringify(deletedMids()));
+	// 断言 fix 真正新增的字段（whitelisted / deleted），而不是 blacklistCode==='WHITELISTED'
+	// —— 后者同时也是 addToBlacklistCore 对白名单用户的返回值，删掉整条跳过分支它照样绿。
+	assert('★ 28.12 连带清扫：白名单用户整条跳过（未加黑且未删消息）',
+		linkedDone.find((d) => String(d.userId) === WL_ID)?.whitelisted === true
+		&& linkedDone.find((d) => String(d.userId) === WL_ID)?.deleted === 0,
+		JSON.stringify(linkedDone));
+	assert('★ 28.12 负控：非白名单的连带目标消息照删、照加黑（豁免不外溢）',
+		deletedMids().includes('9002')
+		&& linkedDone.find((d) => String(d.userId) === CTRL_ID)?.blacklistCode !== 'WHITELISTED',
+		JSON.stringify({ deleted: deletedMids(), done: linkedDone }));
+
+	// (b) 第二条写黑名单的路：addManyToBlacklist（批量任务与连带清扫都走它，绕开命令层）
+	const manyResult = await W.addManyToBlacklist([WL_ID, '71998'], envW, { reason: 'spam', by: 'system' });
+	// 【为什么断言 whitelisted 桶而不是 failed 桶】performBulkJobD1Mutation 的判断是
+	// `if (!lastResults.failed.length) return` —— 白名单条目若混进 failed，批量任务会重试到
+	// 上限后 throw「批量 D1 操作连续失败」并停住游标，把整批任务卡死。所以它必须单独一桶。
+	assert('★ 28.12 addManyToBlacklist：白名单用户不进 success/exists，落进 whitelisted 桶（不得进 failed）',
+		!manyResult.success.includes(WL_ID) && !manyResult.exists.includes(WL_ID)
+		&& manyResult.whitelisted.includes(WL_ID) && !manyResult.failed.length,
+		JSON.stringify(manyResult));
+	// ⚠️ 这里断言的是「真的落库了」，不是「落在 success 数组里」：D1 mock 把
+	// `INSERT ... RETURNING` 按首 6 字符归类成【写语句】，其 .all() 固定返回空 results，
+	// 于是 inserted 集合恒为空、所有 ID 都落进 exists —— success/exists 的区分在这个 mock 下
+	// 本来就测不出来（既有测试同样绕开它）。真实语义只有「库里有这一行」。
+	assert('★ 28.12 addManyToBlacklist：非白名单用户照旧写入（闸门没有整体关死）',
+		(await isBlacklisted('71998')) && !manyResult.whitelisted.includes('71998'),
+		JSON.stringify({ manyResult, inDb: await isBlacklisted('71998') }));
+
+	// (c) 回复学习的自然语言入口（handleAdReplyLearning）—— 端到端。
+	// 【触发源有两个，别只看一个】classifyAdReplyIntent 先扫中文短语表 AD_REPLY_LEARN_TRIGGERS
+	// （非空：'这是广告' / '封了他' …），再扫英文正则表 AD_REPLY_LEARN_TRIGGER_PATTERNS（空数组）。
+	// 只看后者会误判成「路径不可达」，从而写出一条恒真的假断言 —— 这正是本段上一版的错误。
+	// 操作人必须是 isPrivilegedManager，否则会在鉴权处提前 return，断言同样恒真。
+	resetCalls();
+	adApi();
+	await sendUpdate({
+		message: msgIn(G1, '第一治理群', { id: OWNER_ID, first_name: 'Owner' }, '这是广告', {
+			reply_to_message: msgIn(G1, '第一治理群', { id: WL_ID, first_name: '白名单用户' }, '被举报的消息')
+		})
+	}, envW);
+	assert('★ 28.12 回复「这是广告」：白名单用户的消息不被删（与 /spam 同等对待）',
+		deletedMids().length === 0, JSON.stringify(deletedMids()));
+	assert('★ 28.12 回复「这是广告」：闪屏说明是白名单豁免，而不是含糊地静默',
+		calls.some((c) => c.method === 'sendMessage' && String(c.body?.text || '').includes('白名单')),
+		JSON.stringify(calls.filter((c) => c.method === 'sendMessage').map((c) => String(c.body?.text || '').slice(0, 60))));
+
+	// 负控：同样的回复动作、同样的触发词，目标换成不在白名单的人 → 消息照删。
+	// 没有这条，上面两条可能是因为「链路压根没跑」而恒真。
+	resetCalls();
+	adApi();
+	await sendUpdate({
+		message: msgIn(G1, '第一治理群', { id: OWNER_ID, first_name: 'Owner' }, '这是广告', {
+			reply_to_message: msgIn(G1, '第一治理群', { id: '71996', first_name: '普通用户' }, '另一条被举报的消息')
+		})
+	}, envW);
+	assert('★ 28.12 负控：回复「这是广告」对非白名单用户照旧删消息（证明链路真的跑了）',
+		deletedMids().length >= 1, JSON.stringify(deletedMids()));
+
+	// 哨兵：两个触发源【都】空了才算路径不可达。任一非空而上面三条没覆盖到，这里会变红。
+	const cnTriggers = Number(src.match(/const AD_REPLY_LEARN_TRIGGERS = \[([^\]]*)\]/)?.[1]?.trim() ? 1 : 0);
+	const enPatterns = Number(src.match(/const AD_REPLY_LEARN_TRIGGER_PATTERNS = \[([^\]]*)\]/)?.[1]?.trim() ? 1 : 0);
+	assert('★ 28.12 哨兵：中/英两个触发源至少有一个非空，上面的端到端用例才有意义',
+		cnTriggers + enPatterns >= 1, `cnTriggers=${cnTriggers} enPatterns=${enPatterns}`);
+
+	// ---- 28.13 渲染层：白名单豁免的文案不能谎报 ----
+	// 【为什么单列一段】28.1–28.12 断言的都是「动作有没有发生」；而前三轮复核反复出现的
+	// 缺陷类型是「动作对了、文案假了」—— 投票卡通群谎报「已加入 D1 全局黑名单」、主人收到
+	// 「删除失败:未知错误」、连带通知把白名单账号算进「已处置 N 个」。
+	// 这类缺陷不会让任何动作类断言变红（第三轮复核实测：把这几处全改坏，测试仍然 1204/1204
+	// 全绿），但杀伤力很实：主人会以为人已经被封、或以为接口坏了，据此做出错误决定。
+	const ownerTextNow = () => calls.filter((c) => c.method === 'sendMessage')
+		.map((c) => String(c.body?.text || '')).join('\n');
+
+	// (a) 投票卡状态文案（全群可见）
+	const voteBase = {
+		finalized: true, result: 'approved', enforcementComplete: true,
+		targetUserId: WL_ID, targetUserSnapshot: { id: WL_ID, first_name: '白名单用户' },
+		creatorUserId: OWNER_ID, creatorUserSnapshot: { id: OWNER_ID, first_name: 'Owner' },
+		deadlineAt: 1800000000, approvers: [], rejecters: []
+	};
+	const wlCard = W.buildAdVoteMessageText({ ...voteBase, whitelistSkipped: true });
+	assert('★ 28.13 投票卡：白名单豁免时说明「未执行任何处置」',
+		wlCard.includes('未执行任何处置'), wlCard.slice(0, 220));
+	assert('★ 28.13 投票卡：白名单豁免时不得声称已加入黑名单/已全群封禁',
+		!wlCard.includes('已加入 D1 全局黑名单'), wlCard.slice(0, 220));
+	// 负控：同样 finalized+approved、但没有 whitelistSkipped → 必须仍然显示已封禁。
+	// 没有这条，上面两条可能是因为「文案被整体改坏」而假绿。
+	const normalCard = W.buildAdVoteMessageText({ ...voteBase, whitelistSkipped: false });
+	assert('★ 28.13 负控：非白名单的通过卡仍显示「已加入 D1 全局黑名单」',
+		normalCard.includes('已加入 D1 全局黑名单'), normalCard.slice(0, 220));
+
+	// (b) 主人通知：白名单豁免时不能出现「删除失败」（第二轮复核实测过的真缺陷）
+	resetCalls();
+	await W.notifyOwnerAdVoteApproved(
+		{ ...voteBase, whitelistSkipped: true, reportedMessageId: 4242, chatId: G1, messageId: 77 },
+		{ success: false, code: 'WHITELISTED', message: '⚠️ 该用户在用户白名单中' },
+		[{ groupId: G1, userId: WL_ID, ok: false, skipped: true, error: 'whitelisted' }],
+		null
+	);
+	assert('★ 28.13 主人通知：白名单豁免时说明「按用户白名单豁免，未删除」',
+		ownerTextNow().includes('按用户白名单豁免，未删除'), ownerTextNow().slice(0, 300));
+	assert('★ 28.13 主人通知：白名单豁免时不得出现「删除失败」（reportedMessageId 非空也不许）',
+		!ownerTextNow().includes('删除失败'), ownerTextNow().slice(0, 300));
+	assert('★ 28.13 主人通知：白名单豁免时不得声称「D1 写入失败」',
+		!ownerTextNow().includes('D1 写入失败'), ownerTextNow().slice(0, 300));
+
+	// (c) 批量任务回执：白名单拒绝的条数必须单列，否则计数对不上「目标用户数」
+	const jobMsg = msgIn(G1, '第一治理群', { id: OWNER_ID, first_name: 'Owner' }, 'x');
+	const jobForRender = W.createBulkJobPayload('spam', ['1', '2', '3'], [], 'note', jobMsg, {});
+	jobForRender.stats.added = 0;
+	jobForRender.stats.exists = 0;
+	jobForRender.stats.addFailed = 0;
+	jobForRender.stats.addWhitelisted = 3;
+	jobForRender.stats.kickOk = 0;
+	jobForRender.stats.kickFailed = 0;
+	jobForRender.stats.kickSkipped = 2;
+	const jobDetail = W.formatBulkJobDetail(jobForRender);
+	assert('★ 28.13 批量回执：单列「加黑跳过（用户白名单）」',
+		jobDetail.includes('加黑跳过（用户白名单）:3'), jobDetail);
+	assert('★ 28.13 批量回执：单列「群封禁跳过（用户白名单）」',
+		jobDetail.includes('群封禁跳过（用户白名单）:2'), jobDetail);
+	jobForRender.stats.addWhitelisted = 0;
+	jobForRender.stats.kickSkipped = 0;
+	const jobDetailQuiet = W.formatBulkJobDetail(jobForRender);
+	assert('★ 28.13 批量回执：计数为 0 时两行都不渲染（不给每张回执添噪声）',
+		!jobDetailQuiet.includes('加黑跳过') && !jobDetailQuiet.includes('群封禁跳过'), jobDetailQuiet);
+
+	// (c2) 真实路径：白名单 ID 走完 prepareBulkJobActiveBatch（D1 写入 + 统计 + 分片），
+	// 必须落进 addWhitelisted，而不是被当成 added/exists 或直接丢掉。
+	// 【注意别调错函数】累加写在 prepareBulkJobActiveBatch 的 else 分支里，
+	// performBulkJobD1Mutation 只负责重试与抛错、不碰 stats —— 调后者会得到全 0 的假绿。
+	// 自诊断前置：本段依赖 28.12 开头那次 /add_whitelist 留下的白名单状态。
+	// 若将来有人重排段落，这条会直接指出根因，而不是让 (c2) 以「addWhitelisted=0」这种
+	// 难以定位的方式失败。
+	assert('★ 28.13 前置：WL_ID 仍在白名单中（依赖 28.12 的 /add_whitelist）',
+		W.isAdUserWhitelisted(WL_ID) === true, String(W.isAdUserWhitelisted(WL_ID)));
+	const realJob = W.createBulkJobPayload('spam', [WL_ID, '71999'], [], 'note', jobMsg, {});
+	const realBatch = await W.prepareBulkJobActiveBatch(realJob, envW);
+	// 【为什么用 added + exists 而不是分开断言】D1 mock 把 `INSERT ... RETURNING` 按首 6 字符
+	// 归类成写语句、其 .all() 固定返回空 results，于是本 mock 下所有插入都落进 exists、
+	// added 恒为 0（见 28.12(b) 的注释）。若将来 mock 修好、真的返回 RETURNING 行，
+	// 正确实现会变成 added=1/exists=0 —— 分开断言就会【假红】，逼后人去改本来正确的代码。
+	// 断言「两者之和」与 mock 无关，同时仍能抓住「白名单 ID 被提前摘掉」这个要点。
+	assert('★ 28.13 真实路径：白名单 ID 计入 addWhitelisted，且不进 added/exists',
+		realJob.stats.addWhitelisted === 1 && (realJob.stats.added + realJob.stats.exists) === 1,
+		JSON.stringify({ stats: realJob.stats, batch: realBatch && { userCount: realBatch.userCount } }));
+
+	// (d) 连带通知：白名单条目不能算进「已处置 N 个账号」，也不能吐原文码
+	resetCalls();
+	await W.notifyLinkedSpamResult(envW, {
+		operatorId: OWNER_ID,
+		sourceUserId: WL_ID,
+		textNorm: '同款广告文案',
+		message: { chat: { id: G1, title: '第一治理群' } },
+		done: [
+			{ userId: WL_ID, deleted: 0, blacklistCode: 'WHITELISTED', banSummary: '0/4', whitelisted: true },
+			{ userId: '71995', deleted: 2, blacklistCode: 'ADDED', banSummary: '4/4' }
+		]
+	});
+	assert('★ 28.13 连带通知：「已处置」只数真正被处置的账号（白名单不计入）',
+		ownerTextNow().includes('已处置 1 个账号') && !ownerTextNow().includes('已处置 2 个账号'),
+		ownerTextNow().slice(0, 300));
+	assert('★ 28.13 连带通知：白名单条目单独说明，且不把原文码 WHITELISTED 吐给主人',
+		ownerTextNow().includes('白名单豁免：未加黑、未封禁、未删消息')
+		&& !ownerTextNow().includes('黑名单:WHITELISTED'),
+		ownerTextNow().slice(0, 300));
+}
+
 console.log('');
 console.log('='.repeat(60));
 console.log(`广告检测测试汇总：通过 ${pass} 条，失败 ${fail} 条`);

@@ -301,6 +301,9 @@ export default {
 		// 误判放行库（/ignore 登记、/allowlist 维护）。同样必须在判定之前刷新，
 		// 否则主人刚 /allowlist del 掉的那条记录本次请求仍然生效。
 		await refreshAdAllowlist(env);
+		// 用户白名单（/add_whitelist 维护）。必须在【任何】拦截点之前刷新：
+		// 主人刚 /add_whitelist 加进来的人，本次请求就得被放行，不能等到下一次。
+		await refreshAdUserWhitelist(env);
 
 		if (url.pathname === "/banlist" && url.searchParams.has('tgid') && url.searchParams.get('tgid') != '') {
 			const tgid = url.searchParams.get('tgid');
@@ -377,6 +380,7 @@ export default {
 		await mergeDynamicGroupsFromD1(env);
 		await refreshAdExemptKeywords(env);
 		await refreshAdAllowlist(env);
+		await refreshAdUserWhitelist(env);
 
 		for (const message of batch.messages || []) {
 			const body = message.body || {};
@@ -414,6 +418,7 @@ export default {
 			await mergeDynamicGroupsFromD1(env);
 			await refreshAdExemptKeywords(env);
 			await refreshAdAllowlist(env);
+			await refreshAdUserWhitelist(env);
 			const summary = await runAdBioRescan(env);
 			// 顺手清一次过期数据。原先只搭在 detectAdOnJoin 上，
 			// 没人入群的日子就不会剪枝；挂到 cron 上有个稳定节拍。
@@ -1449,6 +1454,9 @@ async function checkBlacklist(userId, env, options = {}) {
 }
 
 async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, options = {}) {
+	// 【白名单高于黑名单】白名单用户不走这道闸门：他可能还背着历史误封，
+	// 而白名单的语义就是「这个人不要再拦」。拦住他自救等于白名单失效。
+	if (isAdUserWhitelisted(userId)) return false;
 	const blacklistCheck = await checkBlacklist(userId, env, { strict: true });
 	if (!blacklistCheck.isBlacklisted) {
 		return false;
@@ -1490,6 +1498,14 @@ async function blockSelfUnbanIfBlacklisted(userId, chatId, fromUser, env, option
 async function addToBlacklistCore(userId, env, options = {}) {
 	if (!env.DB) {
 		return { success: false, code: 'NO_DB', message: '❌ 未绑定 D1 存储空间' };
+	}
+
+	// 【白名单高于黑名单】白名单用户拒绝写入黑名单 —— 这是最后一道闸门。
+	// 命令层（/spam、/ban）会先给出更友好的提示，这里是防御性的：
+	// 未来任何新调用点都不可能绕过白名单把名单里的人写进黑名单。
+	// options.force === true 时不拦（当前没有调用方使用，留给将来「确实要覆盖白名单」的场景）。
+	if (options.force !== true && isAdUserWhitelisted(userId)) {
+		return { success: false, code: 'WHITELISTED', message: '⚠️ 该用户在用户白名单中，未写入黑名单。需要先 /del_whitelist。' };
 	}
 
 	const userIdStr = String(userId);
@@ -1564,6 +1580,14 @@ async function removeFromBlacklist(userId, env) {
 // 跳过项带 skipped: true 且 ok: false，摘要必须用 attempted = results.filter(r => !r.skipped)
 // 算分母，否则会渲染成「3/4 个群成功」，主人会以为封禁出了问题。
 async function banUserFromAllGroups(userId, options = {}) {
+	// 【白名单高于黑名单·兜底】白名单用户一个群都不封。
+	// 上层拦截点（发言拦截 / 复入群 / 入群处置 / /spam / /ban / 投票 / 关联清扫）
+	// 各自已经放行；这一层保证将来任何新调用点都不可能绕过白名单把人封掉。
+	if (isAdUserWhitelisted(userId)) {
+		return GROUP_IDS.map((groupId) => ({
+			groupId, userId: String(userId), ok: false, skipped: true, error: 'whitelisted', memberProbe: null
+		}));
+	}
 	const results = [];
 	for (const groupId of GROUP_IDS) {
 		if (options.excludeContactGroup === true && isSelfUnbanContactGroup(groupId)) {
@@ -1755,11 +1779,18 @@ function isTelegramPermissionError(description) {
 function getBanResultStats(banResults) {
 	const total = banResults.length;
 	const okCount = banResults.filter((r) => r.ok).length;
-	const failed = banResults.filter((r) => !r.ok);
+	// 【跳过不是失败】白名单豁免与主群豁免都会让底层直接跳过，返回 {ok:false, skipped:true}。
+	// 把它算进失败会让主人收到与事实相反的告警 ——「D1 黑名单已生效；成功 0/3」
+	// 加「❌ 原因：whitelisted　建议：查看 Worker 日志」，而真相是有意不封。
+	// 所以跳过单独统计，并从分母里剔除（attempted = 真正尝试过的群数）。
+	const skippedCount = banResults.filter((r) => r.skipped === true).length;
+	const failed = banResults.filter((r) => !r.ok && r.skipped !== true);
 	return {
 		total,
 		okCount,
-		failCount: total - okCount,
+		skippedCount,
+		attempted: total - skippedCount,
+		failCount: failed.length,
 		lookupFailCount: failed.filter((r) => isTelegramUserUnresolvableError(r.error)).length,
 		permissionFailCount: failed.filter((r) => isTelegramPermissionError(r.error)).length
 	};
@@ -1794,26 +1825,33 @@ function formatTargetFromBanResults(tgid, banResults) {
 // banResults: [{ groupId, ok, error }] 来自 banUserFromAllGroups
 // 返回多行 HTML 文案，每行一个群的具体结果
 async function renderBanResultsDetail(banResults, chatInfoCache = null, options = {}) {
-	const { okCount, total, failCount, lookupFailCount, permissionFailCount } = getBanResultStats(banResults);
+	const { okCount, total, skippedCount, attempted, failCount, lookupFailCount, permissionFailCount } = getBanResultStats(banResults);
 	const lines = [];
 	const cache = chatInfoCache || new Map();
 
 	if (total === 0) {
 		return 'ℹ️ 未配置 GROUP_ID，未执行 Telegram 群封禁/预封。';
 	}
-	if (okCount === total) {
-		lines.push(`✅ <b>Telegram 群封禁/预封成功 ${okCount}/${total}</b>`);
+	if (attempted === 0) {
+		// 全部群都按豁免规则跳过（用户白名单 / 主群豁免）。绝不能报「D1 黑名单已生效」——
+		// 白名单场景下 D1 里根本没有这个人，那句话会把主人引到完全错误的方向。
+		lines.push(`ℹ️ <b>Telegram 群封禁/预封：${skippedCount} 个群按豁免规则跳过，未执行任何封禁</b>`);
+	} else if (okCount === attempted) {
+		lines.push(`✅ <b>Telegram 群封禁/预封成功 ${okCount}/${attempted}</b>`);
 	} else if (okCount === 0) {
-		lines.push(`⚠️ <b>D1 黑名单已生效；Telegram 群封禁/预封成功 0/${total}</b>`);
+		lines.push(`⚠️ <b>D1 黑名单已生效；Telegram 群封禁/预封成功 0/${attempted}</b>`);
 	} else {
-		lines.push(`✅ <b>Telegram 群封禁/预封成功 ${okCount}/${total}</b>（${failCount} 个失败）`);
+		lines.push(`✅ <b>Telegram 群封禁/预封成功 ${okCount}/${attempted}</b>（${failCount} 个失败）`);
+	}
+	if (skippedCount > 0 && attempted > 0) {
+		lines.push(`ℹ️ 另有 ${skippedCount} 个群按豁免规则跳过（未计入分母）。`);
 	}
 	if (banResults.some((r) => r.ok && r.memberProbe?.state === 'not_in_group')) {
 		lines.push('ℹ️ 目标不在群内时，成功表示已加入该群封禁列表（预封），不是从群里踢出了在线成员。');
 	}
 	if (lookupFailCount > 0) {
 		lines.push('ℹ️ Telegram 无法识别 TGID 不代表 D1 黑名单失败；后续进群/发言仍会按 D1 黑名单拦截。');
-	} else if (okCount === 0 && permissionFailCount === total) {
+	} else if (okCount === 0 && attempted > 0 && permissionFailCount === attempted) {
 		lines.push('ℹ️ 全部配置群都因权限或管理员身份失败，请重点检查 bot 的封禁权限和目标是否为管理员。');
 	}
 
@@ -1854,13 +1892,14 @@ async function renderBanResultsDetail(banResults, chatInfoCache = null, options 
 
 // 简短版（用于群内闪屏，不能太长）
 function renderBanResults(banResults) {
-	const { okCount, total, lookupFailCount, permissionFailCount } = getBanResultStats(banResults);
+	const { okCount, total, skippedCount, attempted, lookupFailCount, permissionFailCount } = getBanResultStats(banResults);
 	if (total === 0) return 'ℹ️ 未配置 GROUP_ID，未执行 Telegram 群封禁';
-	if (okCount === total) return `✅ Telegram封禁/预封成功 ${okCount}/${total} 个配置群`;
-	if (okCount === 0 && lookupFailCount === total) return '⚠️ D1已生效，Telegram暂无法识别TGID';
-	if (okCount === 0 && permissionFailCount === total) return `⚠️ Telegram封禁失败 0/${total}（检查bot封禁权限）`;
-	if (okCount === 0) return `⚠️ Telegram封禁/预封失败 0/${total}`;
-	return `✅ Telegram封禁/预封成功 ${okCount}/${total} 个配置群`;
+	if (attempted === 0) return `ℹ️ ${skippedCount} 个配置群按豁免规则跳过，未执行封禁`;
+	if (okCount === attempted) return `✅ Telegram封禁/预封成功 ${okCount}/${attempted} 个配置群`;
+	if (okCount === 0 && lookupFailCount === attempted) return '⚠️ D1已生效，Telegram暂无法识别TGID';
+	if (okCount === 0 && permissionFailCount === attempted) return `⚠️ Telegram封禁失败 0/${attempted}（检查bot封禁权限）`;
+	if (okCount === 0) return `⚠️ Telegram封禁/预封失败 0/${attempted}`;
+	return `✅ Telegram封禁/预封成功 ${okCount}/${attempted} 个配置群`;
 }
 
 // 渲染单用户全群 Telegram 解封结果(详细版)
@@ -2305,8 +2344,22 @@ function chunkBatchItems(items, size = D1_BATCH_MUTATION_SIZE) {
 
 // 批量添加：每 20 个 TGID 一条多行 SQL；RETURNING 精确区分新增与已存在。
 async function addManyToBlacklist(ids, env, options = {}) {
-	const results = { success: [], exists: [], failed: [] };
-	const uniqueIds = normalizeBatchMutationIds(ids);
+	// 【白名单条目单独一桶，绝不能放进 failed】
+	// performBulkJobD1Mutation 的判断是 `if (!lastResults.failed.length) return`，
+	// 只要 failed 非空就重试到上限、然后 throw「批量 D1 操作连续失败」并【停住任务游标】。
+	// 白名单拒绝是确定性结果，重试一万次也一样 —— 放进 failed 会把整批任务卡死。
+	// 所以单开 whitelisted 桶：它既不参与 success/exists（不会被处置），也不参与重试。
+	const results = { success: [], exists: [], failed: [], whitelisted: [] };
+	// 【白名单高于黑名单】这是【第二条】写黑名单的路（第一条是 addToBlacklistCore）。
+	// 只守 addToBlacklistCore 是不够的：批量任务（performBulkJobD1Mutation）与连带清扫
+	// （findLinkedSpamTargets → createBulkJob）都走这里，白名单用户会从这条缝里被写进 D1，
+	// 然后 /check 显示「在黑名单中」、/banlist 能查到他 —— 与白名单语义直接矛盾。
+	// 所以闸门必须同时下沉到这一层：白名单 ID 在进 chunk 之前就被摘掉。
+	const allIds = normalizeBatchMutationIds(ids);
+	const uniqueIds = allIds.filter((id) => !isAdUserWhitelisted(id));
+	for (const id of allIds) {
+		if (isAdUserWhitelisted(id)) results.whitelisted.push(id);
+	}
 	if (!env.DB) {
 		results.failed.push(...uniqueIds.map((id) => ({ id, msg: '❌ 未绑定 D1 存储空间' })));
 		return results;
@@ -2369,7 +2422,9 @@ async function checkManyUnbanEligibility(ids, env, options = {}) {
 				.all();
 			const blocked = new Set((response?.results || []).map((row) => String(row.id)));
 			for (const id of chunk) {
-				if (blocked.has(id)) results.blacklisted.push(id);
+				// 【白名单高于黑名单】白名单用户视为可解封。否则管理员也解不掉他 ——
+				// 白名单就变成「不再封」却「解不开」的半成品。
+				if (blocked.has(id) && !isAdUserWhitelisted(id)) results.blacklisted.push(id);
 				else results.eligible.push(id);
 			}
 		} catch (error) {
@@ -2703,8 +2758,13 @@ function createBulkJobPayload(action, ids, invalid, note, message, options = {})
 			added: 0,
 			exists: 0,
 			addFailed: 0,
+			// 白名单拒绝写入的条数（见 performBulkJobD1Mutation 的 addWhitelisted）。
+			addWhitelisted: 0,
 			kickOk: 0,
 			kickFailed: 0,
+			// 白名单豁免导致的跳过。单独一项而不是并进 kickFailed ——
+			// 并进去会让主人看到「群封禁失败 N」，而真相是有意不封（见 processBulkJobOperationSlice）。
+			kickSkipped: 0,
 			// 同款连带专用统计（普通 /ban /spam 批量恒为 0，只在 deleteTargets 存在时展示）。
 			linkedMsgDeleted: 0,
 			linkedMsgDeleteFailed: 0,
@@ -2856,6 +2916,15 @@ function formatBulkJobDetail(job, title = '📦 <b>批量任务状态</b>') {
 			`群封禁成功:${job.stats?.kickOk || 0}`,
 			`群封禁失败:${job.stats?.kickFailed || 0}`
 		);
+		// 白名单拒绝的条数只在非 0 时出现，否则每张回执都多一行噪声。
+		if (Number(job.stats?.addWhitelisted || 0) > 0) {
+			lines.push(`加黑跳过（用户白名单）:${job.stats.addWhitelisted}`);
+		}
+		// 白名单豁免的跳过单列一行，且只在非 0 时出现 ——
+		// 不列的话「成功 + 失败」对不上任务总数，主人会以为漏统计了。
+		if (Number(job.stats?.kickSkipped || 0) > 0) {
+			lines.push(`群封禁跳过（用户白名单）:${job.stats.kickSkipped}`);
+		}
 		// 同款连带才有这两项；普通 /ban /spam 批量没有 deleteTargets，不显示以免空行干扰。
 		if (job.deleteTargets) {
 			lines.push(
@@ -3022,6 +3091,11 @@ async function prepareBulkJobActiveBatch(job, env) {
 	} else {
 		incrementBulkJobStat(job, 'added', results.success.length);
 		incrementBulkJobStat(job, 'exists', results.exists.length);
+		// 【白名单被拒的 ID 必须单列】它们既不在 success 也不在 exists，更不该混进 failed
+		//（见 addManyToBlacklist 的注释：进 failed 会让重试逻辑把任务卡死）。
+		// 不单列的话回执里「加黑成功 + 已存在 + 加黑失败」对不上「目标用户数」，主人会以为漏统计。
+		const whitelistedCount = Array.isArray(results.whitelisted) ? results.whitelisted.length : 0;
+		if (whitelistedCount) incrementBulkJobStat(job, 'addWhitelisted', whitelistedCount);
 	}
 
 	job.activeBatch = {
@@ -3083,6 +3157,11 @@ async function processBulkJobOperationSlice(job, env) {
 		const result = await banUserFromGroup(task.groupId, task.userId);
 		if (result.ok) {
 			incrementBulkJobStat(job, 'kickOk');
+		} else if (result.skipped) {
+			// 【白名单高于黑名单】跳过不是失败：不计 kickFailed、不写失败明细。
+			// 否则任务回执里会留下一条【永久】的「封禁失败」记录（落 D1，不是瞬时日志），
+			// 主人会以为 Telegram 接口出问题，反复重试一个本来就有意不做的动作。
+			incrementBulkJobStat(job, 'kickSkipped');
 		} else {
 			incrementBulkJobStat(job, 'kickFailed');
 			pushBulkJobFailure(job, {
@@ -3098,7 +3177,11 @@ async function processBulkJobOperationSlice(job, env) {
 		// 但删消息权限是独立的 —— 两者不该互相拖累，能删一条是一条。
 		// 与 revoke_messages 的关系见 createBulkJobPayload 里 deleteTargets 的注释：
 		// 账号冻结 / 已退群时 revoke 完全无效，这条路才是真正兜住消息删除的那一条。
-		const midList = job.deleteTargets?.[String(task.userId)]?.[String(task.groupId)];
+		// 【白名单例外】上面「不看封禁是否成功」的口径对白名单用户不成立：他要的是
+		// 连消息都不被删（完全豁免），所以这里必须显式跳过。
+		const midList = isAdUserWhitelisted(task.userId)
+			? null
+			: job.deleteTargets?.[String(task.userId)]?.[String(task.groupId)];
 		if (Array.isArray(midList) && midList.length) {
 			for (const mid of midList) {
 				try {
@@ -4816,6 +4899,7 @@ const BOT_MODERATION_LOG_LABELS = {
 	'new-member-admin-status': '已查询新入群机器人在群里的身份',
 	'skip:new-member-admin-status-check-failed': '跳过：无法确认新入群机器人是否为管理员，为避免误伤不处理',
 	'skip:new-member-admin-bot': '跳过：新入群机器人是群管理员',
+	'skip:new-bot-whitelisted': '跳过：新入群机器人在用户白名单中（高于黑名单），不禁言',
 	'action:ban-blacklisted-new-bot:start': '开始处理：新入群机器人已在黑名单，踢出',
 	'action:ban-blacklisted-new-bot:result': '处理结果：踢出已拉黑的新入群机器人',
 	'action:ban-blacklisted-new-bot:failed': '处理失败：踢出已拉黑的新入群机器人时异常',
@@ -4915,7 +4999,8 @@ async function handleNewChatMemberBots(message, env) {
 		// 就悄悄降级成禁言。真踢不动时 Telegram 会拒绝，下面的日志会记下失败原因，
 		// 主人能看到，而不是被无声吞掉。
 		const newBotBlacklist = await checkBlacklist(member.id, env);
-		if (newBotBlacklist.isBlacklisted) {
+		// 【白名单高于黑名单】白名单里的 bot 一律放过，不进任何处置。
+		if (newBotBlacklist.isBlacklisted && !isAdUserWhitelisted(member.id)) {
 			try {
 				logBotModeration('action:ban-blacklisted-new-bot:start', logInfo);
 				const banResult = await banUserFromGroup(chat.id, member.id);
@@ -4958,8 +5043,15 @@ async function handleNewChatMemberBots(message, env) {
 
 		try {
 			logBotModeration('action:mute-new-bot:start', logInfo);
-			await muteChatMember(chat.id, member.id);
-			logBotModeration('action:mute-new-bot:success', logInfo);
+			const muteResult = await muteChatMember(chat.id, member.id);
+			// 【白名单高于黑名单】跳过 ≠ 成功。muteChatMember 对白名单用户返回 {skipped:true}
+			// 且刻意不抛异常（抛了会被下面 catch 记成「失败」），所以这里必须自己分流 ——
+			// 否则日志会写「已禁言新入群的非管理员机器人」，而实际上什么都没做。
+			if (muteResult?.skipped) {
+				logBotModeration('skip:new-bot-whitelisted', logInfo);
+			} else {
+				logBotModeration('action:mute-new-bot:success', logInfo);
+			}
 		} catch (error) {
 			logBotModeration('action:mute-new-bot:failed', {
 				...logInfo,
@@ -5027,6 +5119,8 @@ async function handleChatMemberUpdate(chatMember, env) {
 	// 但这条路径只在 bot 入群时触发，频率可以忽略。
 	if (targetUser.is_bot) {
 		const botBlacklistCheck = await checkBlacklist(targetIdStr, env);
+		// 【白名单高于黑名单】白名单里的 bot 直接放过，不走下面的复入群拦截。
+		if (isAdUserWhitelisted(targetIdStr)) return;
 		if (!botBlacklistCheck.isBlacklisted) return;
 	}
 
@@ -5042,7 +5136,8 @@ async function handleChatMemberUpdate(chatMember, env) {
 		oldStatusEarly !== 'creator';
 	if (enteredGroup) {
 		const blacklistCheck = await checkBlacklist(targetIdStr, env);
-		if (blacklistCheck.isBlacklisted) {
+		// 【白名单高于黑名单】白名单用户复入群一律放行，不进拦截。
+		if (blacklistCheck.isBlacklisted && !isAdUserWhitelisted(targetIdStr)) {
 			// 【主群豁免】主群是黑名单用户唯一还能联系到主人的通道（见 isSelfUnbanContactGroup）。
 			// 自动封禁已经不再碰主群，如果这里再把「想回主群求助」的人踢回去，通道等于又焊死了 ——
 			// 而他之所以是黑名单用户，恰恰是因为自动判定（可能误判）把他全群封禁了。
@@ -5120,7 +5215,9 @@ async function handleChatMemberUpdate(chatMember, env) {
 		// 管理层必须通过 /unban TGID 先移除 D1 再解封；该命令路径不会进入这里的封回逻辑。
 		// 普通管理员直接使用 Telegram 原生解封时，D1 仍在，因此继续由独立保护链封回。
 		const blacklistCheck = await checkBlacklist(targetIdStr, env);
-		if (blacklistCheck.isBlacklisted) {
+		// 【白名单高于黑名单】白名单用户被管理员手动解封后不再封回 ——
+		// 否则管理员永远解不掉他，白名单也就形同虚设。
+		if (blacklistCheck.isBlacklisted && !isAdUserWhitelisted(targetIdStr)) {
 			// 仍在 D1 黑名单 → 撤销本次群内手动解封，立即封回，绝不删除黑名单记录
 			const banResult = await banUserFromGroup(chat.id, targetIdStr);
 			console.log('[chat_member] 拦截群内手动解封(D1黑名单保护):', JSON.stringify({ ...logCommon, 封回结果: banResult.ok ? '成功' : `失败:${banResult.error}` }));
@@ -5562,6 +5659,9 @@ async function findLinkedSpamTargets(env, textKey, excludeUserId) {
 		for (const row of results || []) {
 			const uid = String(row.from_id || '');
 			if (!uid || uid === String(excludeUserId)) continue;
+			// 【白名单高于黑名单】白名单用户不进连带名单 —— 连带是「删消息 + 加黑 + 全群封禁」
+			// 三件套，白名单用户一件都不该挨。在这里就摘掉，比在每个下游动作前补判断更可靠。
+			if (isAdUserWhitelisted(uid)) continue;
 			// 二次比对兜住哈希碰撞：FNV-1a 是 32 位，碰撞概率虽低但连带是批量不可逆操作，
 			// 代价不对称 —— 有 text_norm 就没有理由只信哈希。
 			if (String(row.text_norm || '') !== textKey.norm) continue;
@@ -5587,6 +5687,20 @@ async function findLinkedSpamTargets(env, textKey, excludeUserId) {
 async function enforceLinkedSpamTargets(env, targets, options = {}) {
 	const done = [];
 	for (const target of targets) {
+		// 【白名单高于黑名单】白名单用户整条目标跳过：不删消息、不加黑、不封禁。
+		// 这一层必须单独放行 —— 下面删消息走的是 deleteMessage，而 deleteMessage 的签名里
+		// 没有 userId，兜底层根本无从判断「这条消息是不是白名单用户发的」。
+		// 换句话说：踢人侧靠 banUserFromAllGroups 兜底能拦住，删消息侧只能靠每个调用点自查。
+		if (isAdUserWhitelisted(target.userId)) {
+			done.push({
+				userId: target.userId,
+				deleted: 0,
+				blacklistCode: 'WHITELISTED',
+				banSummary: '0/' + GROUP_IDS.length,
+				whitelisted: true
+			});
+			continue;
+		}
 		let deleted = 0;
 		for (const item of target.messageIds) {
 			const r = await deleteMessage(item.chatId, item.mid);
@@ -5654,11 +5768,24 @@ async function notifyLinkedSpamResult(env, info) {
 		''
 	];
 	if (done.length) {
-		lines.push('<b>已处置 ' + done.length + ' 个账号</b>');
-		for (const d of done) {
-			lines.push('· <code>' + escapeHtml(d.userId) + '</code>　黑名单:'
-				+ (d.blacklistCode === 'ADDED' ? '已加入' : d.blacklistCode === 'EXISTS' ? '此前已在' : d.blacklistCode)
-				+ '　封禁:' + d.banSummary + '　删消息:' + d.deleted + ' 条');
+		// 【白名单条目不能算进「已处置」】它们的 blacklistCode 是 WHITELISTED、
+		// banSummary 是 0/N、deleted 是 0 —— 混在「已处置 N 个账号」里既谎报数量，
+		// 又会把原文码直接吐给主人看。分开列，并给一句人话解释。
+		const actionable = done.filter((d) => !d.whitelisted);
+		const skipped = done.filter((d) => d.whitelisted);
+		if (actionable.length) {
+			lines.push('<b>已处置 ' + actionable.length + ' 个账号</b>');
+			for (const d of actionable) {
+				lines.push('· <code>' + escapeHtml(d.userId) + '</code>　黑名单:'
+					+ (d.blacklistCode === 'ADDED' ? '已加入' : d.blacklistCode === 'EXISTS' ? '此前已在' : d.blacklistCode)
+					+ '　封禁:' + d.banSummary + '　删消息:' + d.deleted + ' 条');
+			}
+		}
+		if (skipped.length) {
+			lines.push('<b>已跳过 ' + skipped.length + ' 个账号（用户白名单）</b>');
+			for (const d of skipped) {
+				lines.push('· <code>' + escapeHtml(d.userId) + '</code>　⏭️ 白名单豁免：未加黑、未封禁、未删消息');
+			}
 		}
 	}
 	if (info.jobId) {
@@ -6137,9 +6264,13 @@ function buildAdVoteMessageText(state) {
 	const creator = formatAdVoteUser(state.creatorUserSnapshot, state.creatorUserId);
 	let status = '<i>进行中，1 小时后截止。</i>';
 	if (state.finalized && state.result === 'approved') {
-		status = state.enforcementComplete
-			? '💀 <b>举报通过，已加入 D1 全局黑名单、执行全部 GROUP_ID 群封禁，并请求撤回其各群全部历史发言。</b>'
-			: '💀 <b>举报通过，正在执行 D1 加黑、全群封禁与历史发言撤回。</b>';
+		// 【白名单豁免】这类「通过」没有执行任何处置，绝不能显示成已封禁 ——
+		// 投票卡是全群可见的，谎报会让群成员以为人已经被封了。
+		status = state.whitelistSkipped
+			? 'ℹ️ <b>举报通过，但目标在用户白名单中，未执行任何处置。</b>'
+			: (state.enforcementComplete
+				? '💀 <b>举报通过，已加入 D1 全局黑名单、执行全部 GROUP_ID 群封禁，并请求撤回其各群全部历史发言。</b>'
+				: '💀 <b>举报通过，正在执行 D1 加黑、全群封禁与历史发言撤回。</b>');
 	} else if (state.finalized && state.result === 'rejected') {
 		status = '❎ <b>投票已被否决，目标未处理。</b>';
 	} else if (state.finalized && state.result === 'expired') {
@@ -6586,13 +6717,19 @@ async function notifyOwnerAdVoteApproved(state, blacklistResult, banResults, del
 	];
 	if (blacklistResult?.success) lines.push('✅ 已写入 D1 全局黑名单，原因:ad_vote');
 	else if (blacklistResult?.code === 'EXISTS') lines.push('ℹ️ 目标已在 D1 黑名单，本次仍继续执行全群封禁');
+	else if (blacklistResult?.code === 'WHITELISTED') lines.push('ℹ️ 目标在用户白名单中：本次未加黑、未封禁、未删消息（白名单高于黑名单）');
 	else lines.push('⚠️ D1 写入失败:' + escapeHtml(blacklistResult?.message || '未知错误'));
 	lines.push(await renderBanResultsDetail(banResults || [], null, {
 		userId: state.targetUserId,
 		retryCommand: '/ban 或 /spam',
 	}));
 	lines.push('🧹 历史发言:全部 GROUP_ID 封禁请求均启用 revoke_messages=true；封禁成功的群由 Telegram 撤回该用户全部历史发言。');
-	if (state.reportedMessageId) {
+	if (state.whitelistSkipped) {
+		// 【先判豁免】白名单分支根本没调 deleteMessage，但 reportedMessageId 仍非空
+		//（引用举报的流程里它一定非空），传进来的 deleteResult 是 null —— 直接往下走会渲染成
+		//「删除失败:未知错误」，与上面那句「未加黑、未封禁、未删消息」自相矛盾。
+		lines.push('🧹 被举报消息:按用户白名单豁免，未删除');
+	} else if (state.reportedMessageId) {
 		const outcome = classifyAdDeleteOutcome(deleteResult);
 		lines.push('🧹 被举报消息:' + escapeHtml(outcome.summary));
 		if (outcome.detail) lines.push('   ' + escapeHtml(outcome.detail));
@@ -6656,6 +6793,27 @@ async function notifyOwnerAdVoteClosed(state) {
 
 async function enforceApprovedAdVote(env, state) {
 	if (state.enforcementComplete) return;
+	// 【白名单高于黑名单】白名单用户不能被 /ad 投票处置。
+	// 投票是群成员发起的，白名单是主人设的 —— 主人的意志优先。
+	// 这条链路（加黑 + 删被举报消息 + 清扫同款历史 + 全群封禁）此前完全没有白名单检查，
+	// 是本功能最隐蔽的一处漏点：白名单用户照样会被删消息，只是踢不动而已。
+	if (isAdUserWhitelisted(state.targetUserId)) {
+		state.enforcementComplete = true;
+		state.enforcedAt = new Date().toISOString();
+		state.deleteStatus = 'whitelisted';
+		state.whitelistSkipped = true;
+		await saveFinalizedAdVoteDetails(env, state);
+		await editAdVoteMessage(state.chatId, state.messageId, state);
+		await notifyOwnerAdVoteApproved(
+			state,
+			{ success: false, code: 'WHITELISTED', message: '⚠️ 该用户在用户白名单中' },
+			// 传【每群一条 skipped】而不是空数组：空数组会让渲染层走 total===0 分支，
+			// 显示「未配置 GROUP_ID」——把「有意豁免」说成「配置缺失」，是另一种误导。
+			GROUP_IDS.map((groupId) => ({ groupId, userId: String(state.targetUserId), ok: false, skipped: true, error: 'whitelisted' })),
+			null
+		);
+		return;
+	}
 	const blacklistResult = await addToBlacklist(state.targetUserId, env, {
 		reason: 'ad_vote',
 		by: state.creatorUserId,
@@ -7407,7 +7565,9 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		!(await isSelfBotSender(message.from))
 	) {
 		const blacklistCheck = await checkBlacklist(userId, env);
-		if (blacklistCheck.isBlacklisted) {
+		// 【白名单高于黑名单】白名单用户发言一律放行：不删消息、不踢、不升级。
+		// 这是本功能最核心的一处 —— 主人加白名单就是为了让这个人「正常说话」。
+		if (blacklistCheck.isBlacklisted && !isAdUserWhitelisted(userId)) {
 			// 双保险：管理员豁免，避免误加黑导致管理员被踢
 			const isAdmin = await checkIfUserIsAdmin(userId);
 			if (!isAdmin) {
@@ -7556,6 +7716,25 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const argMatch = text.trim().match(/^\/spam(?:@[^\s]+)?\s*([\s\S]*)/i);
 		const rawArg = argMatch ? argMatch[1].trim() : '';
 		const repliedMsg = message.reply_to_message;
+
+		// 【白名单高于黑名单】白名单用户不能被 /spam：给主人一个明确回执。
+		// 底层的 addToBlacklistCore 与 banUserFromAllGroups 也会各自拒掉，但那条路径
+		// 的回执文案说的是「添加失败」之类的话，容易让人以为只是写库出问题，而不是
+		// 「这个人被白名单保护着」。所以这里提前拦一次，把原因说清楚。
+		{
+			const spamTargets = [];
+			if (repliedMsg?.from?.id) spamTargets.push(String(repliedMsg.from.id));
+			if (!repliedMsg && rawArg) {
+				try { spamTargets.push(...(parseTargetIdsAndNote(rawArg).valid || []).map(String)); } catch { /* 解析失败交给后面的正常分支报错 */ }
+			}
+			const spamBlocked = spamTargets.filter((id) => id && isAdUserWhitelisted(id));
+			if (spamBlocked.length) {
+				await sendModerationCommandFeedback(message, ctx, {
+					flashText: `⚠️ ${spamBlocked.join(', ')} 在用户白名单中，已拒绝加黑。需要先 /del_whitelist 才能封禁。`
+				});
+				return;
+			}
+		}
 
 		if (rawArg && !repliedMsg) {
 			// ===== TGID 模式：直接通过 ID 封禁 =====
@@ -8218,6 +8397,14 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			'/clearsamples　清空全部 AI 样本，需二次确认令牌',
 			'/whitelist [list|add|del] [域名]　维护域名白名单，命中即豁免',
 			'/exempt [list|add|del] [关键词]　维护关键词豁免，命中且无强交易动词时减分',
+			'',
+			'<b>━━ 用户白名单（高于黑名单，仅私聊）━━</b>',
+			'名单里的用户在【所有】审核路径上都不被处置：不删消息、不踢、复入群不拦、入群不处置、广告检测不判。',
+			'加白名单时会同时解除他的全群封禁并清掉 D1 黑名单记录（原封禁原因留档）。',
+			'/add_whitelist 用户ID [备注]　加入用户白名单，也可回复某人的消息直接发本命令',
+			'/del_whitelist 用户ID　移出白名单（移除后立刻恢复普通待遇）',
+			'/whitelist_users　列出当前白名单',
+			'（注意：上面的 /whitelist 是<b>域名</b>白名单，管链接域名；本节是<b>用户</b>白名单，管人）',
 		];
 		await sendTelegramMessageChunks(chatId, helpLines.join('\n'));
 		return;
@@ -8489,6 +8676,19 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 		const argMatch = text.trim().match(/^\/ban(?:@[^\s]+)?\s*([\s\S]*)/i);
 		const rawArg = argMatch ? argMatch[1] : '';
 		const { valid, invalid, note } = parseTargetIdsAndNote(rawArg);
+
+		// 【白名单高于黑名单】白名单用户不能被 /ban：明确拒绝并说明原因。
+		// 底层 addToBlacklistCore 与 banUserFromAllGroups 也会各自拒掉（双保险），
+		// 但这里提前说清楚，主人不会误以为「只是写库失败、其实人已经被踢了」。
+		{
+			const banBlocked = valid.filter((id) => isAdUserWhitelisted(id));
+			if (banBlocked.length) {
+				await sendModerationCommandFeedback(message, ctx, {
+					flashText: `⚠️ ${banBlocked.join(', ')} 在用户白名单中，已拒绝封禁。需要先 /del_whitelist。`
+				});
+				return;
+			}
+		}
 
 		if (valid.length === 0 && invalid.length === 0) {
 			const usageText = `❌ 使用方法：<code>/ban 用户ID</code> 或 <code>/ban 123,456,789</code>（最多 ${BATCH_LIMIT} 个）`;
@@ -9145,6 +9345,11 @@ async function restrictUserInGroup(chatId, userId, options = {}) {
 }
 
 async function muteChatMember(chatId, userId) {
+	// 【白名单高于黑名单·兜底】白名单里的 bot 入群不被禁言。
+	// 这里【不能抛异常】：跳过不是失败，抛出去会被 handleNewChatMemberBots 记成「处理失败」。
+	if (isAdUserWhitelisted(userId)) {
+		return { ok: false, skipped: true, whitelisted: true };
+	}
 	const r = await restrictUserInGroup(chatId, userId);
 	// 保持原有的「失败即抛」契约：调用方（新机器人入群静音）是按异常处理失败的。
 	if (!r.ok) {
@@ -9176,6 +9381,10 @@ function getTelegramMutationRetryDelayMs(failure) {
 }
 
 async function banUserFromGroup(chatId, userId, options = {}) {
+	// 【白名单高于黑名单·兜底】白名单用户永不被封。
+	if (isAdUserWhitelisted(userId)) {
+		return { ok: false, skipped: true, whitelisted: true, error: 'whitelisted' };
+	}
 	const url = `https://api.telegram.org/bot${BOT_TOKEN}/banChatMember`;
 	const body = {
 		chat_id: chatId,
@@ -10313,6 +10522,144 @@ async function refreshAdAllowlist(env) {
 	if (set instanceof Set) AD_ALLOWLIST_DYNAMIC = set;
 }
 
+// ===== 用户白名单：高于黑名单 =====
+// 主人 2026-09-25 要求「加一个高于黑名单的白名单，使用 /add_whitelist 添加」。
+// 语义（主人选定「完全豁免」）：名单里的用户在【所有】审核路径上都不被处置 ——
+// 不删消息、不踢、复入群不拦、入群不处置、广告检测不判。
+//
+// 【为什么是「每请求重建的 Set」而不是每次查 D1】
+// 拦截点散在十几处（发言拦截 / 复入群 / 手动解封回封 / bot 入群 / 广告三入口 /
+// 解封闸门 / 升级函数…），每处一次 D1 查询会把子请求预算吃光；而白名单是【极小集合】，
+// 全量读进内存基本免费。与 refreshAdAllowlist 同一范式。
+//
+// 【为什么不用 checkBlacklist 一处兜住】
+// checkBlacklist 只回答「在不在黑名单里」，它被 11 处调用，其中 /check 展示、/banlist
+// 查询这类【只读】调用必须拿到真话。把白名单塞进 checkBlacklist 会让「在黑名单中」
+// 这个事实被悄悄改写。所以白名单是独立的运行时豁免，逐个动作点放行。
+let AD_USER_WHITELIST = new Set();
+const AD_USER_WHITELIST_CACHE = new WeakMap();
+// 【为什么 TTL 是 0，而不是像放行库那样 60 秒】
+// Cloudflare Workers 天然多 isolate：主人发出的 /add_whitelist 只让【处理该请求的那个
+// isolate】的缓存失效，别的 isolate 仍拿着 60 秒内的旧集合。于是会出现最糟的一幕 ——
+// 主人刚把人加进白名单，同一个人下一秒在另一个 isolate 上被删消息 + 踢出群。
+// 白名单是【极小集合】（通常个位数到几十条），每请求一次 D1 读的成本可以忽略，
+// 所以这里不做时间缓存：TTL=0 表示每次请求都重新读，只保留「同一请求内并发去重」
+// （loadAdCachedValue 的 in-flight promise 合并仍然有效）。
+const AD_USER_WHITELIST_CACHE_TTL_MS = 0;
+
+async function loadAdUserWhitelist(env) {
+	if (!env?.DB) return null;
+	try {
+		return await loadAdCachedValue(AD_USER_WHITELIST_CACHE, env.DB, AD_USER_WHITELIST_CACHE_TTL_MS, async () => {
+			if (!(await adDetectionReady(env))) return null;
+			const { results } = await env.DB.prepare('SELECT user_id FROM ad_user_whitelist').all();
+			const set = new Set();
+			for (const row of results || []) {
+				const id = String(row?.user_id || '').trim();
+				if (id) set.add(id);
+			}
+			return set;
+		});
+	} catch (error) {
+		console.error('[广告检测] 读取用户白名单失败:', error);
+		return null;
+	}
+}
+
+// 每请求入口调用一次。读失败时【保留上一次的值】而不是清空 ——
+// 与 refreshAdAllowlist 同理：清空等于 D1 抖一下就把白名单全忘掉，
+// 名单里的人立刻被再封一次，而这正是本功能要消灭的现象。
+async function refreshAdUserWhitelist(env) {
+	const set = await loadAdUserWhitelist(env);
+	if (set instanceof Set) AD_USER_WHITELIST = set;
+}
+
+// 同步判定，供十几处拦截点零成本调用（纯内存 Set 查找，不碰 D1）。
+function isAdUserWhitelisted(userId) {
+	const id = String(userId ?? '').trim();
+	if (!id) return false;
+	return AD_USER_WHITELIST.has(id);
+}
+
+function invalidateAdUserWhitelist(env) {
+	AD_USER_WHITELIST_CACHE.delete(env?.DB);
+}
+
+// 读一条白名单记录（/add_whitelist 判断是否已存在、以及回执里回显备注用）。
+async function readAdUserWhitelistEntry(env, userId) {
+	const id = String(userId ?? '').trim();
+	if (!env?.DB || !id) return null;
+	try {
+		if (!(await adDetectionReady(env))) return null;
+		return await env.DB.prepare('SELECT user_id, note, previous_blacklist_reason, added_by, created_at FROM ad_user_whitelist WHERE user_id = ?').bind(id).first();
+	} catch (error) {
+		console.error('[广告检测] 读取白名单记录失败:', error);
+		return null;
+	}
+}
+
+// 加入白名单。只写表 + 失效缓存，【不】在这里解封 ——
+// 解封是调用方（命令层）的事，因为「加白名单」与「顺带解封」是两件事，
+// 底层函数保持单一职责，测试也好写。
+async function addAdUserWhitelist(env, userId, options = {}) {
+	const id = String(userId ?? '').trim();
+	if (!/^\d+$/.test(id)) return { ok: false, reason: 'invalid' };
+	if (!env?.DB) return { ok: false, reason: 'unavailable' };
+	try {
+		if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+		const existing = await readAdUserWhitelistEntry(env, id);
+		// 留档：加白名单会删掉黑名单行（见命令层），删之前把原因存下来。
+		const blacklistEntry = await readD1BlacklistEntry(env, id).catch(() => null);
+		await env.DB.prepare(
+			'INSERT INTO ad_user_whitelist (user_id, note, previous_blacklist_reason, added_by, created_at) VALUES (?, ?, ?, ?, ?) '
+			+ 'ON CONFLICT(user_id) DO UPDATE SET note = excluded.note, added_by = excluded.added_by'
+		).bind(
+			id,
+			String(options.note || existing?.note || ''),
+			String(blacklistEntry?.reason || existing?.previous_blacklist_reason || ''),
+			String(options.addedBy || ''),
+			Math.floor(Date.now() / 1000)
+		).run();
+		invalidateAdUserWhitelist(env);
+		await refreshAdUserWhitelist(env);
+		return { ok: true, userId: id, existed: Boolean(existing), blacklistReason: String(blacklistEntry?.reason || '') };
+	} catch (error) {
+		console.error('[广告检测] 写入白名单失败:', error);
+		return { ok: false, reason: 'error', error };
+	}
+}
+
+async function removeAdUserWhitelist(env, userId) {
+	const id = String(userId ?? '').trim();
+	if (!/^\d+$/.test(id)) return { ok: false, reason: 'invalid' };
+	if (!env?.DB) return { ok: false, reason: 'unavailable' };
+	try {
+		if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable' };
+		const result = await env.DB.prepare('DELETE FROM ad_user_whitelist WHERE user_id = ?').bind(id).run();
+		const removed = Number(result?.meta?.changes ?? result?.changes ?? 0) > 0;
+		invalidateAdUserWhitelist(env);
+		await refreshAdUserWhitelist(env);
+		return { ok: true, userId: id, removed };
+	} catch (error) {
+		console.error('[广告检测] 删除白名单失败:', error);
+		return { ok: false, reason: 'error', error };
+	}
+}
+
+async function listAdUserWhitelist(env, limit = 50) {
+	if (!env?.DB) return { ok: false, reason: 'unavailable', rows: [] };
+	try {
+		if (!(await adDetectionReady(env))) return { ok: false, reason: 'unavailable', rows: [] };
+		const { results } = await env.DB.prepare(
+			'SELECT user_id, note, previous_blacklist_reason, added_by, created_at FROM ad_user_whitelist ORDER BY created_at DESC LIMIT ?'
+		).bind(limit).all();
+		return { ok: true, rows: results || [] };
+	} catch (error) {
+		console.error('[广告检测] 列出白名单失败:', error);
+		return { ok: false, reason: 'error', rows: [] };
+	}
+}
+
 // 检测链第 0 层：这份载荷里有哪些维度已被放行。
 // 未命中路径【零 D1 查询】—— 纯内存 Set 查找；只有真正命中才回写命中计数。
 // 返回 null 表示一个维度都没命中（绝大多数消息走这条，成本可忽略）。
@@ -10818,6 +11165,12 @@ async function ensureAdDetectionTables(env) {
 			// 长期 0 命中的就是可以删掉的残留，所以计数必须落库，不能只放内存。
 			await runD1SchemaStatement(env, 'ad_allowlist', 'CREATE TABLE IF NOT EXISTS ad_allowlist (id INTEGER PRIMARY KEY AUTOINCREMENT, allow_key TEXT NOT NULL UNIQUE, dimension TEXT NOT NULL, value TEXT NOT NULL, user_id TEXT, added_by TEXT, source TEXT, hit_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_hit_at INTEGER NOT NULL DEFAULT 0)');
 			await runD1SchemaStatement(env, 'idx_ad_allowlist_dimension', 'CREATE INDEX IF NOT EXISTS idx_ad_allowlist_dimension ON ad_allowlist (dimension)', { optional: true });
+
+			// 用户白名单（高于黑名单）。语义见 refreshAdUserWhitelist 上方说明。
+			// previous_blacklist_reason：/add_whitelist 会顺手删掉该号的黑名单行
+			// （否则 /check、/unban 仍显示「在黑名单中」，与白名单语义自相矛盾），
+			// 删之前把原因留档在这里，审计痕迹不丢。
+			await runD1SchemaStatement(env, 'ad_user_whitelist', 'CREATE TABLE IF NOT EXISTS ad_user_whitelist (user_id TEXT PRIMARY KEY, note TEXT, previous_blacklist_reason TEXT, added_by TEXT, created_at INTEGER NOT NULL)');
 
 			await runD1SchemaStatement(env, 'ad_pending_snapshots', 'CREATE TABLE IF NOT EXISTS ad_pending_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id TEXT NOT NULL, seq INTEGER NOT NULL, user_id TEXT NOT NULL, chat_id TEXT, score INTEGER NOT NULL DEFAULT 0, reasons TEXT, snapshot TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)');
 			await runD1SchemaStatement(env, 'idx_ad_pending_owner_seq', 'CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_pending_owner_seq ON ad_pending_snapshots (owner_id, seq)', { optional: true });
@@ -13709,6 +14062,13 @@ async function rescanAdMember(env, row, options = {}) {
 	const nowSeconds = Math.floor(Date.now() / 1000);
 
 	// 主人/副主人/超管永不判定，与消息路径一致。
+	// 【白名单高于黑名单】白名单用户不参与 cron 主动复扫。
+	// 这一轨【完全不查黑名单】（它只有 privileged/admin 两个豁免），
+	// 所以是白名单最容易被漏掉的一处：只改消息路径的话，名单里的人照样会被 cron 封一次。
+	if (isAdUserWhitelisted(userId)) {
+		await markAdBioChecked(env, userId, nowSeconds);
+		return { scanned: false, banned: false, reason: 'whitelisted' };
+	}
 	if (isPrivilegedManager(userId)) {
 		await markAdBioChecked(env, userId, nowSeconds);
 		return { scanned: false, banned: false, reason: 'privileged' };
@@ -14667,6 +15027,10 @@ async function deleteAdBanScope(env, userId) {
 // 只封一个群（当期触发群）。结构与 banUserFromAllGroups 的返回项完全一致，
 // 让两个函数的结果可以直接拼成同一个 banResults 数组交给既有渲染逻辑，避免另造一套文案。
 async function banUserFromSingleGroup(userId, chatId, options = {}) {
+	// 【白名单高于黑名单·兜底】白名单用户永不被封。
+	if (isAdUserWhitelisted(userId)) {
+		return [{ groupId: String(chatId), userId: String(userId), ok: false, skipped: true, whitelisted: true, error: 'whitelisted', memberProbe: null }];
+	}
 	const results = [];
 	const memberProbe = options.probeMembership
 		? await probeTargetMemberBeforeBan(chatId, userId)
@@ -14681,6 +15045,10 @@ async function banUserFromSingleGroup(userId, chatId, options = {}) {
 // 而 unbanChatMember 只解除封禁、并不会把人拉回群 —— 误判的代价是「这个人得自己重新进群」，
 // 对一个自动判定系统来说这个代价不对称。禁言则完全可逆：解除禁言，人一直在群里。
 async function muteUserFromSingleGroup(userId, chatId, options = {}) {
+	// 【白名单高于黑名单·兜底】白名单用户永不被禁言。
+	if (isAdUserWhitelisted(userId)) {
+		return [{ groupId: String(chatId), userId: String(userId), ok: false, skipped: true, whitelisted: true, error: 'whitelisted', memberProbe: null }];
+	}
 	const results = [];
 	const memberProbe = options.probeMembership
 		? await probeTargetMemberBeforeBan(chatId, userId)
@@ -14709,6 +15077,12 @@ async function muteUserFromSingleGroup(userId, chatId, options = {}) {
 //
 // options.excludeContactGroup —— 自动处置专用，跳过主群（见 isSelfUnbanContactGroup）。
 async function muteUserFromAllGroups(userId, options = {}) {
+	// 【白名单高于黑名单·兜底】白名单用户一个群都不禁言。
+	if (isAdUserWhitelisted(userId)) {
+		return GROUP_IDS.map((groupId) => ({
+			groupId, userId: String(userId), ok: false, skipped: true, whitelisted: true, error: 'whitelisted', memberProbe: null
+		}));
+	}
 	const results = [];
 	for (const groupId of GROUP_IDS) {
 		// 主群豁免排在成员探测之前：既然不打算处置它，就没必要为它多花一次 getChatMember。
@@ -14778,6 +15152,8 @@ async function unmuteUserFromAllGroups(userId) {
 //             ② 手工加黑的号虽然被台账门槛挡住，但那条拦截本身仍在跑，这里不能悬空。
 // 台账仍是升级的门槛（见下），手工 /ban 的号永远不会在这里被升级。
 async function maybeEscalateBlacklistedUser(message, env, userId, chatId) {
+	// 【白名单高于黑名单】白名单用户不参与全群升级。
+	if (isAdUserWhitelisted(userId)) return false;
 	if (AD_BAN_SCOPE_MODE !== AD_BAN_SCOPE_PROGRESSIVE) return false;
 	const uid = String(userId || '');
 	const cid = String(chatId || '');
@@ -14846,6 +15222,11 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 	const userId = String(input?.userId ?? '');
 	const chatId = input?.chatId != null ? String(input.chatId) : '';
 	if (!userId) return { banned: false, seq: null, reason: 'no_user' };
+
+	// 【白名单高于黑名单】防御性兜底。三个入口（detectAdOnMessage / screenAdJoinMember /
+	// rescanAdMember）各自已经有白名单豁免，这里是最后一道：将来新增调用点忘了加，
+	// 也不会把白名单用户判掉。进来即处置，所以必须拦在函数最前面。
+	if (isAdUserWhitelisted(userId)) return { banned: false, seq: null, reason: 'whitelisted' };
 
 	const noteParts = [
 		'广告自动判定',
@@ -15179,6 +15560,8 @@ async function enforceAdDetection(env, input, evaluation, options = {}) {
 async function screenAdJoinMember(env, member, options = {}) {
 	const userId = member?.id;
 	if (!userId || member?.is_bot) return 'skipped';			// bot 交给 handleNewChatMemberBots
+	// 【白名单高于黑名单】白名单用户不做入群资料筛查。
+	if (isAdUserWhitelisted(userId)) return 'skipped';
 	if (isPrivilegedManager(userId)) return 'skipped';			// 主人 / 副主人 / 超级管理员豁免
 	const chatId = String(options.chatId ?? '');
 	if (!chatId) return 'skipped';
@@ -15339,6 +15722,8 @@ async function detectAdOnMessage(message, env) {
 	if (Array.isArray(message.new_chat_members) && message.new_chat_members.length) return false;
 
 	const userId = from.id;
+	// 【白名单高于黑名单】白名单用户发的消息不进广告判定。
+	if (isAdUserWhitelisted(userId)) return false;
 	if (isPrivilegedManager(userId)) return false;
 
 	const text = String(message.text ?? message.caption ?? '').trim();
@@ -15566,7 +15951,11 @@ async function detectAdOnMessage(message, env) {
 // 【2026-09-08 从 11 条减为 10 条】confirm 已删除，见 handleAdIgnoreCommand 上方的说明。
 // 【2026-09-18 加 allowlist】/ignore 的负例登记需要一个人工出口，否则主人只能靠重建整条
 // 误判来撤销 —— 张数不写死在注释里，以本正则的分支为唯一真源。
-const AD_COMMAND_RE = /^\/(pending|ignore|allowlist|addword|delword|words|addsample|clearsamples|adstats|whitelist|exempt|rescreen|warmup)(?:@[^\s]+)?(?:\s|$)/i;
+// 【2026-09-25 加 add_whitelist / del_whitelist / whitelist_users】用户白名单（高于黑名单）。
+// 注意与既有的 `whitelist` 区分：那个是【域名】白名单（/whitelist add github.com），
+// 解决「这个群认为某个域名无害」；新三条是【用户】白名单，解决「这个人不要再拦」。
+// 两者语义完全不同，故不复用同一条命令。长名排在短名之前，便于阅读（(?:\s|$) 锚定下顺序不影响匹配）。
+const AD_COMMAND_RE = /^\/(pending|ignore|allowlist|add_whitelist|del_whitelist|whitelist_users|addword|delword|words|addsample|clearsamples|adstats|whitelist|exempt|rescreen|warmup)(?:@[^\s]+)?(?:\s|$)/i;
 
 // 快照 → 判定载荷。/ignore 标误判、删 AI 样本都要用同一份载荷，保证两边命中的集合一致。
 function adPayloadFromSnapshot(snapshot) {
@@ -15631,6 +16020,9 @@ async function handleAdDetectionCommands(message, env, ctx) {
 			case 'clearsamples': await handleAdClearSamplesCommand(env, chatId, ownerId, arg); break;
 			case 'adstats': await handleAdStatsCommand(env, chatId); break;
 			case 'whitelist': await handleAdWhitelistCommand(env, chatId, ownerId, arg); break;
+			case 'add_whitelist': await handleAdAddUserWhitelistCommand(env, chatId, ownerId, arg, message); break;
+			case 'del_whitelist': await handleAdDelUserWhitelistCommand(env, chatId, ownerId, arg); break;
+			case 'whitelist_users': await handleAdListUserWhitelistCommand(env, chatId); break;
 			case 'exempt': await handleAdExemptCommand(env, chatId, ownerId, arg); break;
 			case 'rescreen': await handleAdRescreenCommand(env, chatId, arg); break;
 			case 'warmup': await handleAdWarmupCommand(env, chatId); break;
@@ -16401,6 +16793,133 @@ async function handleAdStatsCommand(env, chatId) {
 
 // /whitelist [list|add|del] [域名]：域名白名单管理。
 // D1 表为空时自动回落到内置种子，所以「删到空」不会导致所有链接都被判广告。
+// ===== 用户白名单命令（高于黑名单）=====
+// 用法：
+//   /add_whitelist <TGID> [备注]     或   回复某人的消息发 /add_whitelist [备注]
+//   /del_whitelist <TGID>
+//   /whitelist_users [数量]
+//
+// 【为什么加白名单要顺手解封 + 删黑名单行】
+// 白名单是【运行时豁免】—— 它只保证「以后不再执行封禁动作」。如果这个人此刻正被封着，
+// 加白名单并不会把他放出来，他仍是「在白名单里却进不了群」的荒谬状态。
+// 所以 /add_whitelist 顺带做两件事：① 全群解除 Telegram 侧封禁 ② 删掉 D1 黑名单行。
+// ② 是必须的：不删的话 /check 与 /unban 仍显示「在黑名单中」，与白名单语义自相矛盾。
+// 删之前的原因已留档在 ad_user_whitelist.previous_blacklist_reason，审计痕迹不丢。
+async function handleAdAddUserWhitelistCommand(env, chatId, ownerId, arg, message) {
+	// 目标解析：回复优先（回复某条消息即把发送者加白），否则取第一个参数当 TGID。
+	let targetId = '';
+	let note = '';
+	const replyFrom = message?.reply_to_message?.from;
+	if (replyFrom && replyFrom.id) {
+		targetId = String(replyFrom.id);
+		note = String(arg || '').trim();
+	} else {
+		const parts = String(arg || '').trim().split(/\s+/).filter(Boolean);
+		targetId = parts[0] || '';
+		note = parts.slice(1).join(' ').trim();
+	}
+
+	if (!targetId) {
+		await sendTelegramMessage(chatId, [
+			'用法：<code>/add_whitelist 用户ID [备注]</code>',
+			'或：回复某人的消息发 <code>/add_whitelist [备注]</code>',
+			'',
+			'<b>用户白名单高于黑名单</b>：名单里的用户在【所有】审核路径上都不被处置 ——',
+			'不删消息、不踢、复入群不拦、入群不处置、广告检测不判。',
+			'加白名单时会同时解除他的全群封禁并清掉 D1 黑名单记录（原封禁原因留档）。',
+			'',
+			'查看：<code>/whitelist_users</code>　移除：<code>/del_whitelist 用户ID</code>',
+			'（注意区分：<code>/whitelist</code> 是<b>域名</b>白名单，与本命令无关）'
+		].join('\n'));
+		return;
+	}
+	if (!/^\d+$/.test(targetId)) {
+		await sendTelegramMessage(chatId, '❌ 用户 ID 必须是纯数字：<code>' + escapeHtml(targetId) + '</code>');
+		return;
+	}
+
+	const result = await addAdUserWhitelist(env, targetId, { note, addedBy: ownerId });
+	if (!result.ok) {
+		const reasonMap = { invalid: '用户 ID 不合法', unavailable: '数据表不可用', error: '写入失败' };
+		await sendTelegramMessage(chatId, '❌ 加入白名单失败：' + (reasonMap[result.reason] || result.reason));
+		return;
+	}
+
+	// 顺手清掉历史封禁。顺序：先删 D1 黑名单行，再解 Telegram 侧封禁 ——
+	// 反过来的话，解封那一瞬间他若正好发一条消息，仍会撞上黑名单拦截被再踢一次。
+	const removeResult = await removeFromBlacklist(targetId, env).catch((error) => {
+		console.error('[广告检测] 加白名单时删除黑名单记录失败:', error);
+		return null;
+	});
+	const unbanResults = await unbanUserFromAllGroups(targetId).catch((error) => {
+		console.error('[广告检测] 加白名单时全群解封失败:', error);
+		return null;
+	});
+	// 清掉广告判定的观察记录与升级台账，否则下一轮扫描还会拿旧台账把他升级成全群封禁。
+	await deleteAdScreening(env, targetId).catch(() => {});
+	await deleteAdBanScope(env, targetId).catch(() => {});
+
+	const lines = [
+		'<b>✅ 已加入用户白名单' + (result.existed ? '（更新）' : '') + '</b>',
+		'目标：<code>' + escapeHtml(targetId) + '</code>',
+	];
+	if (note) lines.push('备注：' + escapeHtml(note));
+	if (result.blacklistReason) {
+		lines.push('', 'ℹ️ 原 D1 黑名单原因已留档：<code>' + escapeHtml(result.blacklistReason) + '</code>');
+		lines.push(removeResult?.success ? '✅ 已删除 D1 黑名单记录' : '⚠️ D1 黑名单记录删除失败，请用 /check 复核');
+	}
+	if (unbanResults) {
+		const okCount = unbanResults.filter((r) => r.ok).length;
+		lines.push('Telegram 侧解封：' + okCount + '/' + unbanResults.length + ' 个群成功');
+	}
+	lines.push('', '该用户此后不再进入任何审核路径。移除用 <code>/del_whitelist ' + escapeHtml(targetId) + '</code>');
+	await sendTelegramMessage(chatId, lines.join('\n'));
+}
+
+async function handleAdDelUserWhitelistCommand(env, chatId, ownerId, arg) {
+	const targetId = String(arg || '').trim().split(/\s+/)[0] || '';
+	if (!targetId || !/^\d+$/.test(targetId)) {
+		await sendTelegramMessage(chatId, '用法：<code>/del_whitelist 用户ID</code>');
+		return;
+	}
+	const result = await removeAdUserWhitelist(env, targetId);
+	if (!result.ok) {
+		const reasonMap = { invalid: '用户 ID 不合法', unavailable: '数据表不可用', error: '删除失败' };
+		await sendTelegramMessage(chatId, '❌ 移除失败：' + (reasonMap[result.reason] || result.reason));
+		return;
+	}
+	await sendTelegramMessage(chatId, result.removed
+		? '✅ 已从用户白名单移除：<code>' + escapeHtml(targetId) + '</code>\nℹ️ 他不再享有豁免；若仍需封禁，重新 /spam 即可。'
+		: '⚠️ 白名单中没有这个用户：<code>' + escapeHtml(targetId) + '</code>');
+}
+
+async function handleAdListUserWhitelistCommand(env, chatId) {
+	const result = await listAdUserWhitelist(env, 50);
+	if (!result.ok) {
+		await sendTelegramMessage(chatId, '❌ 读取用户白名单失败。');
+		return;
+	}
+	if (!result.rows.length) {
+		await sendTelegramMessage(chatId, '📋 用户白名单为空。\n\n添加：<code>/add_whitelist 用户ID</code>');
+		return;
+	}
+	const lines = ['<b>📋 用户白名单（高于黑名单，共 ' + result.rows.length + ' 条）</b>', ''];
+	for (const row of result.rows) {
+		const id = escapeHtml(String(row.user_id || ''));
+		const note = String(row.note || '').trim();
+		const prev = String(row.previous_blacklist_reason || '').trim();
+		const at = Number(row.created_at || 0);
+		const when = at ? new Date(at * 1000).toISOString().replace('T', ' ').slice(0, 16) : '';
+		lines.push('• <code>' + id + '</code>' + (note ? '　' + escapeHtml(note) : ''));
+		const meta = [];
+		if (when) meta.push(when + ' UTC');
+		if (prev) meta.push('原黑名单原因：' + escapeHtml(prev));
+		if (meta.length) lines.push('　　' + meta.join('　'));
+	}
+	lines.push('', '移除：<code>/del_whitelist 用户ID</code>');
+	await sendTelegramMessage(chatId, lines.join('\n'));
+}
+
 async function handleAdWhitelistCommand(env, chatId, ownerId, arg) {
 	const parts = arg ? arg.split(/\s+/) : [];
 	const action = (parts[0] || 'list').toLowerCase();
@@ -16567,7 +17086,8 @@ async function handleAdRescreenCommand(env, chatId, arg) {
 		try { snapshot = JSON.parse(String(row.snapshot || '{}')); } catch { snapshot = {}; }
 		const targetChatId = String(row.chat_id || '') || String(GROUP_IDS[0] || '');
 		try {
-			if (isPrivilegedManager(userId)) { cleared.push(userId); await deleteAdScreening(env, userId); await deleteAdBanScope(env, userId); continue; }
+			// 【白名单高于黑名单】白名单用户不参与复判：清掉观察记录与台账即可。
+			if (isPrivilegedManager(userId) || isAdUserWhitelisted(userId)) { cleared.push(userId); await deleteAdScreening(env, userId); await deleteAdBanScope(env, userId); continue; }
 			const already = await checkBlacklist(userId, env);
 			if (already.isBlacklisted) { cleared.push(userId); await deleteAdScreening(env, userId); await deleteAdBanScope(env, userId); continue; }
 
@@ -16714,6 +17234,14 @@ async function handleAdReplyLearning(message, env, ctx) {
 	const targetId = String(targetUser.id);
 	if (isPrivilegedManager(targetId)) {
 		await sendFlashMessage(chat.id, '⚠️ 目标是管理层，已忽略该操作。', ctx);
+		return true;
+	}
+	// 【白名单高于黑名单】白名单用户与「管理层」同等对待：直接忽略。
+	// 这条路径和 /spam 是同一件事的两个入口（管理员回复「广告」），而 /spam 那边
+	// 已经明确拒绝了白名单用户。这里不拦的话会出现最讽刺的一幕：主人刚把人加进白名单，
+	// 反手被另一个管理员用回复「广告」把消息删了、还收到「已按广告处置」的回执。
+	if (isAdUserWhitelisted(targetId)) {
+		await sendFlashMessage(chat.id, '⚠️ 目标是用户白名单成员，已忽略该操作（如需处置请先 /del_whitelist）。', ctx);
 		return true;
 	}
 	if (!(await adDetectionReady(env))) return false;
