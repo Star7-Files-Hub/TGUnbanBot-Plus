@@ -818,6 +818,21 @@ async function handleCommand(env, message) {
 	const arg = (m[2] || '').trim();
 	const chat = message.chat;
 	const from = message.from;
+
+	// /start 纯轻路径：不查库（D1 冷启动是慢的主因），直接回帮助。
+	if (command === 'start') {
+		const primary = String(env.OWNER_ID || (env.OWNER_IDS || '').split(/[,，]/)[0] || '').trim();
+		return sendMessage(env, chat.id, renderHelp(String(from?.id) === primary));
+	}
+
+	await adDetectionReady(env);
+
+	// /help 只查主人表 1 次（不查授权群），足够判断是否显示主人命令。
+	if (command === 'help') {
+		const owners = await loadOwners(env);
+		return sendMessage(env, chat.id, renderHelp(owners.has(String(from?.id))));
+	}
+
 	const config = await loadConfig(env);
 	const isAnyOwner = isOwner(from?.id, config);
 	const isPrimary = isPrimaryOwner(from?.id, config);
@@ -845,8 +860,6 @@ async function handleCommand(env, message) {
 		case 'adstats': return handleAdStats(env, message, config, isAnyOwner);
 		case 'ignore': return handleIgnore(env, message, config, isAnyOwner);
 		case 'allowlist': return handleAllowlist(env, message, config, isAnyOwner);
-		case 'start': return sendMessage(env, chat.id, renderHelp(isAnyOwner));
-		case 'help': return sendMessage(env, chat.id, renderHelp(isAnyOwner));
 		default: return false;
 	}
 }
@@ -1285,16 +1298,29 @@ async function handleCallback(env, callback) {
 // 15. 入口
 // =============================================================================
 async function handleUpdate(env, update) {
-	await adDetectionReady(env);
 	if (update?.message) {
-		await recordMessage(env, update.message);
-		if (Array.isArray(update.message.new_chat_members) && update.message.new_chat_members.length) {
-			await handleNewChatMembers(env, update.message);
+		const message = update.message;
+		const text = String(message.text || message.caption || '').trim();
+		const isCommand = COMMAND_RE.test(text);
+		if (isCommand) {
+			// 命令路径：需要 DB 的处理器自行建表；/start 完全不查库，冷启动也秒回。
+			await handleCommand(env, message);
 			return;
 		}
-		if (await handleCommand(env, update.message)) return;
-		await detectAdOnMessage(env, update.message);
+		const chatType = message.chat?.type;
+		if (chatType !== 'group' && chatType !== 'supergroup') {
+			// 私聊非命令消息：不查库、不检测。
+			return;
+		}
+		await adDetectionReady(env);
+		await recordMessage(env, message);
+		if (Array.isArray(message.new_chat_members) && message.new_chat_members.length) {
+			await handleNewChatMembers(env, message);
+			return;
+		}
+		await detectAdOnMessage(env, message);
 	} else if (update?.callback_query) {
+		await adDetectionReady(env);
 		await handleCallback(env, update.callback_query);
 	}
 }
