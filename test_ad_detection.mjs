@@ -1048,6 +1048,20 @@ section('[7] 消息检测端到端（零成本预筛 → 三层判定 → 观察
 	await runCard(60076, { phone_number: '+8613800138000', first_name: 'Python技术交流群管理' });
 	assert('名片通道：技术群名片不误封（无招揽×行业同现）', countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
 
+	// 短中文广告名（≤5 字、无数字无 emoji）：旧版 looksLikePersonName 只按字数判人名，
+	// 会把「外围面交」「假钞面交」这类名片整条吞掉 —— 交易动词 + 业务词恰好同现，
+	// 理应定罪，却被反向白名单在早退闸门就放行。回归 2026-10 漏放。
+	await runCard(60077, { phone_number: '+8613800138000', first_name: '外围面交' });
+	assert('名片通道：短中文广告名「外围面交」照样封', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	await runCard(60078, { phone_number: '+8613800138000', first_name: '假钞面交' });
+	assert('名片通道：短中文广告名「假钞面交」照样封', countCalls('restrictChatMember') >= 1, JSON.stringify(calls.map((c) => c.method)));
+	// 反向白名单只做「放行」，定罪仍靠两类同现：单类词短名不得误封。
+	await runCard(60079, { phone_number: '+8613800138000', first_name: '外围' });
+	assert('名片通道：单类词短名「外围」不误封', countCalls('restrictChatMember') === 0 && countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+	// 真·短人名仍然放行，不受词表放行影响。
+	await runCard(60080, { phone_number: '+8613800138000', first_name: '王芳' });
+	assert('名片通道：短人名「王芳」仍放行', countCalls('restrictChatMember') === 0 && countCalls('banChatMember') === 0, JSON.stringify(calls.map((c) => c.method)));
+
 	// slash 命令一律跳过检测，避免和既有命令分发抢消息。
 	// 这里先手动建表：detectAdOnMessage 在 isTelegramSlashCommand 处就早退了，
 	// 根本走不到 adDetectionReady，不预建表则下面的「零写入」断言无表可查。
@@ -2822,6 +2836,46 @@ section('[16] 指纹种子库（35 图特征下移到第二层）+ /spam 人工�
 	assert('/spam 引用体：来源标记为 spam-quoted', spamQuotedSamples.every((r) => r.source === 'spam-quoted'), JSON.stringify(spamQuotedSamples.map((r) => r.source)));
 	assert('/spam 引用体：不回退到 source=spam', envSpamQuoted.DB.query("SELECT COUNT(*) AS c FROM ad_sample_embeddings WHERE source = 'spam'")[0].c === 0);
 	assert('/spam 引用体：回执告知已加样本', allSentText().includes('已加 AI 语义样本'), allSentText().slice(0, 600));
+
+	// ---- /spam 联系人名片：把名片显示名一并学进指纹与 AI 语义库（2026-10）----
+	// 名片消息 text / caption 恒为空，广告写在 first_name / last_name。旧逻辑只读 text / caption，
+	// /spam 判定名片广告后指纹 no_candidate、AI 样本只拼到「昵称」（<4 字或纯人名），
+	// 同款名片下次照旧放行。修复后名片显示名并入 spamText，指纹与语义样本两处都能取材。
+	const envSpamCard = makeEnv();
+	await W.adDetectionReady(envSpamCard);
+	W.invalidateAdProfileCache();
+	resetCalls();
+	setApi({
+		getChat: (body) => {
+			const id = String(body?.chat_id);
+			if (id === '92006') {
+				return { ok: true, result: { id, first_name: '发卡小号', username: 'card_spam_target', bio: '' } };
+			}
+			return { ok: true, result: { id, first_name: 'Owner', bio: '' } };
+		},
+		getChatMember: (body) => ({ ok: true, result: { status: 'member', user: { id: body?.user_id } } }),
+		getChatAdministrators: () => ({ ok: true, result: [] }),
+		banChatMember: () => ({ ok: true, result: true }),
+		deleteMessage: () => ({ ok: true, result: true })
+	});
+	await sendUpdate({
+		message: groupMessage({ id: OWNER_ID, first_name: 'Owner' }, '/spam 违规出售账号', {
+			reply_to_message: {
+				message_id: 559,
+				date: Math.floor(Date.now() / 1000),
+				chat: { id: Number(GROUP_ID), type: 'supergroup', title: '测试治理群' },
+				from: { id: 92006, is_bot: false, first_name: '发卡小号', username: 'card_spam_target' },
+				contact: { phone_number: '+8613800138000', first_name: '外围面交', last_name: '' }
+			}
+		})
+	}, envSpamCard);
+	const cardSpamFps = envSpamCard.DB.query("SELECT type, value FROM ad_fingerprints WHERE source = 'spam'");
+	const cardSpamSamples = envSpamCard.DB.query("SELECT sample_text, source FROM ad_sample_embeddings WHERE source = 'spam'");
+	assert('/spam 名片：写入了含名片显示名的指纹',
+		cardSpamFps.some((r) => String(r.value).includes('外围面交')), JSON.stringify(cardSpamFps));
+	assert('/spam 名片：写入了含名片显示名的 AI 语义样本',
+		cardSpamSamples.some((r) => String(r.sample_text).includes('外围面交')), JSON.stringify(cardSpamSamples));
+	assert('/spam 名片：样本来源仍标记 spam', cardSpamSamples.every((r) => r.source === 'spam'), JSON.stringify(cardSpamSamples.map((r) => r.source)));
 
 	// 学到的指纹立刻对下一个人生效 —— 「同一段文案第二次出现即被秒杀」。
 	W.invalidateAdProfileCache();

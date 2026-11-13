@@ -5934,7 +5934,21 @@ function looksLikePersonName(name) {
 	} catch (_) {
 		if (/[\u{1F300}-\u{1FAFF}☀-➿]/u.test(value)) return false;
 	}
-	if (/[一-龥]/.test(value)) return chars.length <= 5;            // 中日韩姓名/称谓 ≤5 字
+	if (/[一-龥]/.test(value)) {
+		// 【2026-10 修复】反向白名单必须先让位于广告词表。
+		// 旧规则「CJK ≤5 字一律当人名」会把短中文广告名片整条吞掉：
+		// 「外围面交 / 假钞面交 / 上门面交」这类 2~5 字、无数字无 emoji 的显示名
+		// 全被当成人名，在 detectAdOnMessage 的早退闸门就 return false，连评分链都进不去。
+		// 正常人名不会带广告词，广告名带了广告词就绝不该按人名放行；
+		// 这里只负责放行进评分链，是否定罪仍由 judgeAdStructure 的「招揽∧行业」同现把关，
+		// 单类词（如「外围」）依旧不计分，不会新增误封。
+		if (countAdKeywordHits(value, AD_TRADE_VERBS).length
+			|| countAdKeywordHits(value, AD_BUSINESS_KEYWORDS).length
+			|| countAdKeywordHits(value, AD_WEAK_TRADE_VERBS).length) {
+			return false;
+		}
+		return chars.length <= 5;                                  // 中日韩姓名/称谓 ≤5 字
+	}
 	// 西文人名：1~3 个词，每词首字母大写
 	return /^[A-Z][a-z'’-]+(?:\s[A-Z][a-z'’-]+){0,2}$/.test(value);
 }
@@ -7912,7 +7926,15 @@ async function handleMessage(message, env, ctx, requestUrl = '') {
 			let spamSampleAdded = 0;
 			let spamEnriched = 0;
 			try {
-				const spamText = String(repliedMsg.text || repliedMsg.caption || '');
+				// 联系人名片：text / caption 恒为空，广告内容写在名片显示名里。
+				// 只读 text / caption 会让 /spam 判定名片广告后什么都学不到
+				//（指纹 no_candidate、AI 样本 <4 字拒收），同款名片下次照旧放行。
+				// 把名片显示名并入学习正文，与检测端「text || contactName」同一口径：
+				// 只取 first_name + last_name，不取 phone_number / vcard（纯数字与 vCard 字段名是噪声）。
+				const spamContactName = repliedMsg?.contact
+					? [repliedMsg.contact.first_name, repliedMsg.contact.last_name].filter(Boolean).join(' ').trim()
+					: '';
+				const spamText = String(repliedMsg.text || repliedMsg.caption || spamContactName || '');
 				const spamProfile = await fetchAdUserProfile(repliedUserId, repliedMsg.from || {});
 				const spamName = [spamProfile.firstName, spamProfile.lastName].filter(Boolean).join(' ').trim();
 				const spamPayload = {
