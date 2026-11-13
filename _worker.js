@@ -302,6 +302,8 @@ const SCHEMA_STATEMENTS = [
 ];
 
 // schema 按 isolate 只建一次（env 每个请求都是新对象，不能挂在 env 上）。
+// 13 条 DDL 合并成一次 exec，冷启动从 13 次往返降到 1 次（/start 慢的主因之一）。
+const SCHEMA_SQL = SCHEMA_STATEMENTS.map(([, sql]) => sql).join(';');
 let schemaReady = false;
 let schemaInit = null;
 async function adDetectionReady(env) {
@@ -309,9 +311,7 @@ async function adDetectionReady(env) {
 	if (!schemaReady) {
 		if (!schemaInit) {
 			schemaInit = (async () => {
-				for (const [, sql] of SCHEMA_STATEMENTS) {
-					await env.DB.prepare(sql).run();
-				}
+				await env.DB.exec(SCHEMA_SQL);
 				schemaReady = true;
 				return true;
 			})();
@@ -427,6 +427,12 @@ async function matchAdSemantic(env, text, config) {
 	const hash = await sha256Hex(normalized);
 	const exact = await env.DB.prepare('SELECT id, count FROM ad_samples WHERE norm_hash = ?').bind(hash).first();
 	if (exact) return { hit: true, sampleId: exact.id, similarity: 1, exact: true };
+
+	// 还没有任何带向量的样本时，embedding 无比较对象，跳过昂贵的 AI 调用。
+	const hasSample = await env.DB.prepare(
+		'SELECT 1 AS x FROM ad_samples WHERE embedding IS NOT NULL LIMIT 1'
+	).first();
+	if (!hasSample) return { hit: false };
 
 	const vec = await embedText(env, normalized).catch(() => null);
 	if (!vec) return { hit: false };
@@ -571,7 +577,8 @@ async function detectAdOnMessage(env, message) {
 	if (await isGroupAdmin(env, chat.id, userId)) return null;
 
 	const text = String(message.text ?? message.caption ?? '').trim();
-	if (/^\/(addword|delword|words|addsample|adstats|whitelist|allowlist|ignore|exempt|rescreen|warmup|add_group|del_group|groups|add_owner|del_owner|owners|ad)/i.test(text)) return null;
+	// 所有命令文本都不进检测（避免 /start 等未知命令触发指纹/AI 查询拖慢响应）。
+	if (text.startsWith('/')) return null;
 
 	const contactName = getContactName(message);
 	const quotedText = getQuotedText(message);
@@ -838,6 +845,7 @@ async function handleCommand(env, message) {
 		case 'adstats': return handleAdStats(env, message, config, isAnyOwner);
 		case 'ignore': return handleIgnore(env, message, config, isAnyOwner);
 		case 'allowlist': return handleAllowlist(env, message, config, isAnyOwner);
+		case 'start': return sendMessage(env, chat.id, renderHelp(isAnyOwner));
 		case 'help': return sendMessage(env, chat.id, renderHelp(isAnyOwner));
 		default: return false;
 	}
@@ -1344,5 +1352,5 @@ export {
 	isGroupAdmin, invalidateAdminCache, isBlacklisted, addBlacklist, removeBlacklist,
 	matchAllowlist, recordMessage, sweepUserMessages, sweepUserMessagesAllGroups,
 	judgeAdWithAI, handleAd, notifyAdReport,
-	handleCommand, handleCallback, resolveTargetId
+	handleCommand, handleCallback, handleUpdate, resolveTargetId
 };

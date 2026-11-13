@@ -7,7 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import handler, {
 	adDetectionReady, addAdSample, matchAdSemantic, normalizeAdText,
 	learnFingerprints, loadConfig, isOwner, isPrimaryOwner,
-	handleNewChatMembers, handleCommand, handleCallback,
+	handleNewChatMembers, handleCommand, handleCallback, handleUpdate,
 	banAllGroups, renderBanAllReceipt, judgeAdWithAI,
 	invalidateOwners, invalidateGroups, invalidateUserWhitelist, invalidateAdminCache,
 	resetSchemaState
@@ -59,7 +59,12 @@ function makeD1() {
 		};
 		return api;
 	};
-	return { __sqlite: db, prepare: (sql) => makeStatement(sql), query: (sql, ...p) => db.prepare(sql).all(...p).map(normOut) };
+	return {
+		__sqlite: db,
+		prepare: (sql) => makeStatement(sql),
+		query: (sql, ...p) => db.prepare(sql).all(...p).map(normOut),
+		exec: (sql) => { db.exec(sql); return { count: 1, duration: 0 }; }
+	};
 }
 
 // ---------- 断言 ----------
@@ -365,6 +370,25 @@ section('F. /ad 判定解析（not_ad / 中文否定不误判）');
 	assert('输出 not_ad → 不判广告', (await runJudge('not_ad')).isAd === false);
 	assert('输出 不是广告 → 不判广告', (await runJudge('不是广告')).isAd === false);
 	assert('输出 正常 → 不判广告', (await runJudge('正常')).isAd === false);
+}
+
+// =============================================================================
+section('G. /start /help 秒回 + 命令不进检测管线');
+{
+	resetState();
+	const { env, tgCalls } = makeEnv();
+	await adDetectionReady(env);
+	const privateStart = { update_id: 100, message: { message_id: 1, from: { id: OWNER, is_bot: false, first_name: '主人' }, chat: { id: OWNER, type: 'private' }, text: '/start' } };
+	await handleUpdate(env, privateStart);
+	const privReplies = tgCalls.filter((c) => c.method === 'sendMessage');
+	assert('/start 私聊有回复', privReplies.length >= 1);
+	assert('/start 回复含帮助', privReplies.at(-1).body.text.includes('TGUnbanBot-Plus'));
+
+	tgCalls.length = 0;
+	const groupStart = { update_id: 101, message: { message_id: 2, from: { id: MEMBER, is_bot: false, first_name: '成员' }, chat: { id: MAIN_GROUP, type: 'supergroup', title: '主群' }, text: '/start' } };
+	await handleUpdate(env, groupStart);
+	assert('/start 群聊有回复', tgCalls.filter((c) => c.method === 'sendMessage').length >= 1);
+	assert('/start 未触发禁言/封禁', tgCalls.filter((c) => c.method === 'restrictChatMember').length === 0 && tgCalls.filter((c) => c.method === 'banChatMember').length === 0);
 }
 
 // =============================================================================
