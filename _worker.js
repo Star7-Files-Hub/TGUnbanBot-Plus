@@ -819,8 +819,10 @@ async function handleCommand(env, message) {
 	const chat = message.chat;
 	const from = message.from;
 
-	// /start 纯轻路径：不查库（D1 冷启动是慢的主因），直接回帮助。
+	// /start 纯轻路径：不查库（D1 冷启动是慢的主因）。
 	if (command === 'start') {
+		// 群内 /start 静默，避免刷屏；只有私聊回帮助。
+		if (chat?.type === 'group' || chat?.type === 'supergroup') return true;
 		const primary = String(env.OWNER_ID || (env.OWNER_IDS || '').split(/[,，]/)[0] || '').trim();
 		return sendMessage(env, chat.id, renderHelp(String(from?.id) === primary));
 	}

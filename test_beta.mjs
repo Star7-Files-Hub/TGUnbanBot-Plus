@@ -387,7 +387,7 @@ section('G. /start /help 秒回 + 命令不进检测管线');
 	tgCalls.length = 0;
 	const groupStart = { update_id: 101, message: { message_id: 2, from: { id: MEMBER, is_bot: false, first_name: '成员' }, chat: { id: MAIN_GROUP, type: 'supergroup', title: '主群' }, text: '/start' } };
 	await handleUpdate(env, groupStart);
-	assert('/start 群聊有回复', tgCalls.filter((c) => c.method === 'sendMessage').length >= 1);
+	assert('/start 群聊静默（不刷屏）', tgCalls.filter((c) => c.method === 'sendMessage').length === 0);
 	assert('/start 未触发禁言/封禁', tgCalls.filter((c) => c.method === 'restrictChatMember').length === 0 && tgCalls.filter((c) => c.method === 'banChatMember').length === 0);
 }
 
