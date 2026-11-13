@@ -302,8 +302,7 @@ const SCHEMA_STATEMENTS = [
 ];
 
 // schema 按 isolate 只建一次（env 每个请求都是新对象，不能挂在 env 上）。
-// 13 条 DDL 合并成一次 exec，冷启动从 13 次往返降到 1 次（/start 慢的主因之一）。
-const SCHEMA_SQL = SCHEMA_STATEMENTS.map(([, sql]) => sql).join(';');
+// 13 条 DDL 用 batch 一次往返执行（D1 的 exec 不支持多语句，batch 才是官方多语句姿势）。
 let schemaReady = false;
 let schemaInit = null;
 async function adDetectionReady(env) {
@@ -311,7 +310,7 @@ async function adDetectionReady(env) {
 	if (!schemaReady) {
 		if (!schemaInit) {
 			schemaInit = (async () => {
-				await env.DB.exec(SCHEMA_SQL);
+				await env.DB.batch(SCHEMA_STATEMENTS.map(([, sql]) => env.DB.prepare(sql)));
 				schemaReady = true;
 				return true;
 			})();
@@ -1358,7 +1357,7 @@ export default {
 			const update = await request.json();
 			await handleUpdate(env, update);
 		} catch (error) {
-			console.error('handleUpdate 失败:', error);
+			console.error('handleUpdate 失败:', String(error?.message || error?.stack || error));
 		}
 		return new Response('OK', { status: 200 });
 	},

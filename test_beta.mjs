@@ -63,7 +63,12 @@ function makeD1() {
 		__sqlite: db,
 		prepare: (sql) => makeStatement(sql),
 		query: (sql, ...p) => db.prepare(sql).all(...p).map(normOut),
-		exec: (sql) => { db.exec(sql); return { count: 1, duration: 0 }; }
+		exec: (sql) => { db.exec(sql); return { count: 1, duration: 0 }; },
+		async batch(stmts) {
+			const out = [];
+			for (const stmt of stmts) out.push(await stmt.run());
+			return out;
+		}
 	};
 }
 
