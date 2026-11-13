@@ -107,7 +107,7 @@ function makeEnv(overrides = {}) {
 	const db = makeD1();
 	const tgCalls = [];
 	const tgMock = {};
-	for (const method of ['sendMessage', 'editMessageText', 'restrictChatMember', 'banChatMember', 'unbanChatMember', 'deleteMessage', 'getChatMember', 'answerCallbackQuery']) {
+	for (const method of ['sendMessage', 'editMessageText', 'setMyCommands', 'restrictChatMember', 'banChatMember', 'unbanChatMember', 'deleteMessage', 'getChatMember', 'answerCallbackQuery']) {
 		tgMock[method] = (body) => {
 			tgCalls.push({ method, body });
 			const override = overrides.tg?.[method];

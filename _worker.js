@@ -26,6 +26,37 @@ const FINGERPRINT_MIN_LEN = 2;              // 指纹最短长度
 
 const TG_ROOT = 'https://api.telegram.org/bot';
 
+// 命令面板（Telegram setMyCommands）：非主人只显示公开两条；主人/副主人私聊显示全量。
+const CMD_PUBLIC = [
+	['ad', '回复一条消息，AI 判定广告'],
+	['start', '开始 / 帮助']
+];
+const CMD_OWNER_FULL = [
+	...CMD_PUBLIC,
+	['help', '显示帮助'],
+	['spam', '回复广告消息上报/封禁（权限分级）'],
+	['ban', '封禁用户（主人全群/管理员当前群）'],
+	['unban', '解除黑名单并全群解封'],
+	['check', '查看封禁范围'],
+	['pending', '待确认指纹命中列表'],
+	['addword', '加广告指纹（主人）'],
+	['delword', '删广告指纹（主人）'],
+	['words', '指纹库列表'],
+	['addsample', '加语义样本（主人）'],
+	['adstats', '查杀统计'],
+	['add_owner', '加副主人（主人）'],
+	['del_owner', '删副主人（主人）'],
+	['owners', '副主人列表'],
+	['add_group', '加授权群（主人）'],
+	['del_group', '删授权群（主人）'],
+	['groups', '授权群列表'],
+	['add_whitelist', '加用户白名单'],
+	['del_whitelist', '删用户白名单'],
+	['whitelist_users', '白名单列表'],
+	['ignore', '加误判放行'],
+	['allowlist', '放行库列表']
+];
+
 // =============================================================================
 // 1. 文本工具：去混淆归一化是「自动合并同类语义」的地基。
 // =============================================================================
@@ -243,6 +274,15 @@ async function sendMessage(env, chatId, text, extra = {}) {
 }
 async function editMessageText(env, chatId, messageId, text, extra = {}) {
 	return tgCall(env, 'editMessageText', { chat_id: chatId, message_id: messageId, text, parse_mode: 'HTML', ...extra });
+}
+
+// 给某个用户同步命令面板（主人/副主人私聊 = 全量；其余 = 公开两条）。
+async function setUserCommandScope(env, userId, full) {
+	const commands = (full ? CMD_OWNER_FULL : CMD_PUBLIC).map(([command, description]) => ({ command, description }));
+	return tgCall(env, 'setMyCommands', {
+		commands,
+		scope: { type: 'chat', chat_id: String(userId) }
+	}).catch(() => null);
 }
 async function restrictMember(env, chatId, userId) {
 	return tgCall(env, 'restrictChatMember', { chat_id: chatId, user_id: userId, permissions: { can_send_messages: false, can_send_media_messages: false, can_send_other_messages: false, can_add_web_page_previews: false } });
@@ -1182,6 +1222,7 @@ async function handleAddOwner(env, message, arg, config, isPrimary) {
 	await env.DB.prepare('INSERT OR REPLACE INTO ad_owners (user_id, added_by, created_at) VALUES (?, ?, ?)')
 		.bind(uid, String(message.from.id), nowSeconds()).run();
 	invalidateOwners();
+	await setUserCommandScope(env, uid, true);   // 新副主人私聊同步全量命令面板
 	return sendMessage(env, message.chat.id, `✅ 已设副主人 <code>${uid}</code>`);
 }
 async function handleDelOwner(env, message, arg, config, isPrimary) {
@@ -1191,6 +1232,7 @@ async function handleDelOwner(env, message, arg, config, isPrimary) {
 	if (uid === config.primaryOwner) return sendMessage(env, message.chat.id, '不能删除主主人');
 	await env.DB.prepare('DELETE FROM ad_owners WHERE user_id = ?').bind(uid).run();
 	invalidateOwners();
+	await setUserCommandScope(env, uid, false);  // 移除后回收其全量面板
 	return sendMessage(env, message.chat.id, `✅ 已移除副主人 <code>${uid}</code>`);
 }
 async function handleOwners(env, message, config, isOwner) {
