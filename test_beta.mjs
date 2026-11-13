@@ -8,8 +8,9 @@ import handler, {
 	adDetectionReady, addAdSample, matchAdSemantic, normalizeAdText,
 	learnFingerprints, loadConfig, isOwner, isPrimaryOwner,
 	handleNewChatMembers, handleCommand, handleCallback,
-	banAllGroups, renderBanAllReceipt,
-	invalidateOwners, invalidateGroups, invalidateUserWhitelist, invalidateAdminCache
+	banAllGroups, renderBanAllReceipt, judgeAdWithAI,
+	invalidateOwners, invalidateGroups, invalidateUserWhitelist, invalidateAdminCache,
+	resetSchemaState
 } from './_worker.js';
 
 // ---------- D1 兼容层（node:sqlite） ----------
@@ -130,6 +131,7 @@ function resetState() {
 	invalidateGroups();
 	invalidateUserWhitelist();
 	invalidateAdminCache();
+	resetSchemaState();   // schema 现在是模块级缓存，换新 DB 前必须重置
 }
 
 function countMethod(calls, method) { return calls.filter((c) => c.method === method).length; }
@@ -347,6 +349,22 @@ section('E. /ad 群成员 AI 判定 + 推主人（新需求）');
 	assert('判定非广告 → 不禁言不删', countMethod(e2.tgCalls, 'restrictChatMember') === 0 && countMethod(e2.tgCalls, 'deleteMessage') === 0);
 	const report2 = ownerMessage(e2.tgCalls);
 	assert('非广告也推主人复核（含正文+人名）', Boolean(report2) && String(report2.body.text).includes('非广告') && String(report2.body.text).includes('正常人'));
+}
+
+// =============================================================================
+section('F. /ad 判定解析（not_ad / 中文否定不误判）');
+{
+	async function runJudge(responseText) {
+		const base = makeEnv();
+		const e = { ...base.env, __aiJudgeMock: undefined };
+		e.AI = { async run() { return { response: responseText }; } };
+		return judgeAdWithAI(e, '随便发一条消息');
+	}
+	assert('输出 ad → 判广告', (await runJudge('ad')).isAd === true);
+	assert('输出 广告 → 判广告', (await runJudge('广告')).isAd === true);
+	assert('输出 not_ad → 不判广告', (await runJudge('not_ad')).isAd === false);
+	assert('输出 不是广告 → 不判广告', (await runJudge('不是广告')).isAd === false);
+	assert('输出 正常 → 不判广告', (await runJudge('正常')).isAd === false);
 }
 
 // =============================================================================
