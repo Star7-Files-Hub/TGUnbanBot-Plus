@@ -21,8 +21,10 @@
 | R6 | 全群封禁回执只显示「x 个群成功」，失败才显示原因 | 成功不逐群列出，失败列 `群:原因` |
 | R7 | 进群时检测用户名 + 名片指纹；命中即禁言待主人确认；同指纹再遇自动封禁 | 指纹带状态机 `pending/confirmed`；进群命中 → 禁言 + 待确认；确认后命中 → 全群封禁 |
 | R8 | 群管理员 /ban 只封当前群 | 权限分级 |
-| R9 | /spam 推送主人，确认后全群封禁；除主人外任何群管理员无法用 /spam 全群封禁 | 群管理员 /spam → 仅通知主人 + 待确认任务 |
+| R9 | /spam 推送主人，确认后全群封禁；除主人外任何群管理员无法用 /spam 全群封禁 | 群管理员 /spam → 封本群 + 清扫消息 + 通知主人待确认；主人确认 → 全群封禁 + 全群清扫 |
 | R10 | 纯本地数据库，不接 GKY | 只用 D1 |
+| R11 | env 只配一个主人 + 一个主群；其余授权群与副主人走命令 | `OWNER_ID`/`GROUP_ID` 单值；`ad_owners`/`ad_groups` 由 `/add_owner` `/add_group` 维护 |
+| R12 | 群成员 `/ad`：AI 判定引用消息，广告则禁言 + 删除引用消息并推主人 | 仅当前群 AI 判定；主人点「全群封禁」按钮才全群封禁 |
 
 ## 2. 技术栈与边界
 
@@ -46,8 +48,9 @@
 7 指纹库                # matchFingerprint / learnFingerprint / confirmFingerprint / retireFingerprint
 8 进群筛查              # handleNewChatMembers：用户名+名片指纹命中→禁言+待确认
 9 处置                  # muteInCurrentGroup / banAllGroups（回执简化）
-10 命令路由             # /ban /spam /unban /check /pending /add_whitelist /del_whitelist /whitelist_users /ignore /allowlist /addword /delword /words /addsample /adstats /help
-11 入口                 # fetch（webhook）/ scheduled（补向量、过期清理）
+10 命令路由             # /ad /ban /spam /unban /check /pending + 白名单/放行/词库/群与副主人管理/统计
+11 消息台账与清扫       # recordMessage / sweepUserMessages（/spam、/ad 删除某人消息）
+12 入口                 # fetch（webhook）/ scheduled（补向量、过期清理）
 ```
 
 ## 4. 关键设计决策

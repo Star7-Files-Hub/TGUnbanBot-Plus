@@ -1,0 +1,36 @@
+name = "tg-unban-bot-beta"
+main = "_worker.js"
+compatibility_date = "2026-05-19"
+keep_vars = true
+
+# 测试实例：主主人 + 主群（与生产一致的单值配置）
+[vars]
+OWNER_ID = "5608153118"
+GROUP_ID = "-1004326263155"
+BOT_ID = "7938488679"
+WEBHOOK_SECRET = "beta-test-secret-2026"
+AI_ENABLED = "1"
+
+# 独立测试 D1：不与生产 tg-ad-bot 共用，互不污染
+[[d1_databases]]
+binding = "DB"
+database_name = "tg-unban-bot-beta"
+database_id = "dc54a6aa-7df2-45d4-8d18-81820897824d"
+
+[ai]
+binding = "AI"
+
+[triggers]
+crons = ["17 3 * * *", "17 15 * * *"]
+
+[observability]
+enabled = true
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1

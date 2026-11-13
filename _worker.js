@@ -58,6 +58,16 @@ function keywordSignature(text, trade, biz, weak) {
 	return [...new Set(hits)].sort().join('|');
 }
 
+function countKeywordHits(text, keywords) {
+	const src = String(text || '').toLowerCase();
+	const hits = [];
+	for (const w of keywords) {
+		const needle = String(w).toLowerCase();
+		if (needle && src.includes(needle)) hits.push(w);
+	}
+	return hits;
+}
+
 function stripMentionsAndLinks(text) {
 	return String(text || '')
 		.replace(/@[A-Za-z0-9_]{5,}/g, ' ')
@@ -128,10 +138,44 @@ function matchAnyPattern(patterns, text) {
 // =============================================================================
 // 3. 配置加载与权限
 // =============================================================================
-function loadConfig(env) {
+let ownerSetCache = null;
+let groupSetCache = null;
+
+// 主人：仅 env.OWNER_ID 一个（单主）。副主人：/add_owner 存 D1。
+// 授权群：env.GROUP_ID 一个主群 + /add_group 存 D1。
+async function loadOwners(env) {
+	if (ownerSetCache) return ownerSetCache;
+	const set = new Set();
+	const primary = String(env.OWNER_ID || (env.OWNER_IDS || '').split(/[,，]/)[0] || '').trim();
+	if (primary) set.add(primary);
+	try {
+		const rows = await env.DB.prepare('SELECT user_id FROM ad_owners').all();
+		for (const r of rows.results || []) set.add(String(r.user_id));
+	} catch (_) {}
+	ownerSetCache = set;
+	return set;
+}
+async function loadGroups(env) {
+	if (groupSetCache) return groupSetCache;
+	const set = new Set();
+	const main = String(env.GROUP_ID || (env.GROUP_IDS || '').split(/[,，]/)[0] || '').trim();
+	if (main) set.add(main);
+	try {
+		const rows = await env.DB.prepare('SELECT chat_id FROM ad_groups').all();
+		for (const r of rows.results || []) set.add(String(r.chat_id));
+	} catch (_) {}
+	groupSetCache = set;
+	return set;
+}
+function invalidateOwners() { ownerSetCache = null; }
+function invalidateGroups() { groupSetCache = null; }
+
+async function loadConfig(env) {
 	return {
-		ownerIds: new Set(String(env.OWNER_IDS || '').split(/[,，]/).map((s) => s.trim()).filter(Boolean)),
-		groupIds: new Set(String(env.GROUP_IDS || '').split(/[,，]/).map((s) => s.trim()).filter(Boolean)),
+		primaryOwner: String(env.OWNER_ID || (env.OWNER_IDS || '').split(/[,，]/)[0] || '').trim(),
+		primaryGroup: String(env.GROUP_ID || (env.GROUP_IDS || '').split(/[,，]/)[0] || '').trim(),
+		ownerIds: await loadOwners(env),
+		groupIds: await loadGroups(env),
 		scoreThreshold: Number(env.AD_SCORE_THRESHOLD || DEFAULT_SCORE_THRESHOLD),
 		observeScore: Number(env.AD_OBSERVE_SCORE || DEFAULT_OBSERVE_SCORE),
 		aiSimilarity: Number(env.AD_AI_SIMILARITY || DEFAULT_AI_SIMILARITY),
@@ -145,7 +189,14 @@ function isConfiguredGroup(chatId, config) {
 	return config.groupIds.has(id) || config.groupIds.has(String(chatId));
 }
 
-function isPrimaryOwner(userId, config) { return config.ownerIds.has(String(userId)); }
+// 主人（唯一，env 配置）
+function isPrimaryOwner(userId, config) {
+	return String(userId) === String(config.primaryOwner || '');
+}
+// 主人 + 副主人（都算「主人」）
+function isOwner(userId, config) {
+	return config.ownerIds.has(String(userId));
+}
 
 // 用户白名单（高于黑名单，完全豁免）：内存缓存 + D1。
 let userWhitelistCache = new Set();
@@ -221,6 +272,13 @@ const SCHEMA_STATEMENTS = [
 		created_at INTEGER)`],
 	['ad_user_whitelist', `CREATE TABLE IF NOT EXISTS ad_user_whitelist (
 		user_id TEXT PRIMARY KEY, note TEXT, added_by TEXT, created_at INTEGER NOT NULL)`],
+	['ad_owners', `CREATE TABLE IF NOT EXISTS ad_owners (
+		user_id TEXT PRIMARY KEY, note TEXT, added_by TEXT, created_at INTEGER NOT NULL)`],
+	['ad_groups', `CREATE TABLE IF NOT EXISTS ad_groups (
+		chat_id TEXT PRIMARY KEY, title TEXT, added_by TEXT, created_at INTEGER NOT NULL)`],
+	['moderation_messages', `CREATE TABLE IF NOT EXISTS moderation_messages (
+		mid INTEGER, chat_id TEXT, from_id TEXT, created_at INTEGER,
+		PRIMARY KEY(chat_id, mid))`],
 	['ad_allowlist', `CREATE TABLE IF NOT EXISTS ad_allowlist (
 		dimension TEXT, value TEXT, hit_count INTEGER DEFAULT 0, created_at INTEGER,
 		PRIMARY KEY(dimension, value))`],
@@ -233,10 +291,15 @@ const SCHEMA_STATEMENTS = [
 
 async function adDetectionReady(env) {
 	if (!env?.DB) return false;
-	for (const [, sql] of SCHEMA_STATEMENTS) {
-		await env.DB.prepare(sql).run();
+	if (!env.__schemaReady) {
+		env.__schemaReady = (async () => {
+			for (const [, sql] of SCHEMA_STATEMENTS) {
+				await env.DB.prepare(sql).run();
+			}
+			return true;
+		})();
 	}
-	return true;
+	return env.__schemaReady;
 }
 
 // =============================================================================
@@ -272,7 +335,7 @@ async function addAdSample(env, rawText, options = {}) {
 	const source = String(options.source || 'auto');
 	const hash = await sha256Hex(normalized);
 	const now = nowSeconds();
-	const config = loadConfig(env);
+	const config = await loadConfig(env);
 
 	// 第 1 级：归一化文本完全一致 → 只加计数。
 	const existingByHash = await env.DB.prepare('SELECT id, count FROM ad_samples WHERE norm_hash = ?').bind(hash).first();
@@ -476,17 +539,19 @@ function getQuotedText(message) {
 async function detectAdOnMessage(env, message) {
 	const chat = message?.chat;
 	const from = message?.from;
-	if (!chat || !from || from.is_bot) return null;
-	const config = loadConfig(env);
+	if (!chat || !from) return null;
+	// 只跳过自家 bot；广告 bot 发的广告照查（只处置不回复，避免触发其自动回复）。
+	if (from.is_bot && env.BOT_ID && String(from.id) === String(env.BOT_ID)) return null;
+	const config = await loadConfig(env);
 	if (!isConfiguredGroup(chat.id, config)) return null;
 	const userId = String(from.id);
 
 	if (await isUserWhitelisted(env, userId)) return null;
-	if (isPrimaryOwner(userId, config)) return null;
+	if (isOwner(userId, config)) return null;
 	if (await isGroupAdmin(env, chat.id, userId)) return null;
 
 	const text = String(message.text ?? message.caption ?? '').trim();
-	if (/^\/(addword|delword|words|addsample|adstats|whitelist|allowlist|ignore|exempt|rescreen|warmup)/i.test(text)) return null;
+	if (/^\/(addword|delword|words|addsample|adstats|whitelist|allowlist|ignore|exempt|rescreen|warmup|add_group|del_group|groups|add_owner|del_owner|owners|ad)/i.test(text)) return null;
 
 	const contactName = getContactName(message);
 	const quotedText = getQuotedText(message);
@@ -496,8 +561,13 @@ async function detectAdOnMessage(env, message) {
 	await adDetectionReady(env);
 
 	const normalized = normalizeAdText(bodyText);
-
 	const name = [from.first_name, from.last_name].filter(Boolean).join(' ').trim();
+
+	// 误判放行库（主人 /ignore 过）→ 直接放行。
+	if (await matchAllowlist(env, { text: normalized, name, username: from.username })) {
+		return { action: 'pass', allowlist: true };
+	}
+
 	const candidates = [
 		{ type: 'username', value: from.username ? '@' + from.username : '' },
 		{ type: 'name', value: name },
@@ -521,7 +591,10 @@ async function detectAdOnMessage(env, message) {
 
 	const solicit = matchAnyPattern(SOLICIT_PATTERNS, normalized);
 	const biz = matchAnyPattern(BIZ_PATTERNS, normalized);
-	const structureKill = solicit && biz;
+	// 豁免词命中且无强交易动词 → 不按结构定罪（技术群误杀防护）。
+	const exemptHits = countKeywordHits(normalized, EXEMPT_KEYWORDS);
+	const tradeHits = countKeywordHits(normalized, TRADE_VERBS);
+	const structureKill = solicit && biz && !(exemptHits.length > 0 && tradeHits.length === 0);
 
 	const semantic = await matchAdSemantic(env, bodyText, config);
 
@@ -542,18 +615,23 @@ async function openJoinHit(env, userId, chatId, fingerprint, action) {
 	).bind(String(userId), String(chatId), fingerprint.id, fingerprint.norm_value, action, nowSeconds()).run();
 }
 
+async function notifyOwners(env, config, text, extra = {}) {
+	for (const oid of config.ownerIds) {
+		await sendMessage(env, oid, text, extra).catch(() => {});
+	}
+}
+
 async function notifyFingerprintPending(env, config, userId, chat, fingerprint) {
-	const ownerId = [...config.ownerIds][0];
-	if (!ownerId) return;
 	const kb = {
 		inline_keyboard: [[
 			{ text: '✅ 确认指纹并全群封禁', callback_data: `c:fp:${fingerprint.id}:confirm:${userId}` },
 			{ text: '🚫 误报，忽略', callback_data: `c:fp:${fingerprint.id}:ignore:${userId}` }
 		]]
 	};
-	await sendMessage(env, ownerId,
-		`👤 新成员 <code>${userId}</code> 在群「${chat?.title || chat?.id || ''}」命中待确认指纹：\n\n` +
+	await notifyOwners(env, config,
+		`👤 命中待确认指纹（<code>${fingerprint.type || 'keyword'}</code>）：\n\n` +
 		`<code>${fingerprint.value || fingerprint.norm_value}</code>\n\n` +
+		`用户 <code>${userId}</code> · 群「${chat?.title || chat?.id || ''}」\n` +
 		`已先禁言当前群。确认后该指纹下次再遇将自动全群封禁。`, { reply_markup: kb });
 }
 
@@ -564,7 +642,7 @@ async function handleNewChatMembers(env, message) {
 	const chat = message?.chat;
 	const members = message?.new_chat_members;
 	if (!chat || !Array.isArray(members) || !members.length) return;
-	const config = loadConfig(env);
+	const config = await loadConfig(env);
 	if (!isConfiguredGroup(chat.id, config)) return;
 	await adDetectionReady(env);
 
@@ -572,7 +650,7 @@ async function handleNewChatMembers(env, message) {
 		if (m.is_bot) continue;
 		const userId = String(m.id);
 		if (await isUserWhitelisted(env, userId)) continue;
-		if (isPrimaryOwner(userId, config)) continue;
+		if (isOwner(userId, config)) continue;
 		const name = [m.first_name, m.last_name].filter(Boolean).join(' ').trim();
 		const candidates = [
 			{ type: 'username', value: m.username ? '@' + m.username : '' },
@@ -631,6 +709,67 @@ async function recordBanScope(env, userId, chatId, reason) {
 	).bind(String(userId), String(chatId), reason, nowSeconds()).run();
 }
 
+// 误判放行库：主人 /ignore 过的人/文本/用户名，检测时直接放行。
+async function matchAllowlist(env, dims = {}) {
+	const checks = [
+		['text', dims.text],
+		['name', dims.name],
+		['username', String(dims.username || '').replace(/^@/, '').toLowerCase()]
+	];
+	for (const [dim, raw] of checks) {
+		const value = dim === 'username' ? raw : normalizeAdText(raw);
+		if (!value || value.length < 2) continue;
+		const row = await env.DB.prepare(
+			'SELECT 1 AS x FROM ad_allowlist WHERE dimension = ? AND value = ?'
+		).bind(dim, value).first();
+		if (row) return true;
+	}
+	return false;
+}
+
+// 消息台账：记录配置群内每条消息，/spam、/ad 清扫时按用户批量删除。
+async function recordMessage(env, message) {
+	const chat = message?.chat, from = message?.from;
+	if (!chat || !from || !message.message_id) return;
+	if (chat.type !== 'group' && chat.type !== 'supergroup') return;
+	const config = await loadConfig(env);
+	if (!isConfiguredGroup(chat.id, config)) return;
+	await env.DB.prepare(
+		'INSERT OR IGNORE INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)'
+	).bind(message.message_id, String(chat.id), String(from.id), nowSeconds()).run();
+}
+
+// 清扫某人在某群的全部已记录消息（含额外 message_id）。
+async function sweepUserMessages(env, chatId, userId, extraIds = []) {
+	const ids = new Set((extraIds || []).map((x) => String(x)).filter(Boolean));
+	const rows = await env.DB.prepare(
+		'SELECT mid FROM moderation_messages WHERE chat_id = ? AND from_id = ?'
+	).bind(String(chatId), String(userId)).all();
+	for (const r of rows.results || []) ids.add(String(r.mid));
+	let deleted = 0, failed = 0;
+	for (const mid of ids) {
+		const res = await tgCall(env, 'deleteMessage', { chat_id: chatId, message_id: Number(mid) }).catch(() => null);
+		if (res?.ok === true) {
+			deleted++;
+			await env.DB.prepare('DELETE FROM moderation_messages WHERE chat_id = ? AND mid = ?').bind(String(chatId), mid).run();
+		} else {
+			failed++;
+		}
+	}
+	return { deleted, failed };
+}
+
+async function sweepUserMessagesAllGroups(env, userId, config, extraMid, extraChatId) {
+	let deleted = 0, failed = 0;
+	for (const gid of config.groupIds) {
+		const extra = String(gid) === String(extraChatId) ? [extraMid] : [];
+		const r = await sweepUserMessages(env, gid, userId, extra);
+		deleted += r.deleted;
+		failed += r.failed;
+	}
+	return { deleted, failed };
+}
+
 // =============================================================================
 // 13. 命令路由
 // =============================================================================
@@ -644,19 +783,34 @@ async function handleCommand(env, message) {
 	const arg = (m[2] || '').trim();
 	const chat = message.chat;
 	const from = message.from;
-	const config = loadConfig(env);
-	const isOwner = isPrimaryOwner(from?.id, config);
+	const config = await loadConfig(env);
+	const isAnyOwner = isOwner(from?.id, config);
+	const isPrimary = isPrimaryOwner(from?.id, config);
 
 	switch (command) {
-		case 'ban': return handleBan(env, message, arg, config, isOwner);
-		case 'spam': return handleSpam(env, message, arg, config, isOwner);
-		case 'unban': return handleUnban(env, message, arg, config, isOwner);
+		case 'ad': return handleAd(env, message, config);
+		case 'ban': return handleBan(env, message, arg, config, isAnyOwner);
+		case 'spam': return handleSpam(env, message, arg, config, isAnyOwner);
+		case 'unban': return handleUnban(env, message, arg, config, isAnyOwner);
 		case 'check': return handleCheck(env, message, arg, config);
-		case 'pending': return handlePending(env, message, config, isOwner);
-		case 'add_whitelist': return handleAddWhitelist(env, message, arg, config, isOwner);
-		case 'del_whitelist': return handleDelWhitelist(env, message, arg, config, isOwner);
-		case 'whitelist_users': return handleListWhitelist(env, message, config, isOwner);
-		case 'help': return sendMessage(env, chat.id, renderHelp(isOwner));
+		case 'pending': return handlePending(env, message, config, isAnyOwner);
+		case 'add_whitelist': return handleAddWhitelist(env, message, arg, config, isPrimary);
+		case 'del_whitelist': return handleDelWhitelist(env, message, arg, config, isPrimary);
+		case 'whitelist_users': return handleListWhitelist(env, message, config, isPrimary);
+		case 'add_owner': return handleAddOwner(env, message, arg, config, isPrimary);
+		case 'del_owner': return handleDelOwner(env, message, arg, config, isPrimary);
+		case 'owners': return handleOwners(env, message, config, isAnyOwner);
+		case 'add_group': return handleAddGroup(env, message, arg, config, isPrimary);
+		case 'del_group': return handleDelGroup(env, message, arg, config, isPrimary);
+		case 'groups': return handleGroups(env, message, config, isAnyOwner);
+		case 'addword': return handleAddWord(env, message, arg, config, isPrimary);
+		case 'delword': return handleDelWord(env, message, arg, config, isPrimary);
+		case 'words': return handleWords(env, message, config, isAnyOwner);
+		case 'addsample': return handleAddSample(env, message, arg, config, isPrimary);
+		case 'adstats': return handleAdStats(env, message, config, isAnyOwner);
+		case 'ignore': return handleIgnore(env, message, config, isAnyOwner);
+		case 'allowlist': return handleAllowlist(env, message, config, isAnyOwner);
+		case 'help': return sendMessage(env, chat.id, renderHelp(isAnyOwner));
 		default: return false;
 	}
 }
@@ -689,29 +843,40 @@ async function handleSpam(env, message, arg, config, isOwner) {
 	if (!isOwner) {
 		const admin = await isGroupAdmin(env, chat.id, message.from.id);
 		if (!admin) return sendMessage(env, chat.id, '只有群管理员或主人可以 /spam');
+		// 群管理员：只封禁当前群 + 清扫此人当前群全部消息；全群封禁留给主人确认。
+		const banRes = await banMember(env, chat.id, targetId).catch((e) => ({ ok: false, description: String(e?.message || e) }));
+		await recordBanScope(env, targetId, chat.id, 'group_admin_spam');
+		const sweep = await sweepUserMessages(env, chat.id, targetId, [replied.message_id]);
 		await notifySpamForApproval(env, config, chat, targetId, adText, message.from.id);
-		return sendMessage(env, chat.id, '已上报主人审核，待确认后处理。');
+		const lines = [`✅ 已在本群封禁 <code>${targetId}</code> 并清扫消息 ${sweep.deleted} 条`];
+		if (sweep.failed > 0) lines.push(`⚠️ ${sweep.failed} 条清扫失败`);
+		if (!banRes?.ok) lines.push(`⚠️ 封禁失败：${banRes?.description || ''}`);
+		lines.push('已上报主人，待确认后全群封禁。');
+		return sendMessage(env, chat.id, lines.join('\n'));
 	}
 
+	// 主人：黑名单 + 全群封禁 + 全群清扫 + 学习语义/指纹。
 	await addBlacklist(env, targetId, 'spam', arg, message.from.id);
 	const result = await banAllGroups(env, targetId, config, 'spam');
+	const sweep = await sweepUserMessagesAllGroups(env, targetId, config, replied.message_id, chat.id);
 	await learnFingerprints(env, [
 		{ type: 'keyword', value: adText },
 		{ type: 'username', value: replied.from?.username ? '@' + replied.from.username : '' },
 		...(contactName ? [{ type: 'card_name', value: contactName }] : [])
 	], { source: 'spam' });
 	await addAdSample(env, adText, { source: 'spam', computeEmbedding: true });
-	return sendMessage(env, chat.id, `🎬 /spam 已加黑名单并全群封禁 <code>${targetId}</code>\n${renderBanAllReceipt(result)}`);
+	const lines = [`🎬 /spam 已加黑名单并全群封禁 <code>${targetId}</code>`];
+	lines.push(renderBanAllReceipt(result));
+	lines.push(`🧹 已清扫消息 ${sweep.deleted} 条${sweep.failed > 0 ? `，${sweep.failed} 条失败` : ''}`);
+	return sendMessage(env, chat.id, lines.join('\n'));
 }
 
 async function notifySpamForApproval(env, config, chat, targetId, adText, reporterId) {
-	const ownerId = [...config.ownerIds][0];
-	if (!ownerId) return;
-	const kb = { inline_keyboard: [[{ text: '✅ 确认并全群封禁', callback_data: `c:spam:${targetId}` }]] };
-	await sendMessage(env, ownerId,
+	const kb = { inline_keyboard: [[{ text: '✅ 确认并全群封禁 + 清扫消息', callback_data: `c:spam:${targetId}` }]] };
+	await notifyOwners(env, config,
 		`⚠️ 群管理员 <code>${reporterId}</code> 在「${chat?.title || chat?.id || ''}」用 /spam 上报：\n\n` +
 		`🎯 目标：<code>${targetId}</code>\n📄 内容：<code>${(adText || '(空)').slice(0, 300)}</code>\n\n` +
-		`只有你能确认全群封禁。`, { reply_markup: kb });
+		`本群已封禁并清扫该用户消息。只有主人确认后才全群封禁。`, { reply_markup: kb });
 }
 
 async function handleUnban(env, message, arg, config, isOwner) {
@@ -783,6 +948,203 @@ async function handleListWhitelist(env, message, config, isOwner) {
 	return sendMessage(env, message.chat.id, '用户白名单：\n' + list.map((r) => `<code>${r.user_id}</code> ${r.note || ''}`).join('\n'));
 }
 
+// =============================================================================
+// 13b. /ad：群成员回复消息 → AI 判定广告 → 禁言 + 删除引用消息 + 推主人
+// =============================================================================
+async function judgeAdWithAI(env, text) {
+	if (!env.AI) return { isAd: false, error: 'no_ai' };
+	if (env.__aiJudgeMock) return await env.__aiJudgeMock(text);
+	const model = String(env.AD_JUDGE_MODEL || '@cf/qwen/qwen1.5-7b-chat-awq');
+	const res = await env.AI.run(model, {
+		messages: [
+			{ role: 'system', content: '你是群聊广告判定器。只输出一个词：ad 或 ok。' },
+			{ role: 'user', content: `判断这条消息是不是广告/诈骗/引流（含谐音、拆字、emoji、变体）。是广告回复 ad，否则回复 ok。\n消息：${String(text).slice(0, 800)}` }
+		],
+		max_tokens: 8
+	});
+	const out = String(res?.response || res?.result?.response || JSON.stringify(res)).toLowerCase();
+	return { isAd: out.includes('ad') && !out.includes('ok') };
+}
+
+async function handleAd(env, message, config) {
+	const chat = message.chat;
+	if (chat?.type !== 'group' && chat?.type !== 'supergroup') {
+		return sendMessage(env, chat.id, '请在群里回复一条消息后发送 /ad');
+	}
+	const replied = message.reply_to_message;
+	if (!replied) return sendMessage(env, chat.id, '用法：回复一条消息后发送 /ad，让 AI 判定广告');
+	const targetId = String(replied.from?.id || '');
+	const targetName = [replied.from?.first_name, replied.from?.last_name].filter(Boolean).join(' ').trim() || targetId;
+	const adText = [replied.text, replied.caption, getContactName(replied)].filter(Boolean).join('\n').trim();
+	if (!adText) return sendMessage(env, chat.id, '引用的消息没有可判定的正文');
+
+	const verdict = await judgeAdWithAI(env, adText);
+	if (verdict.error) return sendMessage(env, chat.id, 'AI 判定失败，请稍后再试或改用 /spam 上报');
+
+	if (verdict.isAd) {
+		await muteInCurrentGroup(env, chat.id, targetId);
+		const sweep = await sweepUserMessages(env, chat.id, targetId, [replied.message_id]);
+		await notifyAdReport(env, config, chat, message.from.id, targetId, targetName, adText, true);
+		const lines = [`🤖 AI 判定为广告：已禁言 <code>${targetName}</code> 并删除引用消息 ${sweep.deleted} 条`];
+		if (sweep.failed > 0) lines.push(`⚠️ ${sweep.failed} 条清扫失败`);
+		lines.push('已推送主人。');
+		return sendMessage(env, chat.id, lines.join('\n'));
+	}
+	await notifyAdReport(env, config, chat, message.from.id, targetId, targetName, adText, false);
+	return sendMessage(env, chat.id, '🤖 AI 判定：不是广告（已推送主人复核）。');
+}
+
+async function notifyAdReport(env, config, chat, reporterId, targetId, targetName, adText, isAd) {
+	const kb = isAd
+		? { inline_keyboard: [[{ text: '✅ 确认并全群封禁 + 清扫消息', callback_data: `c:spam:${targetId}` }]] }
+		: undefined;
+	await notifyOwners(env, config,
+		`📢 群成员 <code>${reporterId}</code> 在「${chat?.title || chat?.id || ''}」用 /ad 举报：\n\n` +
+		`🎯 被举报人：<code>${targetName}</code>（<code>${targetId}</code>）\n` +
+		`🤖 AI 判定：${isAd ? '广告 ✅' : '非广告 🚫'}\n` +
+		`📄 正文：<code>${(adText || '(空)').slice(0, 300)}</code>`, { reply_markup: kb });
+}
+
+// =============================================================================
+// 13c. 主人/副主人管理命令
+// =============================================================================
+async function addFingerprintManual(env, value, type, by) {
+	const norm = normalizeFingerprintValue(value);
+	if (norm.length < FINGERPRINT_MIN_LEN) return { ok: false, reason: 'too_short' };
+	const existing = await env.DB.prepare('SELECT id FROM ad_fingerprints WHERE type = ? AND norm_value = ?').bind(type, norm).first();
+	if (existing) {
+		await env.DB.prepare("UPDATE ad_fingerprints SET status = 'confirmed', confirmed_by = ?, updated_at = ? WHERE id = ?")
+			.bind(String(by || ''), nowSeconds(), existing.id).run();
+		return { ok: true, existed: true };
+	}
+	await env.DB.prepare(
+		`INSERT INTO ad_fingerprints (type, value, norm_value, weight, status, source, confirmed_by, created_at, updated_at)
+		 VALUES (?, ?, ?, 0.8, 'confirmed', 'manual', ?, ?, ?)`
+	).bind(type, String(value).slice(0, 200), norm, String(by || ''), nowSeconds(), nowSeconds()).run();
+	return { ok: true, added: true };
+}
+
+async function removeFingerprint(env, value, type) {
+	const norm = normalizeFingerprintValue(value);
+	await env.DB.prepare('DELETE FROM ad_fingerprints WHERE type = ? AND (value = ? OR norm_value = ?)')
+		.bind(type, String(value).slice(0, 200), norm).run();
+}
+
+async function handleAddWord(env, message, arg, config, isPrimary) {
+	if (!isPrimary || message.chat?.type !== 'private') return sendMessage(env, message.chat.id, '仅主人在私聊可用');
+	if (!arg) return sendMessage(env, message.chat.id, '用法：/addword <广告词>');
+	const r = await addFingerprintManual(env, arg, 'keyword', message.from.id);
+	return sendMessage(env, message.chat.id, r.existed ? `⚠️ 指纹已存在，已确认为可用：<code>${arg}</code>` : `✅ 已加指纹并直接确认：<code>${arg}</code>`);
+}
+async function handleDelWord(env, message, arg, config, isPrimary) {
+	if (!isPrimary) return sendMessage(env, message.chat.id, '仅主人可用');
+	if (!arg) return sendMessage(env, message.chat.id, '用法：/delword <广告词>');
+	await removeFingerprint(env, arg, 'keyword');
+	return sendMessage(env, message.chat.id, `✅ 已删除指纹：<code>${arg}</code>`);
+}
+async function handleWords(env, message, config, isOwner) {
+	if (!isOwner) return sendMessage(env, message.chat.id, '仅主人可用');
+	const rows = await env.DB.prepare('SELECT type, value, status, hit_count FROM ad_fingerprints ORDER BY updated_at DESC LIMIT 50').all();
+	const list = rows.results || [];
+	if (!list.length) return sendMessage(env, message.chat.id, '指纹库为空。');
+	return sendMessage(env, message.chat.id, '指纹库：\n' + list.map((r) => `<code>${r.value}</code> [${r.type}/${r.status}]×${r.hit_count}`).join('\n'));
+}
+async function handleAddSample(env, message, arg, config, isPrimary) {
+	if (!isPrimary || message.chat?.type !== 'private') return sendMessage(env, message.chat.id, '仅主人在私聊可用');
+	if (!arg) return sendMessage(env, message.chat.id, '用法：/addsample <广告文本>');
+	const r = await addAdSample(env, arg, { source: 'manual', computeEmbedding: true });
+	return sendMessage(env, message.chat.id, r.merged ? `🧠 已合并进语义簇 #${r.sampleId}（第 ${r.tier} 级）` : '🧠 已新增语义样本');
+}
+async function handleAdStats(env, message, config, isOwner) {
+	if (!isOwner) return sendMessage(env, message.chat.id, '仅主人可用');
+	const black = await env.DB.prepare('SELECT COUNT(*) AS c FROM blacklist').first();
+	const samples = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_samples').first();
+	const fps = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_fingerprints').first();
+	const pendingFps = await env.DB.prepare("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE status = 'pending'").first();
+	const groups = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_groups').first();
+	return sendMessage(env, message.chat.id,
+		`📊 黑名单 ${black.c} · 语义簇 ${samples.c} · 指纹 ${fps.c}（待确认 ${pendingFps.c}）· 授权群 ${groups.c}`);
+}
+async function handleIgnore(env, message, config, isOwner) {
+	if (!isOwner) return sendMessage(env, message.chat.id, '仅主人可用');
+	const replied = message.reply_to_message;
+	if (!replied) return sendMessage(env, message.chat.id, '用法：回复一条消息后发送 /ignore');
+	const text = String(replied.text || replied.caption || '').trim();
+	const name = [replied.from?.first_name, replied.from?.last_name].filter(Boolean).join(' ').trim();
+	const username = String(replied.from?.username || '').replace(/^@/, '').toLowerCase();
+	let added = 0;
+	const entries = [];
+	if (text) entries.push(['text', text]);
+	if (name) entries.push(['name', name]);
+	if (username) entries.push(['username', username]);
+	for (const [dim, raw] of entries) {
+		const value = dim === 'username' ? username : normalizeAdText(raw);
+		if (!value) continue;
+		await env.DB.prepare('INSERT OR IGNORE INTO ad_allowlist (dimension, value, hit_count, created_at) VALUES (?, ?, 0, ?)')
+			.bind(dim, value, nowSeconds()).run();
+		added++;
+	}
+	return sendMessage(env, message.chat.id, `✅ 已加入误判放行库 ${added} 条`);
+}
+async function handleAllowlist(env, message, config, isOwner) {
+	if (!isOwner) return sendMessage(env, message.chat.id, '仅主人可用');
+	const rows = await env.DB.prepare('SELECT dimension, value, hit_count FROM ad_allowlist ORDER BY dimension, value LIMIT 50').all();
+	const list = rows.results || [];
+	if (!list.length) return sendMessage(env, message.chat.id, '误判放行库为空。');
+	return sendMessage(env, message.chat.id, '误判放行库：\n' + list.map((r) => `<code>${r.dimension}:${r.value}</code>`).join('\n'));
+}
+async function handleAddGroup(env, message, arg, config, isPrimary) {
+	if (!isPrimary || message.chat?.type !== 'private') return sendMessage(env, message.chat.id, '仅主人在私聊可用');
+	const gid = String(arg || '').trim();
+	if (!/^-?\d+$/.test(gid)) return sendMessage(env, message.chat.id, '用法：/add_group <群ID>');
+	await env.DB.prepare('INSERT OR REPLACE INTO ad_groups (chat_id, added_by, created_at) VALUES (?, ?, ?)')
+		.bind(gid, String(message.from.id), nowSeconds()).run();
+	invalidateGroups();
+	return sendMessage(env, message.chat.id, `✅ 已授权群 <code>${gid}</code>`);
+}
+async function handleDelGroup(env, message, arg, config, isPrimary) {
+	if (!isPrimary) return sendMessage(env, message.chat.id, '仅主人可用');
+	const gid = String(arg || '').trim();
+	if (!gid) return sendMessage(env, message.chat.id, '用法：/del_group <群ID>');
+	await env.DB.prepare('DELETE FROM ad_groups WHERE chat_id = ?').bind(gid).run();
+	invalidateGroups();
+	return sendMessage(env, message.chat.id, `✅ 已移除授权群 <code>${gid}</code>`);
+}
+async function handleGroups(env, message, config, isOwner) {
+	if (!isOwner) return sendMessage(env, message.chat.id, '仅主人可用');
+	const rows = await env.DB.prepare('SELECT chat_id FROM ad_groups ORDER BY created_at').all();
+	const list = rows.results || [];
+	const lines = [config.primaryGroup ? `主群：<code>${config.primaryGroup}</code>` : '（未配置主群）'];
+	for (const r of list) lines.push(`授权群：<code>${r.chat_id}</code>`);
+	return sendMessage(env, message.chat.id, lines.join('\n'));
+}
+async function handleAddOwner(env, message, arg, config, isPrimary) {
+	if (!isPrimary || message.chat?.type !== 'private') return sendMessage(env, message.chat.id, '仅主人在私聊可用');
+	const uid = String(arg || '').trim();
+	if (!/^-?\d+$/.test(uid)) return sendMessage(env, message.chat.id, '用法：/add_owner <用户ID>');
+	await env.DB.prepare('INSERT OR REPLACE INTO ad_owners (user_id, added_by, created_at) VALUES (?, ?, ?)')
+		.bind(uid, String(message.from.id), nowSeconds()).run();
+	invalidateOwners();
+	return sendMessage(env, message.chat.id, `✅ 已设副主人 <code>${uid}</code>`);
+}
+async function handleDelOwner(env, message, arg, config, isPrimary) {
+	if (!isPrimary) return sendMessage(env, message.chat.id, '仅主人可用');
+	const uid = String(arg || '').trim();
+	if (!uid) return sendMessage(env, message.chat.id, '用法：/del_owner <用户ID>');
+	if (uid === config.primaryOwner) return sendMessage(env, message.chat.id, '不能删除主主人');
+	await env.DB.prepare('DELETE FROM ad_owners WHERE user_id = ?').bind(uid).run();
+	invalidateOwners();
+	return sendMessage(env, message.chat.id, `✅ 已移除副主人 <code>${uid}</code>`);
+}
+async function handleOwners(env, message, config, isOwner) {
+	if (!isOwner) return sendMessage(env, message.chat.id, '仅主人可用');
+	const rows = await env.DB.prepare('SELECT user_id FROM ad_owners ORDER BY created_at').all();
+	const list = rows.results || [];
+	const lines = [config.primaryOwner ? `主人：<code>${config.primaryOwner}</code>` : '（未配置主人）'];
+	for (const r of list) lines.push(`副主人：<code>${r.user_id}</code>`);
+	return sendMessage(env, message.chat.id, lines.join('\n'));
+}
+
 async function resolveTargetId(env, message, arg) {
 	if (/^-?\d+$/.test(String(arg || '').trim())) return String(arg.trim());
 	const replied = message?.reply_to_message;
@@ -793,15 +1155,29 @@ async function resolveTargetId(env, message, arg) {
 function renderHelp(isOwner) {
 	const lines = [
 		'<b>TGUnbanBot-Plus Beta</b>',
+		'/ad — 回复消息让 AI 判定广告（群成员可用，命中即删+禁言并推主人）',
 		'/ban <ID> — 封禁（主人=全群；群管理员=仅当前群）',
-		'/spam — 回复广告消息举报（主人=全群；群管理员=上报待确认）',
+		'/spam — 回复广告消息（主人=全群+清扫；群管理员=封本群+清扫并上报）',
 		'/unban <ID> — 解除黑名单并全群解封（仅主人）',
 		'/check [ID] — 查看黑名单/封禁台账',
 		'/pending — 查看待确认指纹命中（仅主人）'
 	];
 	if (isOwner) {
 		lines.push(
-			'/add_whitelist <ID> — 加入用户白名单（仅私聊）',
+			'/add_group <ID> — 授权群（仅主人私聊）',
+			'/del_group <ID> — 移除授权群',
+			'/groups — 列出主群与授权群',
+			'/add_owner <ID> — 设副主人（仅主人私聊）',
+			'/del_owner <ID> — 移除副主人',
+			'/owners — 列出主人/副主人',
+			'/addword <词> — 加指纹并直接确认（仅主人私聊）',
+			'/delword <词> — 删指纹',
+			'/words — 列指纹库',
+			'/addsample <文本> — 手工加语义样本（仅主人私聊）',
+			'/adstats — 统计',
+			'/ignore — 回复消息加入误判放行库',
+			'/allowlist — 列放行库',
+			'/add_whitelist <ID> — 用户白名单（仅主人私聊）',
 			'/del_whitelist <ID> — 移出用户白名单',
 			'/whitelist_users — 列出用户白名单'
 		);
@@ -815,9 +1191,9 @@ function renderHelp(isOwner) {
 async function handleCallback(env, callback) {
 	const data = String(callback?.data || '');
 	const from = callback?.from;
-	const config = loadConfig(env);
-	if (!isPrimaryOwner(from?.id, config)) {
-		await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id, text: '只有主人可操作', show_alert: true });
+	const config = await loadConfig(env);
+	if (!isOwner(from?.id, config)) {
+		await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id, text: '只有主人或副主人可操作', show_alert: true });
 		return;
 	}
 	await adDetectionReady(env);
@@ -850,8 +1226,11 @@ async function handleCallback(env, callback) {
 		const userId = m[1];
 		await addBlacklist(env, userId, 'spam', 'owner_confirm', from.id);
 		const result = await banAllGroups(env, userId, config, 'spam_confirm');
+		const sweep = await sweepUserMessagesAllGroups(env, userId, config, null, null);
+		const sweepNote = sweep.failed > 0 ? `\n⚠️ ${sweep.failed} 条清扫失败` : '';
 		await editMessageText(env, callback.message?.chat?.id, callback.message?.message_id,
-			`✅ 已确认，用户 <code>${userId}</code> 已加黑并全群封禁。\n${renderBanAllReceipt(result)}`).catch(() => {});
+			`✅ 已确认，用户 <code>${userId}</code> 已加黑并全群封禁。\n${renderBanAllReceipt(result)}` +
+			`\n🧹 已清扫消息 ${sweep.deleted} 条${sweepNote}`).catch(() => {});
 		await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id });
 		return;
 	}
@@ -863,7 +1242,9 @@ async function handleCallback(env, callback) {
 // 15. 入口
 // =============================================================================
 async function handleUpdate(env, update) {
+	await adDetectionReady(env);
 	if (update?.message) {
+		await recordMessage(env, update.message);
 		if (Array.isArray(update.message.new_chat_members) && update.message.new_chat_members.length) {
 			await handleNewChatMembers(env, update.message);
 			return;
@@ -877,6 +1258,8 @@ async function handleUpdate(env, update) {
 
 async function scheduled(env) {
 	await adDetectionReady(env);
+	// 消息台账只保留 48h，防膨胀。
+	await env.DB.prepare('DELETE FROM moderation_messages WHERE created_at < ?').bind(nowSeconds() - 172800).run();
 	const rows = await env.DB.prepare('SELECT id, sample_text FROM ad_samples WHERE embedding IS NULL ORDER BY id ASC LIMIT 50').all();
 	for (const r of rows.results || []) {
 		try {
@@ -896,6 +1279,10 @@ export default {
 			return new Response('OK', { status: 200 });
 		}
 		if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+		const secret = env.WEBHOOK_SECRET;
+		if (secret && request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== secret) {
+			return new Response('Unauthorized', { status: 401 });
+		}
 		try {
 			const update = await request.json();
 			await handleUpdate(env, update);
@@ -911,13 +1298,16 @@ export default {
 
 // 供离线测试 import 的内部函数（Workers 只消费 default，命名导出无副作用）。
 export {
-	normalizeAdText, stripEmoji, toHalfWidth, keywordSignature, matchAnyPattern,
-	loadConfig, isConfiguredGroup, isPrimaryOwner, isUserWhitelisted, invalidateUserWhitelist,
+	normalizeAdText, stripEmoji, toHalfWidth, keywordSignature, countKeywordHits, matchAnyPattern,
+	loadConfig, isConfiguredGroup, isPrimaryOwner, isOwner, invalidateOwners, invalidateGroups,
+	isUserWhitelisted, invalidateUserWhitelist,
 	tgCall, sendMessage, restrictMember, banMember,
 	adDetectionReady, addAdSample, matchAdSemantic, embedText, cosineSimilarity,
 	matchFingerprints, learnFingerprints, confirmFingerprint, retireFingerprint,
 	muteInCurrentGroup, banAllGroups, renderBanAllReceipt,
 	getContactName, getQuotedText, detectAdOnMessage, handleNewChatMembers,
-	isGroupAdmin, isBlacklisted, addBlacklist, removeBlacklist,
+	isGroupAdmin, invalidateAdminCache, isBlacklisted, addBlacklist, removeBlacklist,
+	matchAllowlist, recordMessage, sweepUserMessages, sweepUserMessagesAllGroups,
+	judgeAdWithAI, handleAd, notifyAdReport,
 	handleCommand, handleCallback, resolveTargetId
 };
