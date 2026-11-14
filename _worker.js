@@ -693,6 +693,8 @@ async function detectAdOnMessage(env, message) {
 	if (from.is_bot && env.BOT_ID && String(from.id) === String(env.BOT_ID)) return null;
 	const config = await loadConfig(env);
 	if (!isConfiguredGroup(chat.id, config)) return null;
+	// 匿名管理员是可信的群管理身份，其转发/提醒内容不进自动检测。
+	if (isAnonymousAdminMessage(message)) return null;
 	const userId = String(from.id);
 
 	if (await isUserWhitelisted(env, userId)) return null;
@@ -941,6 +943,14 @@ async function handleNewChatMembers(env, message) {
 // =============================================================================
 // 11. 群管理员判断
 // =============================================================================
+// Telegram 匿名管理员以群身份发言，message.from 是匿名机器人，sender_chat 才是真实群身份。
+function isAnonymousAdminMessage(message) {
+	return Boolean(message?.sender_chat && message?.chat && String(message.sender_chat.id) === String(message.chat.id));
+}
+function getMessageActorId(message) {
+	if (isAnonymousAdminMessage(message)) return 'anonymous_admin:' + String(message.chat.id);
+	return String(message?.from?.id || '');
+}
 let adminCache = new Map();
 async function isGroupAdmin(env, chatId, userId) {
 	const key = `${chatId}:${userId}`;
@@ -1003,6 +1013,8 @@ async function recordMessage(env, message) {
 	if (chat.type !== 'group' && chat.type !== 'supergroup') return;
 	const config = await loadConfig(env);
 	if (!isConfiguredGroup(chat.id, config)) return;
+	// 匿名管理员消息不作为普通成员发言入台账，避免误清扫。
+	if (isAnonymousAdminMessage(message)) return;
 	await env.DB.prepare(
 		'INSERT OR IGNORE INTO moderation_messages (mid, chat_id, from_id, created_at) VALUES (?, ?, ?, ?)'
 	).bind(message.message_id, String(chat.id), String(from.id), nowSeconds()).run();
@@ -1105,13 +1117,13 @@ async function handleBan(env, message, arg, config, isOwner, ctx) {
 	const targetId = await resolveTargetId(env, message, arg);
 	if (!targetId) return sendGroupReceipt(env, chat, '用法：/ban <用户ID>（或回复一条消息）', ctx);
 	if (!isOwner) {
-		const admin = await isGroupAdmin(env, chat.id, message.from.id);
+		const admin = isAnonymousAdminMessage(message) || await isGroupAdmin(env, chat.id, message.from.id);
 		if (!admin) return sendGroupReceipt(env, chat, '只有群管理员或主人可以 /ban', ctx);
 		const res = await banMember(env, chat.id, targetId);
 		await recordBanScope(env, targetId, chat.id, 'group_admin_ban');
 		return sendGroupReceipt(env, chat, res?.ok ? `✅ 已在本群封禁 <code>${targetId}</code>` : `⚠️ 封禁失败：${res?.description || res?.error || ''}`, ctx);
 	}
-	await addBlacklist(env, targetId, 'manual', arg, message.from.id);
+	await addBlacklist(env, targetId, 'manual', arg, getMessageActorId(message));
 	const result = await banAllGroups(env, targetId, config, 'manual');
 	return sendGroupReceipt(env, chat, `🎯 已加黑名单并全群封禁 <code>${targetId}</code>\n${renderBanAllReceipt(result)}`, ctx);
 }
@@ -1126,13 +1138,13 @@ async function handleSpam(env, message, arg, config, isOwner, ctx) {
 	const adText = [replied.text, replied.caption, contactName, getQuotedText(replied)].filter(Boolean).join('\n').trim();
 
 	if (!isOwner) {
-		const admin = await isGroupAdmin(env, chat.id, message.from.id);
+		const admin = isAnonymousAdminMessage(message) || await isGroupAdmin(env, chat.id, message.from.id);
 		if (!admin) return sendGroupReceipt(env, chat, '只有群管理员或主人可以 /spam', ctx);
 		// 群管理员：只封禁当前群 + 清扫此人当前群全部消息；全群封禁留给主人确认。
 		const banRes = await banMember(env, chat.id, targetId).catch((e) => ({ ok: false, description: String(e?.message || e) }));
 		await recordBanScope(env, targetId, chat.id, 'group_admin_spam');
 		const sweep = await sweepUserMessages(env, chat.id, targetId, [replied.message_id]);
-		await notifySpamForApproval(env, config, chat, targetId, adText, message.from.id);
+		await notifySpamForApproval(env, config, chat, targetId, adText, getMessageActorId(message));
 		const lines = [`✅ 已在本群封禁 <code>${targetId}</code> 并清扫消息 ${sweep.deleted} 条`];
 		if (sweep.failed > 0) lines.push(`⚠️ ${sweep.failed} 条清扫失败`);
 		if (!banRes?.ok) lines.push(`⚠️ 封禁失败：${banRes?.description || ''}`);
@@ -1141,7 +1153,7 @@ async function handleSpam(env, message, arg, config, isOwner, ctx) {
 	}
 
 	// 主人：黑名单 + 全群封禁 + 全群清扫 + 学习语义/指纹。
-	await addBlacklist(env, targetId, 'spam', arg, message.from.id);
+	await addBlacklist(env, targetId, 'spam', arg, getMessageActorId(message));
 	const result = await banAllGroups(env, targetId, config, 'spam');
 	const sweep = await sweepUserMessagesAllGroups(env, targetId, config, replied.message_id, chat.id);
 	// Enforcement is explicit and independent: reviewer failure means zero learning, not rollback.
@@ -1165,8 +1177,8 @@ async function handleUnban(env, message, arg, config, isOwner, ctx) {
 	const targetId = await resolveTargetId(env, message, arg);
 	if (!targetId) return sendGroupReceipt(env, chat, '用法：/unban <用户ID>（或回复一条消息）', ctx);
 	if (!isOwner) {
-		// 群管理员可解封当前群，但不得解除主人设置的全群黑名单。
-		const admin = await isGroupAdmin(env, chat.id, message.from.id);
+		// 群管理员（含匿名管理员）可解封当前群，但不得解除主人设置的全群黑名单。
+		const admin = isAnonymousAdminMessage(message) || await isGroupAdmin(env, chat.id, message.from.id);
 		if (!admin) return sendGroupReceipt(env, chat, '只有群管理员或主人可以 /unban', ctx);
 		if (await isBlacklisted(env, targetId)) return sendGroupReceipt(env, chat, '该用户在全群黑名单中，仅主人可解封', ctx);
 		const res = await unbanMember(env, chat.id, targetId);
@@ -1506,14 +1518,14 @@ async function handleAd(env, message, config, ctx) {
 		if (targetIsBot) await banMember(env, chat.id, targetId).catch(() => null);
 		else await muteInCurrentGroup(env, chat.id, targetId);
 		const sweep = await sweepUserMessages(env, chat.id, targetId, [replied.message_id]);
-		await notifyAdReport(env, config, chat, message.from.id, targetId, targetName, adText, true);
+		await notifyAdReport(env, config, chat, getMessageActorId(message), targetId, targetName, adText, true);
 		const actionText = targetIsBot ? '已封禁' : '已禁言';
 		const lines = [`🤖 AI 判定为广告：${actionText} <code>${escapeHtml(targetName)}</code> 并删除引用消息 ${sweep.deleted} 条`];
 		if (sweep.failed > 0) lines.push(`⚠️ ${sweep.failed} 条清扫失败`);
 		lines.push('已推送主人。');
 		return sendGroupReceipt(env, chat, lines.join('\n'), ctx);
 	}
-	await notifyAdReport(env, config, chat, message.from.id, targetId, targetName, adText, false);
+	await notifyAdReport(env, config, chat, getMessageActorId(message), targetId, targetName, adText, false);
 	return sendGroupReceipt(env, chat, '🤖 AI 判定：不是广告（已推送主人复核）。', ctx);
 }
 
