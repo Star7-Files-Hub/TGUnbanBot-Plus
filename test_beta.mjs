@@ -362,7 +362,7 @@ section('E. /ad 群成员 AI 判定 + 推主人（新需求）');
 }
 
 // =============================================================================
-section('F. /ad 判定解析（not_ad / 中文否定不误判）');
+section('F. /ad 严格标签解析（未知输出报错、不处罚）');
 {
 	async function runJudge(responseText) {
 		const base = makeEnv();
@@ -371,10 +371,11 @@ section('F. /ad 判定解析（not_ad / 中文否定不误判）');
 		return judgeAdWithAI(e, '随便发一条消息');
 	}
 	assert('输出 ad → 判广告', (await runJudge('ad')).isAd === true);
-	assert('输出 广告 → 判广告', (await runJudge('广告')).isAd === true);
-	assert('输出 not_ad → 不判广告', (await runJudge('not_ad')).isAd === false);
-	assert('输出 不是广告 → 不判广告', (await runJudge('不是广告')).isAd === false);
-	assert('输出 正常 → 不判广告', (await runJudge('正常')).isAd === false);
+	assert('输出 ok → 正常标签', (await runJudge('ok')).isAd === false && !(await runJudge('ok')).error);
+	for (const value of ['广告', 'not_ad', '不是广告', '正常']) {
+		const verdict = await runJudge(value);
+		assert(`输出 ${value} → 严格报错而不是正常判定`, verdict.isAd === false && verdict.error === 'invalid_ai_response');
+	}
 }
 
 // =============================================================================

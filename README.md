@@ -1,5 +1,7 @@
 # CF-Workers-TGUnbanBot-Plus
 
+> **Beta 分支提示**：当前分支是独立重写的 Beta，不是 Plus 生产代码。最新 `/ad` AI 修复、仅第一主人复核通知、群内回执 8 秒撤回与部署/测试方法见 [Beta 变更说明](BETA_CHANGES.md)。下方为历史 Plus 文档，部分命令与配置不适用于 Beta；部署请显式指定 `wrangler.beta.toml`。
+
 ## 🙏 致敬原作者
 
 | 项目 | 信息 |
