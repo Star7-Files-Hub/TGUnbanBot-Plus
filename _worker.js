@@ -1163,8 +1163,16 @@ async function notifySpamForApproval(env, config, chat, targetId, adText, report
 async function handleUnban(env, message, arg, config, isOwner, ctx) {
 	const chat = message.chat;
 	const targetId = await resolveTargetId(env, message, arg);
-	if (!targetId) return sendMessage(env, chat.id, '用法：/unban <用户ID>（或回复一条消息）');
-	if (!isOwner) return sendMessage(env, chat.id, '只有主人可以 /unban');
+	if (!targetId) return sendGroupReceipt(env, chat, '用法：/unban <用户ID>（或回复一条消息）', ctx);
+	if (!isOwner) {
+		// 群管理员可解封当前群，但不得解除主人设置的全群黑名单。
+		const admin = await isGroupAdmin(env, chat.id, message.from.id);
+		if (!admin) return sendGroupReceipt(env, chat, '只有群管理员或主人可以 /unban', ctx);
+		if (await isBlacklisted(env, targetId)) return sendGroupReceipt(env, chat, '该用户在全群黑名单中，仅主人可解封', ctx);
+		const res = await unbanMember(env, chat.id, targetId);
+		await env.DB.prepare('DELETE FROM ad_ban_scope WHERE user_id = ? AND chat_id = ?').bind(targetId, String(chat.id)).run();
+		return sendGroupReceipt(env, chat, res?.ok ? `✅ 已在本群解封 <code>${targetId}</code>` : `⚠️ 解封失败：${res?.description || res?.error || ''}`, ctx);
+	}
 	await removeBlacklist(env, targetId);
 	let ok = 0;
 	for (const gid of config.groupIds) {

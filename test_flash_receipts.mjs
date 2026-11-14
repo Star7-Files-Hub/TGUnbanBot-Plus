@@ -153,7 +153,7 @@ for (const options of [{ deleteThrows: true }, { deleteRejects: true }]) {
 for (const [label, msg, verdict] of [
   ['AI failure', message('/ad'), 'unrecognized'],
   ['usage hint', { ...message('/ad'), reply_to_message: undefined }, 'ok'],
-  ['unauthorized unban', message('/unban 555'), 'ok'],
+  ['unauthorized private unban', message('/unban 555', 'private'), 'ok'],
 ]) {
   test(`Non-final or denied feedback remains unchanged: ${label}`, async () => {
     const h = harness({ verdict });
