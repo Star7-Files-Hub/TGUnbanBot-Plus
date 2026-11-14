@@ -268,6 +268,9 @@ section('C. 权限分级（R4/R5/R9 + 副主人/授权群命令）');
 	// C4 主人 /spam 直接全群封禁 + 学习
 	resetState();
 	const c4 = makeEnv();
+	const c4Ai = c4.env.AI.run.bind(c4.env.AI);
+	c4.env.AI.run = async (model, input) => model.includes('bge-m3') ? c4Ai(model, input)
+		: { response: JSON.stringify({ is_ad: true, candidates: ['高价收购实名号四件套，长期招代理'] }) };
 	await adDetectionReady(c4.env);
 	await c4.db.prepare('INSERT INTO ad_groups (chat_id, added_by, created_at) VALUES (?, ?, ?)').bind(GROUP2, OWNER, 1).run();
 	invalidateGroups();
@@ -275,7 +278,7 @@ section('C. 权限分级（R4/R5/R9 + 副主人/授权群命令）');
 		text: '/spam',
 		chat: { id: MAIN_GROUP, type: 'supergroup' },
 		from: { id: OWNER, first_name: '主人' },
-		reply_to_message: { message_id: 7200, from: { id: '41004', username: 'adman2' }, text: '收购账号 日结' }
+		reply_to_message: { message_id: 7200, from: { id: '41004', username: 'adman2' }, text: '高价收购实名号四件套，长期招代理' }
 	});
 	assert('主人 /spam 全群封禁 2 群', countMethod(c4.tgCalls, 'banChatMember') === 2);
 	const fpCount = await c4.db.prepare('SELECT COUNT(*) AS c FROM ad_fingerprints').first();
