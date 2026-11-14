@@ -1693,29 +1693,29 @@ function renderHelp(isOwner) {
 	const lines = [
 		'<b>TGUnbanBot-Plus Beta</b>',
 		'/ad — 回复消息让 AI 判定广告（群成员可用，命中即删+禁言并推主人）',
-		'/ban <ID> — 封禁（主人=全群；群管理员=仅当前群）',
+		'/ban <code>ID</code> — 封禁（主人=全群；群管理员=仅当前群）',
 		'/spam — 回复广告消息（主人=全群+清扫；群管理员=封本群+清扫并上报）',
-		'/unban <ID> — 解除黑名单并全群解封（仅主人）',
+		'/unban <code>ID</code> — 主人=解除黑名单并全群解封；群管理员=仅解封当前群',
 		'/check [ID] — 查看黑名单/封禁台账',
 		'/pending — 查看待确认指纹命中（仅主人）'
 	];
 	if (isOwner) {
 		lines.push(
-			'/add_group <ID> — 授权群（仅主人私聊）',
-			'/del_group <ID> — 移除授权群',
+			'/add_group <code>ID</code> — 授权群（仅主人私聊）',
+			'/del_group <code>ID</code> — 移除授权群',
 			'/groups — 列出主群与授权群',
-			'/add_owner <ID> — 设副主人（仅主人私聊）',
-			'/del_owner <ID> — 移除副主人',
+			'/add_owner <code>ID</code> — 设副主人（仅主人私聊）',
+			'/del_owner <code>ID</code> — 移除副主人',
 			'/owners — 列出主人/副主人',
-			'/addword <词> — 加指纹并直接确认（仅主人私聊）',
-			'/delword <词> — 删指纹',
+			'/addword <code>词</code> — 加指纹并直接确认（仅主人私聊）',
+			'/delword <code>词</code> — 删指纹',
 			'/words — 列指纹库',
-			'/addsample <文本> — 手工加语义样本（仅主人私聊）',
+			'/addsample <code>文本</code> — 手工加语义样本（仅主人私聊）',
 			'/adstats — 统计',
 			'/ignore — 回复消息加入误判放行库',
 			'/allowlist — 列放行库',
-			'/add_whitelist <ID> — 用户白名单（仅主人私聊）',
-			'/del_whitelist <ID> — 移出用户白名单',
+			'/add_whitelist <code>ID</code> — 用户白名单（仅主人私聊）',
+			'/del_whitelist <code>ID</code> — 移出用户白名单',
 			'/whitelist_users — 列出用户白名单'
 		);
 	}
