@@ -153,13 +153,22 @@ for (const options of [{ deleteThrows: true }, { deleteRejects: true }]) {
 for (const [label, msg, verdict] of [
   ['AI failure', message('/ad'), 'unrecognized'],
   ['usage hint', { ...message('/ad'), reply_to_message: undefined }, 'ok'],
-  ['unauthorized private unban', message('/unban 555', 'private'), 'ok'],
 ]) {
-  test(`Non-final or denied feedback remains unchanged: ${label}`, async () => {
+  test(`Group feedback also expires: ${label}`, async () => {
     const h = harness({ verdict });
     await throughFetch(h, msg);
-    assert.equal(h.tasks.length, 0);
-    assert.equal(h.timers.length, 0);
+    assert.equal(h.tasks.length, 1);
+    assert.equal(h.timers.length, 1);
     assert.equal(deletes(h).length, 0);
+    h.advance(8000);
+    await Promise.all(h.tasks);
+    assert.equal(deletes(h).length, 1);
   });
 }
+test('Non-final private feedback remains durable', async () => {
+  const h = harness();
+  await throughFetch(h, message('/unban 555', 'private'));
+  assert.equal(h.tasks.length, 0);
+  assert.equal(h.timers.length, 0);
+  assert.equal(deletes(h).length, 0);
+});
