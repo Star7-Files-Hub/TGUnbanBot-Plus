@@ -213,6 +213,27 @@ async function loadGroups(env) {
 function invalidateOwners() { ownerSetCache = null; ownerSetExp = 0; }
 function invalidateGroups() { groupSetCache = null; groupSetExp = 0; }
 
+let observeSetCache = null;
+let observeSetExp = 0;
+async function loadObserveGroups(env) {
+	const now = nowSeconds();
+	if (observeSetCache && now < observeSetExp) return observeSetCache;
+	const set = new Set();
+	try {
+		const rows = await env.DB.prepare('SELECT chat_id FROM ad_observe_groups').all();
+		for (const r of rows.results || []) set.add(String(r.chat_id));
+	} catch (_) {}
+	observeSetCache = set;
+	observeSetExp = now + CONFIG_TTL;
+	return set;
+}
+async function isObserveGroup(env, chatId) {
+	if (!chatId) return false;
+	const set = await loadObserveGroups(env);
+	return set.has(String(chatId));
+}
+function invalidateObserveGroups() { observeSetCache = null; observeSetExp = 0; }
+
 async function loadConfig(env) {
 	return {
 		primaryOwner: String(env.OWNER_ID || (env.OWNER_IDS || '').split(/[,，]/)[0] || '').trim(),
@@ -364,7 +385,14 @@ const SCHEMA_STATEMENTS = [
 		status TEXT NOT NULL DEFAULT 'open',
 		created_at INTEGER NOT NULL)`],
 	['bot_settings', `CREATE TABLE IF NOT EXISTS bot_settings (
-		key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)`]
+		key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)`],
+	['ad_observe_groups', `CREATE TABLE IF NOT EXISTS ad_observe_groups (
+		chat_id TEXT PRIMARY KEY, title TEXT, added_by TEXT, created_at INTEGER NOT NULL)`],
+	['ad_observe_reports', `CREATE TABLE IF NOT EXISTS ad_observe_reports (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id TEXT NOT NULL, chat_id TEXT NOT NULL, message_id INTEGER,
+		body_text TEXT NOT NULL, name TEXT, reason TEXT,
+		status TEXT NOT NULL DEFAULT 'open', created_at INTEGER NOT NULL)`]
 ];
 
 // schema 按 isolate 只建一次（env 每个请求都是新对象，不能挂在 env 上）。
@@ -706,14 +734,14 @@ function getQuotedText(message) {
 	return [message?.quote?.text, ext?.text, ext?.caption, reply?.text, reply?.caption].filter(Boolean).join('\n').trim();
 }
 
-async function detectAdOnMessage(env, message) {
+async function detectAdOnMessage(env, message, options = {}) {
 	const chat = message?.chat;
 	const from = message?.from;
 	if (!chat || !from) return null;
 	// 只跳过自家 bot；广告 bot 发的广告照查（只处置不回复，避免触发其自动回复）。
 	if (from.is_bot && env.BOT_ID && String(from.id) === String(env.BOT_ID)) return null;
 	const config = await loadConfig(env);
-	if (!isConfiguredGroup(chat.id, config)) return null;
+	if (!options.observe && !isConfiguredGroup(chat.id, config)) return null;
 	// 匿名管理员是可信的群管理身份，其转发/提醒内容不进自动检测。
 	if (isAnonymousAdminMessage(message)) return null;
 	const userId = String(from.id);
@@ -752,6 +780,11 @@ async function detectAdOnMessage(env, message) {
 	const confirmedHit = fpHits.find((h) => h.status === 'confirmed');
 	const pendingHit = fpHits.find((h) => h.status === 'pending');
 
+	if (options.observe && fpHits.length) {
+		// 观察群不处置；已被指纹覆盖的消息无需再打扰主人。
+		return { action: 'pass', reason: 'fingerprint_hit', fingerprint: confirmedHit || pendingHit };
+	}
+
 	if (confirmedHit) {
 		await banAllGroups(env, userId, config, 'fingerprint:' + confirmedHit.norm_value);
 		return { action: 'ban_all', reason: 'fingerprint_confirmed', fingerprint: confirmedHit };
@@ -773,8 +806,12 @@ async function detectAdOnMessage(env, message) {
 	const semantic = await matchAdSemantic(env, bodyText, config);
 
 	if (structureKill || semantic.hit) {
-		const autoNotify = await getBotSetting(env, 'auto_ban_notify', '0') === '1';
 		const reason = structureKill ? '结构规则命中' : 'AI 语义命中';
+		if (options.observe) {
+			await notifyObserveCandidate(env, config, chat, userId, name, bodyText, reason, message.message_id);
+			return { action: 'observe', reason: structureKill ? 'structure' : 'ai', semantic };
+		}
+		const autoNotify = await getBotSetting(env, 'auto_ban_notify', '0') === '1';
 		if (from.is_bot) {
 			// bot 发的广告：restrict 对 bot 无效，直接封当前群 + 清扫它发的消息。
 			await banMember(env, chat.id, userId).catch(() => null);
@@ -829,6 +866,24 @@ async function notifyAutoBan(env, config, chat, userId, userName, reason, previe
 		`📍 群「${escapeHtml(chat?.title || chat?.id || '')}」\n` +
 		`🎯 原因：${escapeHtml(reason)}\n` +
 		`📄 内容：<code>${escapeHtml(String(preview || '').slice(0, 200))}</code>`);
+}
+
+async function notifyObserveCandidate(env, config, chat, userId, userName, text, reason, messageId) {
+	const inserted = await env.DB.prepare(
+		"INSERT INTO ad_observe_reports (user_id, chat_id, message_id, body_text, name, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
+	).bind(String(userId), String(chat?.id || ''), Number(messageId) || null, String(text || '').slice(0, 2000), String(userName || ''), String(reason || ''), nowSeconds()).run();
+	const reportId = Number(inserted?.meta?.last_row_id || 0);
+	const kb = { inline_keyboard: [[
+		{ text: '✅ 是广告，抓样本', callback_data: `o:save:${reportId}` },
+		{ text: '🚫 误判，放行', callback_data: `o:dismiss:${reportId}` }
+	]] };
+	await notifyOwners(env, config,
+		`👀 观察群疑似广告（未命中指纹）：\n\n` +
+		`👤 用户 <code>${escapeHtml(userId)}</code>${userName ? `（${escapeHtml(userName)}）` : ''}\n` +
+		`📍 群「${escapeHtml(chat?.title || chat?.id || '')}」\n` +
+		`🎯 原因：${escapeHtml(reason)}\n` +
+		`📄 内容：<code>${escapeHtml(String(text || '').slice(0, 300))}</code>\n\n` +
+		`请决定是否抓取样本。`, { reply_markup: kb });
 }
 
 async function notifyFingerprintPending(env, config, userId, chat, fingerprint) {
@@ -1151,6 +1206,9 @@ async function handleCommand(env, message, ctx) {
 		case 'add_group': return handleAddGroup(env, message, arg, config, isPrimary);
 		case 'del_group': return handleDelGroup(env, message, arg, config, isPrimary);
 		case 'groups': return handleGroups(env, message, config, isAnyOwner);
+		case 'addlisten': return handleAddListen(env, message, arg, config, isPrimary);
+		case 'dellisten': return handleDelListen(env, message, arg, config, isPrimary);
+		case 'listen_groups': return handleListenGroups(env, message, config, isAnyOwner);
 		case 'addword': return handleAddWord(env, message, arg, config, isPrimary);
 		case 'delword': return handleDelWord(env, message, arg, config, isPrimary);
 		case 'words': return handleWords(env, message, config, isAnyOwner);
@@ -1771,6 +1829,30 @@ async function handleGroups(env, message, config, isOwner) {
 	for (const r of list) lines.push(`授权群：<code>${r.chat_id}</code>`);
 	return sendMessage(env, message.chat.id, lines.join('\n'));
 }
+async function handleAddListen(env, message, arg, config, isPrimary) {
+	if (!isPrimary || message.chat?.type !== 'private') return sendMessage(env, message.chat.id, '仅主人在私聊可用');
+	const gid = String(arg || '').trim();
+	if (!/^-?\d+$/.test(gid)) return sendMessage(env, message.chat.id, '用法：/addlisten <群ID>');
+	await env.DB.prepare('INSERT OR REPLACE INTO ad_observe_groups (chat_id, added_by, created_at) VALUES (?, ?, ?)')
+		.bind(gid, String(message.from.id), nowSeconds()).run();
+	invalidateObserveGroups();
+	return sendMessage(env, message.chat.id, `✅ 已添加观察群 <code>${gid}</code>（只采集样本，不处置）`);
+}
+async function handleDelListen(env, message, arg, config, isPrimary) {
+	if (!isPrimary) return sendMessage(env, message.chat.id, '仅主人可用');
+	const gid = String(arg || '').trim();
+	if (!gid) return sendMessage(env, message.chat.id, '用法：/dellisten <群ID>');
+	await env.DB.prepare('DELETE FROM ad_observe_groups WHERE chat_id = ?').bind(gid).run();
+	invalidateObserveGroups();
+	return sendMessage(env, message.chat.id, `✅ 已移除观察群 <code>${gid}</code>`);
+}
+async function handleListenGroups(env, message, config, isOwner) {
+	if (!isOwner) return sendMessage(env, message.chat.id, '仅主人可用');
+	const rows = await env.DB.prepare('SELECT chat_id, created_at FROM ad_observe_groups ORDER BY created_at').all();
+	const list = rows.results || [];
+	if (!list.length) return sendMessage(env, message.chat.id, '观察群为空。\n用 /addlisten <群ID> 添加。');
+	return sendMessage(env, message.chat.id, '观察群：\n' + list.map((r) => `<code>${r.chat_id}</code>`).join('\n'));
+}
 async function handleAddOwner(env, message, arg, config, isPrimary) {
 	if (!isPrimary || message.chat?.type !== 'private') return sendMessage(env, message.chat.id, '仅主人在私聊可用');
 	const uid = String(arg || '').trim();
@@ -1867,7 +1949,38 @@ async function handleCallback(env, callback) {
 		return;
 	}
 
-	let m = data.match(/^c:fp:(\d+):(confirm|ignore):(\d+)$/);
+	let m = data.match(/^o:(save|dismiss):(\d+)$/);
+	if (m) {
+		if (!isPrimaryOwner(from?.id, config)) {
+			await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id, text: '仅第一主人可操作', show_alert: true });
+			return;
+		}
+		const action = m[1];
+		const reportId = Number(m[2]);
+		const report = await env.DB.prepare('SELECT * FROM ad_observe_reports WHERE id = ?').bind(reportId).first();
+		if (!report) {
+			await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id, text: '记录不存在', show_alert: true });
+			return;
+		}
+		if (String(report.status) !== 'open') {
+			await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id, text: '该记录已处理', show_alert: true });
+			return;
+		}
+		if (action === 'save') {
+			await addAdSample(env, report.body_text, { source: 'observe_confirm', computeEmbedding: true });
+			await env.DB.prepare("UPDATE ad_observe_reports SET status = 'saved' WHERE id = ?").bind(reportId).run();
+			await editMessageText(env, callback.message?.chat?.id, callback.message?.message_id,
+				`✅ 已抓取样本保存进数据库。\n\n📄 <code>${escapeHtml(String(report.body_text || '').slice(0, 300))}</code>`).catch(() => {});
+		} else {
+			await env.DB.prepare("UPDATE ad_observe_reports SET status = 'dismissed' WHERE id = ?").bind(reportId).run();
+			await editMessageText(env, callback.message?.chat?.id, callback.message?.message_id,
+				`🚫 已放行，不做任何操作。`).catch(() => {});
+		}
+		await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id });
+		return;
+	}
+
+	m = data.match(/^c:fp:(\d+):(confirm|ignore):(\d+)$/);
 	if (m) {
 		const fpId = Number(m[1]);
 		const action = m[2];
@@ -1936,6 +2049,11 @@ async function handleUpdate(env, update, ctx) {
 			return;
 		}
 		await adDetectionReady(env);
+		if (await isObserveGroup(env, message.chat?.id)) {
+			// 观察群只采集样本：不记台账、不处置、不进群流程，只通知未命中指纹的疑似广告。
+			await detectAdOnMessage(env, message, { observe: true });
+			return;
+		}
 		await recordMessage(env, message);
 		if (Array.isArray(message.new_chat_members) && message.new_chat_members.length) {
 			await handleNewChatMembers(env, message);
@@ -2025,7 +2143,7 @@ function move(kind,delta){
   load(kind);
 }
 async function load(kind){
-  var key=kind==='fp'?'fingerprints':kind;
+  var key=kind==='fp'?'fingerprints':'blacklist';
   var tbody=document.getElementById(kind+'-tbody');
   var meta=document.getElementById(kind+'-meta');
   var prev=document.getElementById(kind+'-prev');
@@ -2192,6 +2310,7 @@ export default {
 export {
 	normalizeAdText, stripEmoji, toHalfWidth, keywordSignature, countKeywordHits, matchAnyPattern,
 	loadConfig, isConfiguredGroup, isPrimaryOwner, isOwner, invalidateOwners, invalidateGroups,
+	isObserveGroup, invalidateObserveGroups, notifyObserveCandidate,
 	isUserWhitelisted, invalidateUserWhitelist,
 	tgCall, sendMessage, restrictMember, banMember,
 	adDetectionReady, resetSchemaState, addAdSample, matchAdSemantic, embedText, cosineSimilarity,
