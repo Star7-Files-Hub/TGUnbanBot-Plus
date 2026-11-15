@@ -61,3 +61,13 @@ test('public endpoints respect limit and report no_db', async () => {
   assert.equal(r.status, 503);
   assert.equal(r.body.error, 'no_db');
 });
+
+test('panel and docs pages render as HTML', async () => {
+  const env = {};
+  const panel = await worker.default.fetch(new Request('https://x/'), env);
+  assert.ok((panel.headers.get('content-type') || '').includes('text/html'));
+  assert.ok((await panel.text()).includes('数据预览'));
+  const docs = await worker.default.fetch(new Request('https://x/docs'), env);
+  assert.ok((docs.headers.get('content-type') || '').includes('text/html'));
+  assert.ok((await docs.text()).includes('API 文档'));
+});

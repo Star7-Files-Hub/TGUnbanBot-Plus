@@ -1955,6 +1955,97 @@ async function scheduled(env) {
 }
 
 // 公开只读 API：指纹库与黑名单列表。不含密钥、主人 ID、样本正文或内部备注。
+const PANEL_HTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TGUnbanBot Beta 数据预览</title>
+<style>
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
+header{padding:20px 24px;background:#1e293b;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+h1{font-size:18px;margin:0}
+nav a{color:#93c5fd;text-decoration:none;font-size:14px;margin-left:14px}
+main{max-width:1100px;margin:24px auto;padding:0 16px}
+.card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px;margin-bottom:24px}
+.card h2{font-size:15px;margin:0 0 12px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #334155;word-break:break-all}
+th{color:#94a3b8;font-weight:600}
+.meta{color:#94a3b8;font-size:12px;margin-top:10px}
+button{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
+button:hover{background:#1d4ed8}
+code{background:#0f172a;padding:2px 6px;border-radius:6px;color:#a5f3fc}
+</style>
+</head>
+<body>
+<header><h1>TGUnbanBot Beta 数据预览</h1><nav><a href="/docs">API 文档</a></nav></header>
+<main>
+<div class="card"><h2>广告指纹库</h2><table id="fingerprints"><thead><tr><th>value</th><th>type</th><th>status</th><th>hit_count</th><th>source</th></tr></thead><tbody></tbody></table><div class="meta" id="fingerprints-meta"></div><button onclick="load('fingerprints')">刷新指纹</button></div>
+<div class="card"><h2>黑名单列表</h2><table id="blacklist"><thead><tr><th>user_id</th><th>reason</th><th>created_at</th></tr></thead><tbody></tbody></table><div class="meta" id="blacklist-meta"></div><button onclick="load('blacklist')">刷新黑名单</button></div>
+</main>
+<script>
+async function load(kind){
+  const meta=document.getElementById(kind+'-meta');
+  const tbody=document.querySelector('#'+kind+' tbody');
+  meta.textContent='加载中...';
+  try{
+    const res=await fetch('/api/'+kind);
+    const data=await res.json();
+    if(!data.ok){meta.textContent='加载失败：'+(data.error||res.status);return;}
+    tbody.textContent='';
+    (data.items||[]).forEach(item=>{
+      const tr=document.createElement('tr');
+      const cells=kind==='fingerprints'
+        ?[item.value,item.type,item.status,item.hit_count,item.source]
+        :[item.user_id,item.reason,item.created_at?new Date(item.created_at*1000).toLocaleString():''];
+      cells.forEach(v=>{const td=document.createElement('td');td.textContent=(v===null||v===undefined)?'':String(v);tr.appendChild(td);});
+      tbody.appendChild(tr);
+    });
+    meta.textContent='共 '+data.count+' 条 · '+new Date().toLocaleString();
+  }catch(e){meta.textContent='加载失败：'+e.message;}
+}
+load('fingerprints');load('blacklist');
+</script>
+</body>
+</html>`;
+
+const DOCS_HTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TGUnbanBot Beta API 文档</title>
+<style>
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
+header{padding:20px 24px;background:#1e293b;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+h1{font-size:18px;margin:0}
+nav a{color:#93c5fd;text-decoration:none;font-size:14px;margin-left:14px}
+main{max-width:960px;margin:24px auto;padding:0 16px}
+.card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px;margin-bottom:24px}
+h2{font-size:15px;margin:0 0 12px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #334155;word-break:break-all}
+th{color:#94a3b8}
+code,pre{background:#0f172a;color:#a5f3fc;border-radius:6px;padding:2px 6px}
+pre{padding:12px;overflow:auto}
+</style>
+</head>
+<body>
+<header><h1>TGUnbanBot Beta API 文档</h1><nav><a href="/">数据预览</a></nav></header>
+<main>
+<div class="card"><h2>基础信息</h2><p>基础地址：<code>https://tg-unban-bot-beta.cf77-6b9.workers.dev</code>（可按部署域名替换）</p><p>全部端点均为只读 GET，无需鉴权，支持 CORS。响应统一为 <code>{"ok":true,"kind":"...","count":N,"items":[...]}</code>。</p></div>
+<div class="card"><h2>端点</h2><table><thead><tr><th>端点</th><th>说明</th><th>分页参数</th></tr></thead><tbody>
+<tr><td><code>GET /api/fingerprints</code></td><td>广告指纹库（value、type、status、hit_count、fp_count、source、created_at、updated_at）</td><td>limit/offset</td></tr>
+<tr><td><code>GET /api/blacklist</code></td><td>黑名单（user_id、reason、created_at）</td><td>limit/offset</td></tr>
+<tr><td><code>GET /health</code></td><td>健康检查，返回 <code>OK</code></td><td>-</td></tr>
+</tbody></table><p>分页默认 <code>limit=200</code>（最大 1000），<code>offset=0</code>。</p></div>
+<div class="card"><h2>示例</h2><p>获取指纹库前 50 条：</p><pre>curl "https://tg-unban-bot-beta.cf77-6b9.workers.dev/api/fingerprints?limit=50"</pre>
+<p>获取黑名单第 2 页：</p><pre>curl "https://tg-unban-bot-beta.cf77-6b9.workers.dev/api/blacklist?limit=50&offset=50"</pre>
+<p>响应示例：</p><pre>{"ok":true,"kind":"blacklist","count":7,"items":[{"user_id":"9243769025","reason":"spam","created_at":1794727282}]}</pre></div>
+</main>
+</body>
+</html>`;
 async function servePublicList(env, kind, url) {
 	const cors = { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' };
 	if (!env?.DB) return new Response(JSON.stringify({ ok: false, error: 'no_db' }), { status: 503, headers: cors });
@@ -1980,6 +2071,13 @@ async function servePublicList(env, kind, url) {
 	}
 }
 
+function servePanel() {
+	return new Response(PANEL_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+function serveApiDocs() {
+	return new Response(DOCS_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
@@ -1987,6 +2085,8 @@ export default {
 			if (url.pathname === '/health') return new Response('OK', { status: 200 });
 			if (url.pathname === '/api/fingerprints') return servePublicList(env, 'fingerprints', url);
 			if (url.pathname === '/api/blacklist') return servePublicList(env, 'blacklist', url);
+			if (url.pathname === '/' || url.pathname === '/panel') return servePanel();
+			if (url.pathname === '/docs') return serveApiDocs();
 			return new Response(JSON.stringify({ ok: false, error: 'not_found' }), { status: 404, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' } });
 		}
 		if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
