@@ -1954,11 +1954,40 @@ async function scheduled(env) {
 	}
 }
 
+// 公开只读 API：指纹库与黑名单列表。不含密钥、主人 ID、样本正文或内部备注。
+async function servePublicList(env, kind, url) {
+	const cors = { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' };
+	if (!env?.DB) return new Response(JSON.stringify({ ok: false, error: 'no_db' }), { status: 503, headers: cors });
+	await adDetectionReady(env);
+	const limit = Math.min(1000, Math.max(1, Number(url?.searchParams?.get('limit')) || 200));
+	const offset = Math.max(0, Number(url?.searchParams?.get('offset')) || 0);
+	try {
+		if (kind === 'fingerprints') {
+			const rows = await env.DB.prepare(
+				'SELECT id, type, value, status, weight, hit_count, fp_count, source, created_at, updated_at FROM ad_fingerprints WHERE status != ? ORDER BY updated_at DESC LIMIT ? OFFSET ?'
+			).bind('retired', limit, offset).all();
+			return new Response(JSON.stringify({ ok: true, kind, count: (rows.results || []).length, items: rows.results || [] }), { headers: cors });
+		}
+		if (kind === 'blacklist') {
+			const rows = await env.DB.prepare(
+				'SELECT user_id, reason, created_at FROM blacklist ORDER BY created_at DESC LIMIT ? OFFSET ?'
+			).bind(limit, offset).all();
+			return new Response(JSON.stringify({ ok: true, kind, count: (rows.results || []).length, items: rows.results || [] }), { headers: cors });
+		}
+		return new Response(JSON.stringify({ ok: false, error: 'not_found' }), { status: 404, headers: cors });
+	} catch (_) {
+		return new Response(JSON.stringify({ ok: false, error: 'query_failed' }), { status: 500, headers: cors });
+	}
+}
+
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
-		if (request.method === 'GET' && url.pathname === '/health') {
-			return new Response('OK', { status: 200 });
+		if (request.method === 'GET') {
+			if (url.pathname === '/health') return new Response('OK', { status: 200 });
+			if (url.pathname === '/api/fingerprints') return servePublicList(env, 'fingerprints', url);
+			if (url.pathname === '/api/blacklist') return servePublicList(env, 'blacklist', url);
+			return new Response(JSON.stringify({ ok: false, error: 'not_found' }), { status: 404, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' } });
 		}
 		if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 		const secret = env.WEBHOOK_SECRET;
@@ -1991,5 +2020,5 @@ export {
 	isGroupAdmin, invalidateAdminCache, isBlacklisted, addBlacklist, removeBlacklist,
 	matchAllowlist, recordMessage, sweepUserMessages, sweepUserMessagesAllGroups,
 	judgeAdWithAI, handleAd, notifyAdReport,
-	handleCommand, handleCallback, handleUpdate, resolveTargetId
+	handleCommand, handleCallback, handleUpdate, resolveTargetId, servePublicList
 };

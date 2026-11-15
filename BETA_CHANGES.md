@@ -56,6 +56,12 @@
 - 匿名管理员消息不进入自动广告检测，也不写入普通成员消息台账，避免被误判或误清扫。
 - 复核通知和操作记录中的操作人显示为 `anonymous_admin:<群ID>`，不会显示匿名机器人 ID。
 
+## 公开只读 API
+
+- `GET /api/fingerprints`：公开指纹库（type、value、status、命中次数等），不含已停用词、规范化值、确认人 ID 或样本正文。
+- `GET /api/blacklist`：公开黑名单（user_id、reason、created_at），不含操作者 ID 或内部备注。
+- 支持 `?limit=`（默认 200，最大 1000）与 `?offset=`；带 CORS `Access-Control-Allow-Origin: *`。
+
 ## 备用 AI 与账户额度保护
 
 只接管 `/ad` 文本分类，Cloudflare 优先，备用模型为 `DeepSeek-V4.1-Flash`。向量嵌入仍使用 Cloudflare 的嵌入模型，不能将聊天模型结果当作向量。
