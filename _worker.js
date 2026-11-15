@@ -1973,50 +1973,102 @@ const PANEL_HTML = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TGUnbanBot Beta 数据预览</title>
 <style>
-body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
-header{padding:20px 24px;background:#1e293b;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
-h1{font-size:18px;margin:0}
-nav a{color:#93c5fd;text-decoration:none;font-size:14px;margin-left:14px}
-main{max-width:1100px;margin:24px auto;padding:0 16px}
-.card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px;margin-bottom:24px}
-.card h2{font-size:15px;margin:0 0 12px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #334155;word-break:break-all}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;margin:0;background:#0f172a;color:#e2e8f0;height:100vh;overflow:hidden;display:flex;flex-direction:column}
+header{padding:10px 16px;background:#1e293b;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #334155}
+h1{font-size:16px;margin:0}
+nav a{color:#93c5fd;text-decoration:none;font-size:13px}
+.toolbar{display:flex;align-items:center;gap:10px;padding:10px 16px;background:#1e293b;border-bottom:1px solid #334155}
+.toolbar input{background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:8px;padding:7px 10px;font-size:13px;width:240px}
+.toolbar button{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:7px 12px;cursor:pointer;font-size:13px}
+.toolbar .result{font-size:13px;color:#a5f3fc}
+main{flex:1;display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px 16px;min-height:0}
+.card{background:#1e293b;border:1px solid #334155;border-radius:12px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+.card .head{padding:10px 12px;border-bottom:1px solid #334155}
+.card h2{font-size:14px;margin:0}
+.tablewrap{flex:1;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:12.5px;table-layout:fixed}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #334155;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 th{color:#94a3b8;font-weight:600}
-.meta{color:#94a3b8;font-size:12px;margin-top:10px}
-button{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:13px}
-button:hover{background:#1d4ed8}
-code{background:#0f172a;padding:2px 6px;border-radius:6px;color:#a5f3fc}
+.foot{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-top:1px solid #334155;font-size:12px;color:#94a3b8}
+.foot button{background:#1e293b;color:#93c5fd;border:1px solid #334155;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px}
+.foot button:disabled{opacity:.4;cursor:default}
 </style>
 </head>
 <body>
 <header><h1>TGUnbanBot Beta 数据预览</h1><nav><a href="/docs">API 文档</a></nav></header>
+<div class="toolbar">
+  <input id="tgid" placeholder="输入 TG 用户 ID 查询是否被封禁" />
+  <button onclick="checkTgid()">查询封禁状态</button>
+  <span class="result" id="check-result"></span>
+</div>
 <main>
-<div class="card"><h2>广告指纹库</h2><table id="fingerprints"><thead><tr><th>value</th><th>type</th><th>status</th><th>hit_count</th><th>source</th></tr></thead><tbody></tbody></table><div class="meta" id="fingerprints-meta"></div><button onclick="load('fingerprints')">刷新指纹</button></div>
-<div class="card"><h2>黑名单列表</h2><table id="blacklist"><thead><tr><th>user_id</th><th>reason</th><th>created_at</th></tr></thead><tbody></tbody></table><div class="meta" id="blacklist-meta"></div><button onclick="load('blacklist')">刷新黑名单</button></div>
+  <div class="card">
+    <div class="head"><h2>广告指纹库</h2></div>
+    <div class="tablewrap"><table><thead><tr><th style="width:44%">value</th><th style="width:16%">type</th><th style="width:16%">status</th><th style="width:12%">hit</th><th style="width:12%">source</th></tr></thead><tbody id="fp-tbody"></tbody></table></div>
+    <div class="foot"><span id="fp-meta"></span><span><button id="fp-prev" onclick="move('fp',-1)">上一页</button> <button id="fp-next" onclick="move('fp',1)">下一页</button></span></div>
+  </div>
+  <div class="card">
+    <div class="head"><h2>黑名单列表</h2></div>
+    <div class="tablewrap"><table><thead><tr><th style="width:34%">user_id</th><th style="width:40%">reason</th><th style="width:26%">created_at</th></tr></thead><tbody id="bl-tbody"></tbody></table></div>
+    <div class="foot"><span id="bl-meta"></span><span><button id="bl-prev" onclick="move('bl',-1)">上一页</button> <button id="bl-next" onclick="move('bl',1)">下一页</button></span></div>
+  </div>
 </main>
 <script>
+var state={fp:0,bl:0};
+var pageSize=20;
+function move(kind,delta){
+  var next=state[kind]+delta;
+  if(next<0)return;
+  state[kind]=next;
+  load(kind);
+}
 async function load(kind){
-  const meta=document.getElementById(kind+'-meta');
-  const tbody=document.querySelector('#'+kind+' tbody');
+  var key=kind==='fp'?'fingerprints':kind;
+  var tbody=document.getElementById(kind+'-tbody');
+  var meta=document.getElementById(kind+'-meta');
+  var prev=document.getElementById(kind+'-prev');
+  var nextBtn=document.getElementById(kind+'-next');
   meta.textContent='加载中...';
   try{
-    const res=await fetch('/api/'+kind);
-    const data=await res.json();
-    if(!data.ok){meta.textContent='加载失败：'+(data.error||res.status);return;}
+    var res=await fetch('/api/'+key+'?limit=20&offset='+(state[kind]*pageSize));
+    var data=await res.json();
+    if(!data.ok){meta.textContent='加载失败';return;}
     tbody.textContent='';
-    (data.items||[]).forEach(item=>{
-      const tr=document.createElement('tr');
-      const cells=kind==='fingerprints'
+    var total=data.total||0;
+    (data.items||[]).forEach(function(item){
+      var tr=document.createElement('tr');
+      var cells=kind==='fp'
         ?[item.value,item.type,item.status,item.hit_count,item.source]
         :[item.user_id,item.reason,item.created_at?new Date(item.created_at*1000).toLocaleString():''];
-      cells.forEach(v=>{const td=document.createElement('td');td.textContent=(v===null||v===undefined)?'':String(v);tr.appendChild(td);});
+      cells.forEach(function(v){
+        var td=document.createElement('td');
+        var s=(v===null||v===undefined)?'':String(v);
+        td.title=s;td.textContent=s;tr.appendChild(td);
+      });
       tbody.appendChild(tr);
     });
-    meta.textContent='共 '+data.count+' 条 · '+new Date().toLocaleString();
+    meta.textContent='第 '+(state[kind]+1)+' 页 · 共 '+total+' 条';
+    prev.disabled=state[kind]===0;
+    nextBtn.disabled=(state[kind]+1)*pageSize>=total;
   }catch(e){meta.textContent='加载失败：'+e.message;}
 }
-load('fingerprints');load('blacklist');
+async function checkTgid(){
+  var input=document.getElementById('tgid');
+  var out=document.getElementById('check-result');
+  var uid=String(input.value||'').trim();
+  if(!/^\\d{1,16}$/.test(uid)){out.textContent='请输入纯数字 TG ID';out.style.color='#fca5a5';return;}
+  out.textContent='查询中...';out.style.color='#94a3b8';
+  try{
+    var res=await fetch('/api/blacklist/check?user_id='+uid);
+    var data=await res.json();
+    if(!data.ok){out.textContent='查询失败：'+(data.error||'');out.style.color='#fca5a5';return;}
+    if(data.blacklisted){out.textContent='TG ID '+uid+' 已被封禁（原因：'+((data.record&&data.record.reason)||'未知')+'）';out.style.color='#fca5a5';}
+    else{out.textContent='TG ID '+uid+' 未被封禁';out.style.color='#86efac';}
+  }catch(e){out.textContent='查询失败：'+e.message;out.style.color='#fca5a5';}
+}
+load('fp');load('bl');
 </script>
 </body>
 </html>`;
@@ -2049,6 +2101,7 @@ pre{padding:12px;overflow:auto}
 <div class="card"><h2>端点</h2><table><thead><tr><th>端点</th><th>说明</th><th>分页参数</th></tr></thead><tbody>
 <tr><td><code>GET /api/fingerprints</code></td><td>广告指纹库（value、type、status、hit_count、fp_count、source、created_at、updated_at）</td><td>limit/offset</td></tr>
 <tr><td><code>GET /api/blacklist</code></td><td>黑名单（user_id、reason、created_at）</td><td>limit/offset</td></tr>
+<tr><td><code>GET /api/blacklist/check?user_id=</code></td><td>查询某 TG ID 是否被封禁</td><td>-</td></tr>
 <tr><td><code>GET /health</code></td><td>健康检查，返回 <code>OK</code></td><td>-</td></tr>
 </tbody></table><p>分页默认 <code>limit=200</code>（最大 1000），<code>offset=0</code>。</p></div>
 <div class="card"><h2>示例</h2><p>获取指纹库前 50 条：</p><pre>curl "https://tg-unban-bot-beta.cf77-6b9.workers.dev/api/fingerprints?limit=50"</pre>
@@ -2068,15 +2121,31 @@ async function servePublicList(env, kind, url) {
 			const rows = await env.DB.prepare(
 				'SELECT id, type, value, status, weight, hit_count, fp_count, source, created_at, updated_at FROM ad_fingerprints WHERE status != ? ORDER BY updated_at DESC LIMIT ? OFFSET ?'
 			).bind('retired', limit, offset).all();
-			return new Response(JSON.stringify({ ok: true, kind, count: (rows.results || []).length, items: rows.results || [] }), { headers: cors });
+			const total = await env.DB.prepare("SELECT COUNT(*) AS c FROM ad_fingerprints WHERE status != ?").bind('retired').first();
+			return new Response(JSON.stringify({ ok: true, kind, count: (rows.results || []).length, total: Number(total?.c || 0), items: rows.results || [] }), { headers: cors });
 		}
 		if (kind === 'blacklist') {
 			const rows = await env.DB.prepare(
 				'SELECT user_id, reason, created_at FROM blacklist ORDER BY created_at DESC LIMIT ? OFFSET ?'
 			).bind(limit, offset).all();
-			return new Response(JSON.stringify({ ok: true, kind, count: (rows.results || []).length, items: rows.results || [] }), { headers: cors });
+			const total = await env.DB.prepare('SELECT COUNT(*) AS c FROM blacklist').first();
+			return new Response(JSON.stringify({ ok: true, kind, count: (rows.results || []).length, total: Number(total?.c || 0), items: rows.results || [] }), { headers: cors });
 		}
 		return new Response(JSON.stringify({ ok: false, error: 'not_found' }), { status: 404, headers: cors });
+	} catch (_) {
+		return new Response(JSON.stringify({ ok: false, error: 'query_failed' }), { status: 500, headers: cors });
+	}
+}
+
+async function serveBlacklistCheck(env, url) {
+	const cors = { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' };
+	if (!env?.DB) return new Response(JSON.stringify({ ok: false, error: 'no_db' }), { status: 503, headers: cors });
+	const uid = String(url?.searchParams?.get('user_id') || '').trim();
+	if (!/^\d{1,16}$/.test(uid)) return new Response(JSON.stringify({ ok: false, error: 'invalid_user_id' }), { status: 400, headers: cors });
+	await adDetectionReady(env);
+	try {
+		const row = await env.DB.prepare('SELECT user_id, reason, created_at FROM blacklist WHERE user_id = ? LIMIT 1').bind(uid).first();
+		return new Response(JSON.stringify({ ok: true, user_id: uid, blacklisted: Boolean(row), record: row || null }), { headers: cors });
 	} catch (_) {
 		return new Response(JSON.stringify({ ok: false, error: 'query_failed' }), { status: 500, headers: cors });
 	}
@@ -2096,6 +2165,7 @@ export default {
 			if (url.pathname === '/health') return new Response('OK', { status: 200 });
 			if (url.pathname === '/api/fingerprints') return servePublicList(env, 'fingerprints', url);
 			if (url.pathname === '/api/blacklist') return servePublicList(env, 'blacklist', url);
+			if (url.pathname === '/api/blacklist/check') return serveBlacklistCheck(env, url);
 			if (url.pathname === '/' || url.pathname === '/panel') return servePanel();
 			if (url.pathname === '/docs') return serveApiDocs();
 			return new Response(JSON.stringify({ ok: false, error: 'not_found' }), { status: 404, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' } });
@@ -2131,5 +2201,5 @@ export {
 	isGroupAdmin, invalidateAdminCache, isBlacklisted, addBlacklist, removeBlacklist,
 	matchAllowlist, recordMessage, sweepUserMessages, sweepUserMessagesAllGroups,
 	judgeAdWithAI, handleAd, notifyAdReport,
-	handleCommand, handleCallback, handleUpdate, resolveTargetId, servePublicList
+	handleCommand, handleCallback, handleUpdate, resolveTargetId, servePublicList, serveBlacklistCheck
 };

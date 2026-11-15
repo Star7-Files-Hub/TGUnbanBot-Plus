@@ -62,6 +62,27 @@ test('public endpoints respect limit and report no_db', async () => {
   assert.equal(r.body.error, 'no_db');
 });
 
+test('blacklist check endpoint reports ban status', async () => {
+  const h = harness();
+  await worker.adDetectionReady(h.env);
+  h.sqlite.prepare('INSERT INTO blacklist VALUES (?, ?, ?, ?, ?)').run('9112496534', 'spam', null, '999', 5);
+  const hit = await worker.serveBlacklistCheck(h.env, new URL('https://x/api/blacklist/check?user_id=9112496534'));
+  const hb = await asJson(hit);
+  assert.equal(hb.status, 200);
+  assert.equal(hb.body.blacklisted, true);
+  assert.equal(hb.body.record.reason, 'spam');
+
+  const miss = await worker.serveBlacklistCheck(h.env, new URL('https://x/api/blacklist/check?user_id=123'));
+  const mb = await asJson(miss);
+  assert.equal(mb.body.blacklisted, false);
+  assert.equal(mb.body.record, null);
+
+  const bad = await worker.serveBlacklistCheck(h.env, new URL('https://x/api/blacklist/check?user_id=abc'));
+  const bb = await asJson(bad);
+  assert.equal(bb.status, 400);
+  assert.equal(bb.body.error, 'invalid_user_id');
+});
+
 test('panel and docs pages render as HTML', async () => {
   const env = {};
   const panel = await worker.default.fetch(new Request('https://x/'), env);

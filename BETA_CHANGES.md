@@ -62,8 +62,9 @@
 - `GET /api/fingerprints`：公开指纹库（type、value、status、命中次数等），不含已停用词、规范化值、确认人 ID 或样本正文。
 - `GET /api/blacklist`：公开黑名单（user_id、reason、created_at），不含操作者 ID 或内部备注。
 - 支持 `?limit=`（默认 200，最大 1000）与 `?offset=`；带 CORS `Access-Control-Allow-Origin: *`。
-- `GET /`（或 `/panel`）：数据预览网页，直接查看指纹库和黑名单列表。
+- `GET /`（或 `/panel`）：数据预览网页，左指纹库、右黑名单双栏布局，每页 20 条分页，顶部可按 TG ID 查询封禁状态；1920×1080 浏览器窗口内无需滚动即可看全。
 - `GET /docs`：API 文档网页，供他人查看调用方式和示例。
+- `GET /api/blacklist/check?user_id=<TGID>`：查询某个 TG ID 是否在黑名单。
 
 ## 备用 AI 与账户额度保护
 
