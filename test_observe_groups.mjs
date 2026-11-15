@@ -64,6 +64,25 @@ test('observe mode notifies owner for unmatched ad and never punishes', async ()
   assert.equal(rows(h, 'ad_observe_reports').length, 1);
 });
 
+test('observe group /spam command notifies owner without any group reply', async () => {
+  const h = harness();
+  await worker.adDetectionReady(h.env);
+  h.sqlite.prepare('INSERT INTO ad_observe_groups VALUES (?, ?, ?, ?)').run(GROUP, '广告群', OWNER, 1);
+  worker.invalidateObserveGroups();
+  await worker.handleObserveCommand(h.env, {
+    message_id: 8, text: '/spam',
+    chat: { id: GROUP, type: 'supergroup', title: '广告群' },
+    from: { id: '777', first_name: '举报人' },
+    reply_to_message: { message_id: 5, from: { id: TARGET, first_name: '广告号', username: 'seller' }, text: adText },
+  });
+  assert.equal(h.calls.filter(c => c.method === 'sendMessage' && String(c.body.chat_id) === GROUP).length, 0);
+  assert.equal(h.calls.filter(c => c.method === 'banChatMember').length, 0);
+  assert.equal(h.calls.filter(c => c.method === 'restrictChatMember').length, 0);
+  const dm = h.calls.find(c => c.method === 'sendMessage' && String(c.body.chat_id) === OWNER);
+  assert.ok(dm && String(dm.body.text).includes('观察群 /spam 举报'));
+  assert.equal(rows(h, 'ad_observe_reports').length, 1);
+});
+
 test('observe mode skips messages already covered by fingerprints', async () => {
   const h = harness();
   await worker.adDetectionReady(h.env);

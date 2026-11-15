@@ -868,6 +868,28 @@ async function notifyAutoBan(env, config, chat, userId, userName, reason, previe
 		`📄 内容：<code>${escapeHtml(String(preview || '').slice(0, 200))}</code>`);
 }
 
+async function handleObserveCommand(env, message) {
+	// 观察群内只监听 /spam 命令：不回复、不处置，只把举报通知主人。
+	const text = String(message?.text || message?.caption || '').trim();
+	const m = text.match(COMMAND_RE);
+	if (!m || String(m[1]).toLowerCase() !== 'spam') return;
+	const arg = (m[2] || '').trim();
+	const idList = parseIdList(arg);
+	const replied = message.reply_to_message;
+	const targets = [];
+	if (idList.length) {
+		for (const id of idList) targets.push({ id, text: '' });
+	} else if (replied?.from?.id) {
+		targets.push({ id: String(replied.from.id), text: [replied.text, replied.caption].filter(Boolean).join(' ').trim() });
+	}
+	if (!targets.length) return;
+	await adDetectionReady(env);
+	const config = await loadConfig(env);
+	for (const t of targets) {
+		await notifyObserveCandidate(env, config, message.chat, t.id, '', t.text || '(通过 /spam 举报，无正文)', '观察群 /spam 举报', replied?.message_id);
+	}
+}
+
 async function notifyObserveCandidate(env, config, chat, userId, userName, text, reason, messageId) {
 	const inserted = await env.DB.prepare(
 		"INSERT INTO ad_observe_reports (user_id, chat_id, message_id, body_text, name, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
@@ -2041,6 +2063,11 @@ async function handleUpdate(env, update, ctx) {
 		const text = String(message.text || message.caption || '').trim();
 		const isCommand = COMMAND_RE.test(text);
 		if (isCommand) {
+			// 观察群不回复任何命令；只监听 /spam 并通知主人。
+			if (await isObserveGroup(env, message.chat?.id)) {
+				await handleObserveCommand(env, message);
+				return;
+			}
 			// 命令路径：需要 DB 的处理器自行建表；/start 完全不查库，冷启动也秒回。
 			await handleCommand(env, message, ctx);
 			return;
@@ -2312,7 +2339,7 @@ export default {
 export {
 	normalizeAdText, stripEmoji, toHalfWidth, keywordSignature, countKeywordHits, matchAnyPattern,
 	loadConfig, isConfiguredGroup, isPrimaryOwner, isOwner, invalidateOwners, invalidateGroups,
-	isObserveGroup, invalidateObserveGroups, notifyObserveCandidate,
+	isObserveGroup, invalidateObserveGroups, notifyObserveCandidate, handleObserveCommand,
 	isUserWhitelisted, invalidateUserWhitelist,
 	tgCall, sendMessage, restrictMember, banMember,
 	adDetectionReady, resetSchemaState, addAdSample, matchAdSemantic, embedText, cosineSimilarity,
