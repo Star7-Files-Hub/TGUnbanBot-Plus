@@ -354,7 +354,15 @@ const SCHEMA_STATEMENTS = [
 	['ad_domain_whitelist', `CREATE TABLE IF NOT EXISTS ad_domain_whitelist (domain TEXT PRIMARY KEY)`],
 	['ad_ban_scope', `CREATE TABLE IF NOT EXISTS ad_ban_scope (
 		user_id TEXT, chat_id TEXT, reason TEXT, created_at INTEGER,
-		PRIMARY KEY(user_id, chat_id))`]
+		PRIMARY KEY(user_id, chat_id))`],
+	['ad_spam_reports', `CREATE TABLE IF NOT EXISTS ad_spam_reports (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		target_user_id TEXT NOT NULL,
+		chat_id TEXT NOT NULL,
+		reporter_id TEXT,
+		message_json TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'open',
+		created_at INTEGER NOT NULL)`]
 ];
 
 // schema 按 isolate 只建一次（env 每个请求都是新对象，不能挂在 env 上）。
@@ -1144,6 +1152,14 @@ async function handleSpam(env, message, arg, config, isOwner, ctx) {
 		const banRes = await banMember(env, chat.id, targetId).catch((e) => ({ ok: false, description: String(e?.message || e) }));
 		await recordBanScope(env, targetId, chat.id, 'group_admin_spam');
 		const sweep = await sweepUserMessages(env, chat.id, targetId, [replied.message_id]);
+		// 保存被举报正文供主人确认时执行同样的精准学习；不在此刻学习。
+		const reportMessageJson = JSON.stringify({
+			text: getOwnLearningText(replied),
+			quote: getQuotedText(replied) ? { text: getQuotedText(replied) } : null,
+			from: { first_name: replied.from?.first_name || '', last_name: replied.from?.last_name || '', username: replied.from?.username || '' }
+		});
+		await env.DB.prepare("INSERT INTO ad_spam_reports (target_user_id, chat_id, reporter_id, message_json, status, created_at) VALUES (?, ?, ?, ?, 'open', ?)")
+			.bind(targetId, String(chat.id), getMessageActorId(message), reportMessageJson, nowSeconds()).run();
 		await notifySpamForApproval(env, config, chat, targetId, adText, getMessageActorId(message));
 		const lines = [`✅ 已在本群封禁 <code>${targetId}</code> 并清扫消息 ${sweep.deleted} 条`];
 		if (sweep.failed > 0) lines.push(`⚠️ ${sweep.failed} 条清扫失败`);
@@ -1765,6 +1781,16 @@ async function handleCallback(env, callback) {
 		await addBlacklist(env, userId, 'spam', 'owner_confirm', from.id);
 		const result = await banAllGroups(env, userId, config, 'spam_confirm');
 		const sweep = await sweepUserMessagesAllGroups(env, userId, config, null, null);
+		// 管理员上报后，主人确认时按同样的精准策略学习，学习失败不回滚封禁。
+		const report = await env.DB.prepare("SELECT id, message_json FROM ad_spam_reports WHERE target_user_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1")
+			.bind(userId).first();
+		if (report) {
+			try {
+				const parsed = JSON.parse(report.message_json);
+				if (parsed && typeof parsed === 'object') await learnPrecisionSpam(env, parsed);
+			} catch (_) { /* 保存的原文损坏不影响封禁确认。 */ }
+			await env.DB.prepare("UPDATE ad_spam_reports SET status = 'confirmed' WHERE id = ?").bind(report.id).run();
+		}
 		const sweepNote = sweep.failed > 0 ? `\n⚠️ ${sweep.failed} 条清扫失败` : '';
 		await editMessageText(env, callback.message?.chat?.id, callback.message?.message_id,
 			`✅ 已确认，用户 <code>${userId}</code> 已加黑并全群封禁。\n${renderBanAllReceipt(result)}` +

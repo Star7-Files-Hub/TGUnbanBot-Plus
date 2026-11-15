@@ -16,6 +16,7 @@ function makeDb() {
     'CREATE TABLE moderation_messages (mid INTEGER, chat_id TEXT, from_id TEXT, created_at INTEGER NOT NULL)',
     'CREATE TABLE ad_owners (user_id TEXT PRIMARY KEY, added_by TEXT, created_at INTEGER NOT NULL)',
     'CREATE TABLE ad_groups (chat_id TEXT PRIMARY KEY, added_by TEXT, created_at INTEGER NOT NULL)',
+    'CREATE TABLE ad_spam_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, target_user_id TEXT NOT NULL, chat_id TEXT NOT NULL, reporter_id TEXT, message_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT \'open\', created_at INTEGER NOT NULL)',
   ]) sqlite.exec(sql);
   const db = {
     prepare(sql) {
