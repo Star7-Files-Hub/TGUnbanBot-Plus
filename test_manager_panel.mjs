@@ -29,7 +29,7 @@ function harness() {
   const env = {
     OWNER_ID: OWNER, GROUP_ID: GROUP, DB: db,
     AI: { async run(model, options) { if (String(model).includes('bge-m3')) return { data: [[1, 0, 0]] }; return { response: 'ok' }; } },
-    __tgMock: Object.fromEntries(['sendMessage', 'editMessageText', 'answerCallbackQuery', 'restrictChatMember', 'banChatMember', 'deleteMessage'].map(method => [method, async body => {
+    __tgMock: Object.fromEntries(['sendMessage', 'editMessageText', 'answerCallbackQuery', 'restrictChatMember', 'banChatMember', 'deleteMessage', 'unbanChatMember'].map(method => [method, async body => {
       calls.push({ method, body });
       return { ok: true, result: method === 'sendMessage' ? { message_id: 1 } : true };
     }])),
@@ -82,4 +82,21 @@ test('auto-ban notification is off by default and honors the switch', async () =
   const ownerDm = h.calls.find(c => c.method === 'sendMessage' && String(c.body.chat_id) === OWNER);
   assert.ok(ownerDm && String(ownerDm.body.text).includes('自动处置广告'));
   assert.ok(String(ownerDm.body.text).includes(adText.slice(0, 6)));
+});
+
+test('auto-ban misjudge callback unbans and whitelists', async () => {
+  const h = harness();
+  await worker.adDetectionReady(h.env);
+  h.sqlite.prepare('INSERT INTO blacklist VALUES (?, ?, ?, ?, ?)').run('9112496534', 'spam', null, OWNER, 1);
+  h.sqlite.prepare('INSERT INTO ad_ban_scope VALUES (?, ?, ?, ?)').run('9112496534', GROUP, 'auto', 1);
+  await worker.handleCallback(h.env, {
+    id: 'cb', data: 'ab:unban:9112496534',
+    from: { id: OWNER, is_bot: false },
+    message: { chat: { id: OWNER, type: 'private' }, message_id: 10 },
+  });
+  assert.equal(h.sqlite.prepare('SELECT COUNT(*) c FROM blacklist WHERE user_id=?').get('9112496534').c, 0);
+  assert.equal(h.sqlite.prepare('SELECT COUNT(*) c FROM ad_ban_scope WHERE user_id=?').get('9112496534').c, 0);
+  assert.equal(h.sqlite.prepare('SELECT COUNT(*) c FROM ad_user_whitelist WHERE user_id=?').get('9112496534').c, 1);
+  assert.ok(h.calls.some(c => c.method === 'unbanChatMember'));
+  assert.ok(h.calls.some(c => c.method === 'editMessageText'));
 });

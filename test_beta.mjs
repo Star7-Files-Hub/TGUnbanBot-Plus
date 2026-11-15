@@ -296,7 +296,7 @@ section('C. 权限分级（R4/R5/R9 + 副主人/授权群命令）');
 	assert('主人可加副主人', isOwner(DEPUTY, cfgA) && !isPrimaryOwner(DEPUTY, cfgA));
 	await handleCommand(c5.env, { text: '/add_owner 10003', chat: { id: DEPUTY, type: 'private' }, from: { id: DEPUTY, first_name: '副主人' } });
 	const owners = await c5.db.prepare('SELECT COUNT(*) AS c FROM ad_owners').first();
-	assert('副主人不能加副主人', Number(owners.c) === 1);
+	assert('副主人可加副主人（权限放开）', Number(owners.c) === 2);
 	await handleCommand(c5.env, { text: `/add_group ${GROUP2}`, chat: { id: OWNER, type: 'private' }, from: { id: OWNER, first_name: '主人' } });
 	invalidateGroups();
 	const cfgB = await loadConfig(c5.env);
