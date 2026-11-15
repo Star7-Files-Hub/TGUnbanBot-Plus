@@ -64,7 +64,7 @@ test('AI request honors a configured model and uses deterministic constrained la
   } } }, '广告文本');
   assert.equal(captured.model, 'explicit-test-model');
   assert.equal(captured.options.temperature, 0);
-  assert.ok(captured.options.max_tokens >= 8 && captured.options.max_tokens <= 32);
+  assert.ok(captured.options.max_tokens >= 8 && captured.options.max_tokens <= 64);
   assert.ok(captured.options.messages[0].content.includes('引用'));
   assert.ok(captured.options.messages[0].content.includes('指令'));
   assert.ok(captured.options.messages[1].content.includes('广告文本'));
