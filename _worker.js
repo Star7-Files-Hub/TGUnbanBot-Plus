@@ -362,7 +362,9 @@ const SCHEMA_STATEMENTS = [
 		reporter_id TEXT,
 		message_json TEXT NOT NULL,
 		status TEXT NOT NULL DEFAULT 'open',
-		created_at INTEGER NOT NULL)`]
+		created_at INTEGER NOT NULL)`],
+	['bot_settings', `CREATE TABLE IF NOT EXISTS bot_settings (
+		key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)`]
 ];
 
 // schema 按 isolate 只建一次（env 每个请求都是新对象，不能挂在 env 上）。
@@ -760,15 +762,19 @@ async function detectAdOnMessage(env, message) {
 	const semantic = await matchAdSemantic(env, bodyText, config);
 
 	if (structureKill || semantic.hit) {
+		const autoNotify = await getBotSetting(env, 'auto_ban_notify', '0') === '1';
+		const reason = structureKill ? '结构规则命中' : 'AI 语义命中';
 		if (from.is_bot) {
 			// bot 发的广告：restrict 对 bot 无效，直接封当前群 + 清扫它发的消息。
 			await banMember(env, chat.id, userId).catch(() => null);
 			await sweepUserMessages(env, chat.id, userId, [message.message_id]);
 			// Automatic detection cannot enroll raw identities or quoted content into learning.
+			if (autoNotify) await notifyAutoBan(env, config, chat, userId, name, reason + '（bot）', bodyText);
 			return { action: 'ban', reason: structureKill ? 'structure' : 'ai', bot: true, semantic };
 		}
 		await muteInCurrentGroup(env, chat.id, userId);
 		// Only explicit owner /spam with precision review may enroll new automatic phrases.
+		if (autoNotify) await notifyAutoBan(env, config, chat, userId, name, reason, bodyText);
 		return { action: 'mute', reason: structureKill ? 'structure' : 'ai', semantic };
 	}
 
@@ -787,6 +793,31 @@ async function notifyOwners(env, config, text, extra = {}) {
 	const ownerId = String(config.primaryOwner || '').trim();
 	if (!/^\d+$/.test(ownerId)) return;
 	await sendMessage(env, ownerId, text, extra).catch(() => {});
+}
+
+async function getBotSetting(env, key, fallback = '') {
+	if (!env?.DB) return fallback;
+	try {
+		const row = await env.DB.prepare('SELECT value FROM bot_settings WHERE key = ?').bind(String(key)).first();
+		return row ? String(row.value) : fallback;
+	} catch (_) { return fallback; }
+}
+async function setBotSetting(env, key, value) {
+	if (!env?.DB) return false;
+	try {
+		await env.DB.prepare('INSERT INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at')
+			.bind(String(key), String(value), nowSeconds()).run();
+		return true;
+	} catch (_) { return false; }
+}
+
+async function notifyAutoBan(env, config, chat, userId, userName, reason, preview) {
+	await notifyOwners(env, config,
+		`🤖 自动处置广告：\n\n` +
+		`👤 用户 <code>${escapeHtml(userId)}</code>${userName ? `（${escapeHtml(userName)}）` : ''}\n` +
+		`📍 群「${escapeHtml(chat?.title || chat?.id || '')}」\n` +
+		`🎯 原因：${escapeHtml(reason)}\n` +
+		`📄 内容：<code>${escapeHtml(String(preview || '').slice(0, 200))}</code>`);
 }
 
 async function notifyFingerprintPending(env, config, userId, chat, fingerprint) {
@@ -1116,8 +1147,22 @@ async function handleCommand(env, message, ctx) {
 		case 'adstats': return handleAdStats(env, message, config, isAnyOwner);
 		case 'ignore': return handleIgnore(env, message, config, isAnyOwner);
 		case 'allowlist': return handleAllowlist(env, message, config, isAnyOwner);
+		case 'manager': return handleManagerPanel(env, message, isPrimary);
 		default: return false;
 	}
+}
+
+function buildManagerPanelText(enabled) {
+	return '<b>管理面板</b>\n\n自动封禁通知主人：' + (enabled ? '✅ 已开启' : '🔕 已关闭');
+}
+function buildManagerPanelKeyboard(enabled) {
+	return { inline_keyboard: [[{ text: enabled ? '🔕 关闭通知' : '✅ 开启通知', callback_data: 'mgr:auto_ban_notify:toggle' }]] };
+}
+async function handleManagerPanel(env, message, isPrimary) {
+	const chat = message.chat;
+	if (!isPrimary || chat?.type !== 'private') return true;
+	const enabled = await getBotSetting(env, 'auto_ban_notify', '0') === '1';
+	return sendMessage(env, chat.id, buildManagerPanelText(enabled), { reply_markup: buildManagerPanelKeyboard(enabled) });
 }
 
 async function handleBan(env, message, arg, config, isOwner, ctx) {
@@ -1751,6 +1796,19 @@ async function handleCallback(env, callback) {
 		return;
 	}
 	await adDetectionReady(env);
+
+	if (data === 'mgr:auto_ban_notify:toggle') {
+		if (!isPrimaryOwner(from?.id, config)) {
+			await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id, text: '仅第一主人可操作', show_alert: true });
+			return;
+		}
+		const enabled = await getBotSetting(env, 'auto_ban_notify', '0') === '1';
+		const next = !enabled;
+		await setBotSetting(env, 'auto_ban_notify', next ? '1' : '0');
+		await editMessageText(env, callback.message?.chat?.id, callback.message?.message_id, buildManagerPanelText(next), { reply_markup: buildManagerPanelKeyboard(next) }).catch(() => {});
+		await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id });
+		return;
+	}
 
 	let m = data.match(/^c:fp:(\d+):(confirm|ignore):(\d+)$/);
 	if (m) {
