@@ -873,6 +873,32 @@ async function detectAdOnMessage(env, message, options = {}) {
 	return { action: 'pass' };
 }
 
+async function detectImageAd(env, message) {
+	const photos = message?.photo;
+	if (!Array.isArray(photos) || !photos.length) return null;
+	// 有 caption 的图片走普通文本检测，不额外消耗图片模型。
+	if (String(message.text || message.caption || '').trim()) return null;
+	if (await getBotSetting(env, 'image_ad_detect', '0') !== '1') return null;
+	if (!env.AI) return null;
+	const fileId = photos[photos.length - 1]?.file_id;
+	if (!fileId) return null;
+	const file = await tgCall(env, 'getFile', { file_id: fileId }).catch(() => null);
+	const filePath = file?.result?.file_path;
+	if (!filePath || !env.TELEGRAM_BOT_TOKEN) return null;
+	const bytes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`)
+		.then((r) => (r.ok ? r.arrayBuffer() : null)).catch(() => null);
+	if (!bytes) return null;
+	const model = String(env.IMAGE_AD_MODEL || '').trim() || '@cf/llava-hf/llava-1.5-7b-hf';
+	const res = await env.AI.run(model, {
+		image: [new Uint8Array(bytes)],
+		prompt: 'Extract all visible text and describe the product and contact methods in this image. Output only ad or ok.'
+	}).catch(() => null);
+	const extracted = String(res?.response || res?.result?.response || res?.description || '').trim();
+	if (!extracted) return null;
+	const result = await detectAdOnMessage(env, { ...message, text: extracted });
+	return result && ['mute', 'ban', 'ban_all'].includes(result.action) ? result : null;
+}
+
 async function openJoinHit(env, userId, chatId, fingerprint, action) {
 	await env.DB.prepare(
 		`INSERT INTO ad_join_hits (user_id, chat_id, fingerprint_id, fingerprint_value, action, status, created_at)
@@ -903,13 +929,18 @@ async function setBotSetting(env, key, value) {
 	} catch (_) { return false; }
 }
 
-async function notifyAutoBan(env, config, chat, userId, userName, reason, preview) {
+async function notifyAutoBan(env, config, chat, userId, userName, reason, preview, detail = {}) {
+	const actionText = detail.action === 'ban' ? '封禁踢出群' : '禁言';
+	const actionStatus = detail.actionOk ? '✅ 成功' : '❌ 失败';
+	const sweepLine = `🧹 清扫广告消息 ${Number(detail.sweepDeleted) || 0} 条${Number(detail.sweepFailed) > 0 ? `，${detail.sweepFailed} 条失败` : ''}`;
 	await notifyOwners(env, config,
 		`🤖 自动处置广告：\n\n` +
 		`👤 用户 <code>${escapeHtml(userId)}</code>${userName ? `（${escapeHtml(userName)}）` : ''}\n` +
 		`📍 群「${escapeHtml(chat?.title || chat?.id || '')}」\n` +
 		`🎯 原因：${escapeHtml(reason)}\n` +
-		`📄 内容：<code>${escapeHtml(String(preview || '').slice(0, 200))}</code>`);
+		`📄 内容：<code>${escapeHtml(String(preview || '').slice(0, 200))}</code>\n` +
+		`⚙️ 处置：${actionText}（${actionStatus}）\n` +
+		sweepLine);
 }
 
 async function handleObserveCommand(env, message) {
@@ -1287,17 +1318,23 @@ async function handleCommand(env, message, ctx) {
 	}
 }
 
-function buildManagerPanelText(enabled) {
-	return '<b>管理面板</b>\n\n自动封禁通知主人：' + (enabled ? '✅ 已开启' : '🔕 已关闭');
+function buildManagerPanelText(notifyEnabled, imageEnabled) {
+	return '<b>管理面板</b>\n\n' +
+		'自动封禁通知主人：' + (notifyEnabled ? '✅ 已开启' : '🔕 已关闭') + '\n' +
+		'图片广告检测：' + (imageEnabled ? '✅ 已开启' : '🔕 已关闭');
 }
-function buildManagerPanelKeyboard(enabled) {
-	return { inline_keyboard: [[{ text: enabled ? '🔕 关闭通知' : '✅ 开启通知', callback_data: 'mgr:auto_ban_notify:toggle' }]] };
+function buildManagerPanelKeyboard(notifyEnabled, imageEnabled) {
+	return { inline_keyboard: [
+		[{ text: notifyEnabled ? '🔕 关闭通知' : '✅ 开启通知', callback_data: 'mgr:auto_ban_notify:toggle' }],
+		[{ text: imageEnabled ? '🔕 关闭图片检测' : '✅ 开启图片检测', callback_data: 'mgr:image_ad_detect:toggle' }]
+	] };
 }
 async function handleManagerPanel(env, message, isPrimary) {
 	const chat = message.chat;
 	if (!isPrimary || chat?.type !== 'private') return true;
-	const enabled = await getBotSetting(env, 'auto_ban_notify', '0') === '1';
-	return sendMessage(env, chat.id, buildManagerPanelText(enabled), { reply_markup: buildManagerPanelKeyboard(enabled) });
+	const notifyEnabled = await getBotSetting(env, 'auto_ban_notify', '0') === '1';
+	const imageEnabled = await getBotSetting(env, 'image_ad_detect', '0') === '1';
+	return sendMessage(env, chat.id, buildManagerPanelText(notifyEnabled, imageEnabled), { reply_markup: buildManagerPanelKeyboard(notifyEnabled, imageEnabled) });
 }
 
 async function handleBan(env, message, arg, config, isOwner, ctx) {
@@ -2008,15 +2045,17 @@ async function handleCallback(env, callback) {
 	}
 	await adDetectionReady(env);
 
-	if (data === 'mgr:auto_ban_notify:toggle') {
+	if (data === 'mgr:auto_ban_notify:toggle' || data === 'mgr:image_ad_detect:toggle') {
 		if (!isPrimaryOwner(from?.id, config)) {
 			await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id, text: '仅第一主人可操作', show_alert: true });
 			return;
 		}
-		const enabled = await getBotSetting(env, 'auto_ban_notify', '0') === '1';
-		const next = !enabled;
-		await setBotSetting(env, 'auto_ban_notify', next ? '1' : '0');
-		await editMessageText(env, callback.message?.chat?.id, callback.message?.message_id, buildManagerPanelText(next), { reply_markup: buildManagerPanelKeyboard(next) }).catch(() => {});
+		const key = data === 'mgr:auto_ban_notify:toggle' ? 'auto_ban_notify' : 'image_ad_detect';
+		const enabled = await getBotSetting(env, key, '0') === '1';
+		await setBotSetting(env, key, enabled ? '0' : '1');
+		const notifyEnabled = await getBotSetting(env, 'auto_ban_notify', '0') === '1';
+		const imageEnabled = await getBotSetting(env, 'image_ad_detect', '0') === '1';
+		await editMessageText(env, callback.message?.chat?.id, callback.message?.message_id, buildManagerPanelText(notifyEnabled, imageEnabled), { reply_markup: buildManagerPanelKeyboard(notifyEnabled, imageEnabled) }).catch(() => {});
 		await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id });
 		return;
 	}
@@ -2132,6 +2171,10 @@ async function handleUpdate(env, update, ctx) {
 			// 观察群只采集样本：不记台账、不处置、不进群流程，只通知未命中指纹的疑似广告。
 			await detectAdOnMessage(env, message, { observe: true });
 			return;
+		}
+		if (Array.isArray(message.photo) && message.photo.length && !String(message.caption || '').trim()) {
+			const imageResult = await detectImageAd(env, message);
+			if (imageResult) return;
 		}
 		await recordMessage(env, message);
 		if (Array.isArray(message.new_chat_members) && message.new_chat_members.length) {
@@ -2404,7 +2447,7 @@ export {
 	adDetectionReady, resetSchemaState, addAdSample, matchAdSemantic, embedText, cosineSimilarity,
 	matchFingerprints, learnFingerprints, confirmFingerprint, retireFingerprint,
 	muteInCurrentGroup, banAllGroups, renderBanAllReceipt,
-	getContactName, getQuotedText, detectAdOnMessage, handleNewChatMembers,
+	getContactName, getQuotedText, detectAdOnMessage, detectImageAd, handleNewChatMembers,
 	isGroupAdmin, invalidateAdminCache, isBlacklisted, addBlacklist, removeBlacklist,
 	matchAllowlist, recordMessage, sweepUserMessages, sweepUserMessagesAllGroups,
 	judgeAdWithAI, handleAd, notifyAdReport,
