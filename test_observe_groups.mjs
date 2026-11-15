@@ -86,6 +86,9 @@ test('owner save/dismiss callbacks update report and samples', async () => {
 
   await worker.handleCallback(h.env, { id: 'cb1', data: 'o:save:' + reportId, from: { id: OWNER, is_bot: false }, message: { chat: { id: OWNER, type: 'private' }, message_id: 10 } });
   assert.equal(rows(h, 'ad_samples').length, 1);
+  assert.equal(rows(h, 'blacklist').length, 1);
+  assert.equal(rows(h, 'blacklist')[0].user_id, TARGET);
+  assert.ok(h.calls.some(c => c.method === 'banChatMember'));
   assert.equal(rows(h, 'ad_observe_reports')[0].status, 'saved');
 
   h.sqlite.prepare("UPDATE ad_observe_reports SET status='open' WHERE id=?").run(reportId);

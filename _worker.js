@@ -1968,9 +1968,11 @@ async function handleCallback(env, callback) {
 		}
 		if (action === 'save') {
 			await addAdSample(env, report.body_text, { source: 'observe_confirm', computeEmbedding: true });
+			await addBlacklist(env, report.user_id, 'spam', 'observe_confirm', from.id);
+			const banResult = await banAllGroups(env, report.user_id, config, 'observe_confirm');
 			await env.DB.prepare("UPDATE ad_observe_reports SET status = 'saved' WHERE id = ?").bind(reportId).run();
 			await editMessageText(env, callback.message?.chat?.id, callback.message?.message_id,
-				`✅ 已抓取样本保存进数据库。\n\n📄 <code>${escapeHtml(String(report.body_text || '').slice(0, 300))}</code>`).catch(() => {});
+				`✅ 已抓取样本并列入黑名单全群封禁 <code>${escapeHtml(String(report.user_id || ''))}</code>。\n${renderBanAllReceipt(banResult)}\n\n📄 <code>${escapeHtml(String(report.body_text || '').slice(0, 300))}</code>`).catch(() => {});
 		} else {
 			await env.DB.prepare("UPDATE ad_observe_reports SET status = 'dismissed' WHERE id = ?").bind(reportId).run();
 			await editMessageText(env, callback.message?.chat?.id, callback.message?.message_id,
