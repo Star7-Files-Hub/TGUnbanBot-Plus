@@ -441,13 +441,16 @@ function cosineSimilarity(a, b) {
 	return denom === 0 ? 0 : dot / denom;
 }
 
-// 三级合并的入口。返回 { added, merged, tier, sampleId }。
+// 三级合并的入口。拒绝时返回 { ok: false, reason }，写入后才返回 added/merged。
 async function addAdSample(env, rawText, options = {}) {
-	const normalized = normalizeAdText(rawText);
-	const stripped = stripMentionsAndLinks(normalized).trim();
-	if (stripped.length < MIN_SAMPLE_LEN) {
+	// 必须先剔除链接/提及再归一化，否则标点折叠会破坏 URL 的识别。
+	const meaningful = normalizeAdText(stripMentionsAndLinks(toHalfWidth(rawText).toLowerCase()))
+		.replace(/[^\p{L}\p{N}]/gu, '');
+	if (!meaningful) return { ok: false, reason: 'no_semantic_text' };
+	if (Array.from(meaningful).length < MIN_SAMPLE_LEN) {
 		return { ok: false, reason: 'too_short' };
 	}
+	const normalized = normalizeAdText(rawText);
 	const source = String(options.source || 'auto');
 	const hash = await sha256Hex(normalized);
 	const now = nowSeconds();
@@ -456,7 +459,8 @@ async function addAdSample(env, rawText, options = {}) {
 	// 第 1 级：归一化文本完全一致 → 只加计数。
 	const existingByHash = await env.DB.prepare('SELECT id, count FROM ad_samples WHERE norm_hash = ?').bind(hash).first();
 	if (existingByHash) {
-		await env.DB.prepare('UPDATE ad_samples SET count = count + 1, updated_at = ? WHERE id = ?').bind(now, existingByHash.id).run();
+		const merged = await env.DB.prepare('UPDATE ad_samples SET count = count + 1, updated_at = ? WHERE id = ?').bind(now, existingByHash.id).run();
+		if (merged?.success === false) return { ok: false, reason: 'write_failed' };
 		await maybePromoteSampleToFingerprint(env, existingByHash.id);
 		return { ok: true, added: false, merged: true, sampleId: existingByHash.id, tier: 1 };
 	}
@@ -467,7 +471,8 @@ async function addAdSample(env, rawText, options = {}) {
 	if (sig) {
 		const sameSig = await env.DB.prepare('SELECT id, sample_text, variants, count FROM ad_samples WHERE signature = ? ORDER BY updated_at DESC LIMIT 1').bind(sig).first();
 		if (sameSig) {
-			await mergeVariant(env, sameSig, normalized, now);
+			const merged = await mergeVariant(env, sameSig, normalized, now);
+			if (merged?.success === false) return { ok: false, reason: 'write_failed' };
 			await maybePromoteSampleToFingerprint(env, sameSig.id);
 			return { ok: true, added: false, merged: true, sampleId: sameSig.id, tier: 2 };
 		}
@@ -492,7 +497,8 @@ async function addAdSample(env, rawText, options = {}) {
 		}
 		if (best.id && best.sim >= config.mergeSimilarity) {
 			const row = await env.DB.prepare('SELECT id, variants FROM ad_samples WHERE id = ?').bind(best.id).first();
-			await mergeVariant(env, row, normalized, now);
+			const merged = await mergeVariant(env, row, normalized, now);
+			if (merged?.success === false) return { ok: false, reason: 'write_failed' };
 			await maybePromoteSampleToFingerprint(env, best.id);
 			return { ok: true, added: false, merged: true, sampleId: best.id, tier: 3, sim: best.sim };
 		}
@@ -500,11 +506,12 @@ async function addAdSample(env, rawText, options = {}) {
 
 	// 插入新语义簇。
 	const kind = String(options.kind || 'text');
-	await env.DB.prepare(
+	const inserted = await env.DB.prepare(
 		`INSERT INTO ad_samples (norm_hash, sample_text, signature, variants, count, embedding, dimension, source, kind, created_at, updated_at)
 		 VALUES (?, ?, ?, '[]', 1, ?, ?, ?, ?, ?, ?)`
 	).bind(hash, String(rawText).slice(0, 500), sig, embedding ? JSON.stringify(embedding) : null, embedding ? embedding.length : null, source, kind, now, now).run();
-	return { ok: true, added: true, merged: false, tier: 0 };
+	if (inserted?.success === false) return { ok: false, reason: 'write_failed' };
+	return { ok: true, added: true, merged: false, tier: 0, sampleId: inserted?.meta?.last_row_id };
 }
 
 function semanticAutoFpThreshold(env) {
@@ -537,7 +544,7 @@ async function mergeVariant(env, row, normalized, now) {
 		variants.push(normalized.slice(0, 200));
 		if (variants.length > MERGE_VARIANTS_MAX) variants = variants.slice(-MERGE_VARIANTS_MAX);
 	}
-	await env.DB.prepare(
+	return env.DB.prepare(
 		'UPDATE ad_samples SET variants = ?, count = count + 1, updated_at = ? WHERE id = ?'
 	).bind(JSON.stringify(variants), now, row.id).run();
 }
@@ -1875,9 +1882,25 @@ async function handleWords(env, message, config, isOwner) {
 }
 async function handleAddSample(env, message, arg, config, isOwner) {
 	if (!isOwner || message.chat?.type !== 'private') return sendMessage(env, message.chat.id, '仅主人在私聊可用');
-	if (!arg) return sendMessage(env, message.chat.id, '用法：/addsample <广告文本>');
-	const r = await addAdSample(env, arg, { source: 'manual', computeEmbedding: true });
-	return sendMessage(env, message.chat.id, r.merged ? `🧠 已合并进语义簇 #${r.sampleId}（第 ${r.tier} 级）` : '🧠 已新增语义样本');
+	if (!arg) return sendMessage(env, message.chat.id, '用法：/addsample <code>广告文本</code>');
+	let result;
+	try { result = await addAdSample(env, arg, { source: 'manual', computeEmbedding: true }); }
+	catch (_) {
+		// 不回显数据库异常或原文，也不把失败当成新增成功。
+		return sendMessage(env, message.chat.id, '⚠️ 语义样本保存失败，请稍后重试（未确认写入）。');
+	}
+	if (result?.ok !== true) {
+		const feedback = result?.reason === 'no_semantic_text'
+			? '⚠️ 未保存：样本没有可用于语义识别的文字（纯表情、标点或仅链接/提及）。请提供含广告话术的文本。'
+			: result?.reason === 'too_short'
+				? '⚠️ 未保存：样本至少需要 4 个有效文字或数字，表情、标点、链接和提及不计入。'
+				: '⚠️ 语义样本保存失败，请稍后重试（未确认写入）。';
+		return sendMessage(env, message.chat.id, feedback);
+	}
+	if (result.merged) return sendMessage(env, message.chat.id, `🧠 已合并进语义簇 #${result.sampleId}（第 ${result.tier} 级）`);
+	const sampleId = Number(result.sampleId);
+	const suffix = Number.isSafeInteger(sampleId) && sampleId > 0 ? ` #${sampleId}` : '';
+	return sendMessage(env, message.chat.id, '🧠 已新增语义样本' + suffix);
 }
 async function handleAdStats(env, message, config, isOwner) {
 	if (!isOwner) return sendMessage(env, message.chat.id, '仅主人可用');
@@ -2246,8 +2269,11 @@ nav a{color:#93c5fd;text-decoration:none;font-size:13px}
 .toolbar .result{font-size:13px;color:#a5f3fc}
 main{flex:1;display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px 16px;min-height:0}
 .card{background:#1e293b;border:1px solid #334155;border-radius:12px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
-.card .head{padding:10px 12px;border-bottom:1px solid #334155}
+.card .head{padding:10px 12px;border-bottom:1px solid #334155;display:flex;align-items:center;justify-content:space-between;gap:12px}
 .card h2{font-size:14px;margin:0}
+.library-tabs{display:flex;gap:6px}
+.library-tabs button{background:#0f172a;color:#94a3b8;border:1px solid #334155;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
+.library-tabs button[aria-selected="true"]{color:#fff;background:#2563eb;border-color:#2563eb}
 .tablewrap{flex:1;overflow:hidden}
 table{width:100%;border-collapse:collapse;font-size:12.5px;table-layout:fixed}
 th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #334155;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -2266,8 +2292,8 @@ th{color:#94a3b8;font-weight:600}
 </div>
 <main>
   <div class="card">
-    <div class="head"><h2>广告指纹库</h2></div>
-    <div class="tablewrap"><table><thead><tr><th style="width:44%">value</th><th style="width:16%">type</th><th style="width:16%">status</th><th style="width:12%">hit</th><th style="width:12%">source</th></tr></thead><tbody id="fp-tbody"></tbody></table></div>
+    <div class="head"><h2 id="library-title">广告指纹库</h2><div class="library-tabs" role="tablist" aria-label="查看数据类型"><button id="library-fingerprints" role="tab" aria-selected="true" onclick="switchLibrary('fingerprints')">指纹库</button><button id="library-samples" role="tab" aria-selected="false" onclick="switchLibrary('samples')">AI 语义库</button></div></div>
+    <div class="tablewrap"><table><thead><tr><th id="library-col-0" style="width:44%">value</th><th id="library-col-1" style="width:16%">type</th><th id="library-col-2" style="width:16%">status</th><th id="library-col-3" style="width:12%">hit</th><th id="library-col-4" style="width:12%">source</th></tr></thead><tbody id="fp-tbody"></tbody></table></div>
     <div class="foot"><span id="fp-meta"></span><span><button id="fp-prev" onclick="move('fp',-1)">上一页</button> <button id="fp-next" onclick="move('fp',1)">下一页</button></span></div>
   </div>
   <div class="card">
@@ -2279,6 +2305,18 @@ th{color:#94a3b8;font-weight:600}
 <script>
 var state={fp:0,bl:0};
 var pageSize=20;
+var libraryKind='fingerprints';
+var loadVersion={fp:0,bl:0};
+function switchLibrary(kind){
+  if(kind!=='fingerprints'&&kind!=='samples')return;
+  libraryKind=kind;
+  state.fp=0;
+  document.getElementById('library-title').textContent=kind==='samples'?'AI 语义库':'广告指纹库';
+  ['fingerprints','samples'].forEach(function(key){document.getElementById('library-'+key).setAttribute('aria-selected',String(key===kind));});
+  var headers=kind==='samples'?['样本内容','类型','样本 ID','累计次数','来源']:['value','type','status','hit','source'];
+  headers.forEach(function(label,index){document.getElementById('library-col-'+index).textContent=label;});
+  return load('fp');
+}
 function move(kind,delta){
   var next=state[kind]+delta;
   if(next<0)return;
@@ -2286,23 +2324,29 @@ function move(kind,delta){
   load(kind);
 }
 async function load(kind){
-  var key=kind==='fp'?'fingerprints':'blacklist';
+  var key=kind==='fp'?libraryKind:'blacklist';
+  var version=++loadVersion[kind];
+  var page=state[kind];
   var tbody=document.getElementById(kind+'-tbody');
   var meta=document.getElementById(kind+'-meta');
   var prev=document.getElementById(kind+'-prev');
   var nextBtn=document.getElementById(kind+'-next');
+  tbody.textContent='';
   meta.textContent='加载中...';
+  prev.disabled=true;nextBtn.disabled=true;
   try{
-    var res=await fetch('/api/'+key+'?limit=20&offset='+(state[kind]*pageSize));
+    var res=await fetch('/api/'+key+'?limit=20&offset='+(page*pageSize));
     var data=await res.json();
-    if(!data.ok){meta.textContent='加载失败';return;}
-    tbody.textContent='';
+    if(version!==loadVersion[kind])return;
+    if(!res.ok||!data.ok){meta.textContent='加载失败';return;}
     var total=data.total||0;
     (data.items||[]).forEach(function(item){
       var tr=document.createElement('tr');
-      var cells=kind==='fp'
-        ?[item.value,item.type,item.status,item.hit_count,item.source]
-        :[item.user_id,item.reason,item.created_at?new Date(item.created_at*1000).toLocaleString():''];
+      var cells=key==='samples'
+        ?[item.sample_text,item.kind||'text',item.id,item.count,item.source]
+        :key==='fingerprints'
+          ?[item.value,item.type,item.status,item.hit_count,item.source]
+          :[item.user_id,item.reason,item.created_at?new Date(item.created_at*1000).toLocaleString():''];
       cells.forEach(function(v){
         var td=document.createElement('td');
         var s=(v===null||v===undefined)?'':String(v);
@@ -2310,10 +2354,10 @@ async function load(kind){
       });
       tbody.appendChild(tr);
     });
-    meta.textContent='第 '+(state[kind]+1)+' 页 · 共 '+total+' 条';
-    prev.disabled=state[kind]===0;
-    nextBtn.disabled=(state[kind]+1)*pageSize>=total;
-  }catch(e){meta.textContent='加载失败：'+e.message;}
+    meta.textContent='第 '+(page+1)+' 页 · 共 '+total+' 条';
+    prev.disabled=page===0;
+    nextBtn.disabled=(page+1)*pageSize>=total;
+  }catch(e){if(version===loadVersion[kind])meta.textContent='加载失败：'+e.message;}
 }
 async function checkTgid(){
   var input=document.getElementById('tgid');

@@ -63,6 +63,8 @@
 - `/spam` 的消息不再直接建指纹，AI 审核通过后只保存进语义库（`source=spam_reviewed`），并分别把本人正文、引用频道文本、名片名字按 `kind` 单独采集。
 - 语义样本命中或被反复抓到，`count` 会增长；当 `count >= SEMANTIC_AUTO_FP_THRESHOLD`（默认 3，可设 1–1000）时，`text`、`quote`、`card_name` 三类样本都会自动升级为 confirmed keyword 指纹（`source=auto_semantic_<kind>`）。
 - `GET /api/samples` 公开语义库（sample_text、kind、source、count），不含向量与签名。
+- `/addsample` 现在检查真实写入结果：纯表情、标点、仅链接/提及或不足 4 个有效文字/数字的输入明确回复“未保存”；数据库写入失败不会再回复“已新增”。有效新样本回执附样本 ID，重复样本仍显示合并簇 ID。
+- 数据预览页左侧可切换“指纹库 / AI 语义库”，语义库显示样本内容、类型、ID、累计次数、来源；继续每页 20 条，不改变右侧黑名单及整体双栏布局。
 
 ### 观察群（样本采集）
 
