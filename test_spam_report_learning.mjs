@@ -68,10 +68,7 @@ test('owner confirmation learns reviewed phrase and closes the report', async ()
     from: { id: OWNER, is_bot: false, first_name: '主人' },
     message: { chat: { id: OWNER, type: 'private' }, message_id: 9001 },
   });
-  const fps = rows(h, 'ad_fingerprints');
-  assert.equal(fps.length, 1);
-  assert.equal(fps[0].type, 'ad_phrase');
-  assert.equal(fps[0].status, 'pending');
+  assert.equal(rows(h, 'ad_fingerprints').length, 0);
   assert.equal(rows(h, 'ad_samples').length, 1);
   assert.equal(rows(h, 'ad_spam_reports')[0].status, 'confirmed');
   assert.ok(h.calls.some(c => c.method === 'editMessageText'));

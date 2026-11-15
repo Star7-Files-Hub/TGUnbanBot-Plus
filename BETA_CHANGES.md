@@ -51,6 +51,13 @@
 - 开关默认关闭；开启后，自动检测命中并禁言/封禁时会把目标、群、原因和内容摘要私聊第一主人。
 - 开关持久化在 Beta 的 `bot_settings` 表，不写入环境变量或仓库；面板按钮直接切换，副主人和群内调用不生效。
 
+### 语义库与自动升级指纹
+
+- 语义样本现在带 `kind` 类型：`text`（正文）等；名字、简介、名片、引用不进入语义库。
+- `/spam` 的消息不再直接建指纹，AI 审核通过后只保存进语义库（`source=spam_reviewed`）。
+- 语义样本命中或被反复抓到，`count` 会增长；当 `count >= SEMANTIC_AUTO_FP_THRESHOLD`（默认 3，可设 1–1000）时，仅 `kind=text` 的样本自动升级为 confirmed keyword 指纹。
+- `GET /api/samples` 公开语义库（sample_text、kind、source、count），不含向量与签名。
+
 ### 观察群（样本采集）
 
 - 第一主人私聊 `/addlisten <群ID>` 把机器人加入只监听、不处置的观察群；`/dellisten <群ID>` 移除，`/listen_groups` 列出。

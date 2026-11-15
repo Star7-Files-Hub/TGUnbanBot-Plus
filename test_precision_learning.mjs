@@ -1,4 +1,4 @@
-// Precision-learning regressions: real SQLite, synthetic text, no network/secrets.
+// Precision/semantic learning regressions: real SQLite, synthetic text, no network/secrets.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs/promises';
@@ -26,46 +26,132 @@ function harness(answer = { is_ad: true, candidates: [phrase] }) {
 }
 const target = (text = phrase, extras = {}) => ({from:{id:555,first_name:'普通用户',username:'ordinary_user'},text,...extras});
 async function rows(h, table) { return h.db.prepare('SELECT * FROM ' + table).all(); }
-test('reviewed own verbatim phrase becomes pending ad_phrase and sample, not identity', async () => {
-  const h=harness(); await w.adDetectionReady(h.env);
-  const r=await w.learnPrecisionSpam(h.env,target()); assert.equal(r.learned,1);
-  const fp=await rows(h,'ad_fingerprints'); assert.equal(fp.length,1); assert.equal(fp[0].type,'ad_phrase'); assert.equal(fp[0].value,phrase); assert.equal(fp[0].status,'pending');
-  const samples=await rows(h,'ad_samples'); assert.equal(samples.length,1); assert.ok(!samples[0].sample_text.includes('ordinary_user'));
-  const prompt=h.ai.find(c=>!c.model.includes('bge')).options; assert.equal(prompt.max_tokens,512); assert.ok(prompt.messages[1].content.includes(phrase)); assert.ok(!prompt.messages[1].content.includes('ordinary_user'));
+
+test('reviewed own text becomes semantic sample, never a fingerprint', async () => {
+  const h = harness(); await w.adDetectionReady(h.env);
+  const r = await w.learnPrecisionSpam(h.env, target());
+  assert.equal(r.learned, 1);
+  assert.equal((await rows(h, 'ad_fingerprints')).length, 0);
+  const samples = await rows(h, 'ad_samples');
+  assert.equal(samples.length, 1);
+  assert.equal(samples[0].source, 'spam_reviewed');
+  assert.ok(!samples[0].sample_text.includes('ordinary_user'));
+  const prompt = h.ai.find(c => !c.model.includes('bge')).options;
+  assert.equal(prompt.max_tokens, 512);
+  assert.ok(prompt.messages[1].content.includes(phrase));
+  assert.ok(!prompt.messages[1].content.includes('ordinary_user'));
 });
-for (const answer of [ {is_ad:false,candidates:[]},{is_ad:true,candidates:['usdt']},{is_ad:true,candidates:['出售普通账号']},{is_ad:true,candidates:['高价收购实名号联系 @someone']},{is_ad:true,candidates:['高价收购实名号联系https://invalid.test']},{is_ad:true,candidates:['高价收购实名号四件套完全不存在']},{is_ad:true,candidates:[phrase],reason:'ad'}, {is_ad:'true',candidates:[phrase]}, {is_ad:true,candidates:[phrase,phrase,phrase,phrase]}, new Error('secret provider failure')]) {
- test('rejected or erroneous reviewer creates zero learning: '+JSON.stringify(answer),async()=>{ const h=harness(answer); await w.adDetectionReady(h.env); await w.learnPrecisionSpam(h.env,target()); assert.equal((await rows(h,'ad_fingerprints')).length,0); assert.equal((await rows(h,'ad_samples')).length,0); });
+
+for (const answer of [
+  {is_ad:false,candidates:[]},
+  {is_ad:true,candidates:[phrase],reason:'ad'},
+  {is_ad:'true',candidates:[phrase]},
+  {is_ad:true,candidates:[phrase,phrase,phrase,phrase]},
+  new Error('secret provider failure')
+]) {
+  test('rejected or erroneous reviewer creates zero learning: ' + JSON.stringify(answer), async () => {
+    const h = harness(answer); await w.adDetectionReady(h.env);
+    await w.learnPrecisionSpam(h.env, target());
+    assert.equal((await rows(h, 'ad_fingerprints')).length, 0);
+    assert.equal((await rows(h, 'ad_samples')).length, 0);
+  });
 }
-for (const msg of [target('举报这个广告',{quote:{text:phrase}}),target('警惕骗子',{reply_to_message:{text:phrase}}),target(phrase,{entities:[{type:'blockquote',offset:0,length:phrase.length}]}),target('> '+phrase),target('/spam '+phrase),target('普通正文',{contact:{first_name:phrase}}),target('普通正文',{from:{id:555,first_name:phrase,username:'bad_handle'}}),target(phrase,{quote:{text:phrase}}),target(phrase,{from:{id:555,first_name:'实名号',username:'ordinary_user'}})]) {
- test('quotes/contact/name/identity never enroll: '+JSON.stringify(msg),async()=>{const h=harness(); await w.adDetectionReady(h.env); await w.learnPrecisionSpam(h.env,msg); assert.equal((await rows(h,'ad_fingerprints')).length,0);assert.equal((await rows(h,'ad_samples')).length,0);});
-}
-test('ad_phrase substring match requires own_body; name, username, quote keyword do not match',async()=>{const h=harness();await w.adDetectionReady(h.env);await w.learnPrecisionSpam(h.env,target());
- for(const type of ['name','username','keyword','card_name']) assert.equal((await w.matchFingerprints(h.env,[{type,value:'前缀'+phrase+'后缀'}])).length,0);
- assert.equal((await w.matchFingerprints(h.env,[{type:'own_body',value:'前缀'+phrase+'后缀'}])).length,1);
- await h.env.DB.prepare("UPDATE ad_fingerprints SET status='retired'").run(); assert.equal((await w.matchFingerprints(h.env,[{type:'own_body',value:phrase}])).length,0);
+
+test('quoted text never enters the semantic sample', async () => {
+  const h = harness(); await w.adDetectionReady(h.env);
+  await w.learnPrecisionSpam(h.env, target('普通正文', { quote: { text: phrase } }));
+  const samples = await rows(h, 'ad_samples');
+  assert.equal(samples.length, 1);
+  assert.ok(!String(samples[0].sample_text).includes(phrase));
 });
-test('legacy unsafe short ad_phrase row is not matched',async()=>{const h=harness();await w.adDetectionReady(h.env);await w.learnFingerprints(h.env,[{type:'ad_phrase',value:'usdt'}]);assert.equal((await w.matchFingerprints(h.env,[{type:'own_body',value:'discussion usdt'}])).length,0);});
-test('owner spam enforcement survives review failure and action-note never reaches reviewer',async()=>{const h=harness(new Error('review unavailable'));await w.adDetectionReady(h.env);await w.handleCommand(h.env,{text:'/spam '+phrase,chat:{id:-1001,type:'supergroup'},from:{id:999},reply_to_message:target('普通正文',{message_id:3})});assert.equal((await rows(h,'blacklist')).length,1);assert.ok(h.calls.some(c=>c.method==='banChatMember'));assert.equal((await rows(h,'ad_fingerprints')).length,0);assert.equal((await rows(h,'ad_samples')).length,0);assert.ok(h.ai.every(c=>!JSON.stringify(c.options).includes(phrase)));});
-test('binary judge mock cannot approve structured review',async()=>{const h=harness({is_ad:false,candidates:[]});h.env.__aiJudgeMock=async()=>({isAd:true});await w.adDetectionReady(h.env);await w.learnPrecisionSpam(h.env,target());assert.equal((await rows(h,'ad_fingerprints')).length,0);assert.equal(h.ai.length,1);});
-test('automatic structure enforcement cannot re-enroll names, handles, own or quoted raw text',async()=>{const h=harness();await w.adDetectionReady(h.env);await w.detectAdOnMessage(h.env,{...target(),message_id:9,chat:{id:-1001,type:'supergroup'}});assert.ok(h.calls.some(c=>c.method==='restrictChatMember'));assert.equal((await rows(h,'ad_fingerprints')).length,0);assert.equal((await rows(h,'ad_samples')).length,0);});
-test('structured precision review shares threshold backup routing and strict completion',async()=>{
- const h=harness();await w.adDetectionReady(h.env);
- await h.env.DB.prepare('CREATE TABLE ai_classifier_state (key TEXT PRIMARY KEY,utc_day TEXT,value TEXT,updated_at INTEGER)').run();
- await h.env.DB.prepare('INSERT INTO ai_classifier_state VALUES (?,?,?,?)').bind('cloudflare_daily',new Date().toISOString().slice(0,10),JSON.stringify({neurons:9000}),Math.floor(Date.now()/1000)).run();
- Object.assign(h.env,{AI_API_BASE_URL:'https://backup.invalid/v1',AI_API_TOKEN:'TEST-NOT-REAL'});
- const prior=globalThis.fetch;let capture;
- globalThis.fetch=async(url,options)=>{capture={url,options};return Response.json({choices:[{finish_reason:'stop',message:{content:JSON.stringify({is_ad:true,candidates:[phrase]})}}]});};
- try{const reviewed=await w.judgeAdWithAI(h.env,phrase,'precision_learn');assert.equal(reviewed.is_ad,true);assert.equal(h.ai.length,0);assert.equal(JSON.parse(capture.options.body).max_tokens,1024);assert.ok(JSON.parse(capture.options.body).messages[0].content.includes('JSON'));assert.equal(capture.options.redirect,'error');
- globalThis.fetch=async()=>Response.json({choices:[{finish_reason:'length',message:{content:JSON.stringify({is_ad:true,candidates:[phrase]})}}]});
- assert.ok((await w.judgeAdWithAI(h.env,phrase,'precision_learn')).error);
- }finally{globalThis.fetch=prior;}
+
+test('ad_phrase substring match requires own_body; identity/quote/keyword do not match', async () => {
+  const h = harness(); await w.adDetectionReady(h.env);
+  await w.learnFingerprints(h.env, [{ type: 'ad_phrase', value: phrase }], { source: 'spam_reviewed' });
+  for (const type of ['name', 'username', 'keyword', 'card_name']) assert.equal((await w.matchFingerprints(h.env, [{ type, value: '前缀' + phrase + '后缀' }])).length, 0);
+  assert.equal((await w.matchFingerprints(h.env, [{ type: 'own_body', value: '前缀' + phrase + '后缀' }])).length, 1);
+  await h.env.DB.prepare("UPDATE ad_fingerprints SET status='retired'").run();
+  assert.equal((await w.matchFingerprints(h.env, [{ type: 'own_body', value: phrase }])).length, 0);
 });
-test('CF structured truncated completion cannot enroll candidates',async()=>{const h=harness();h.env.AI.run=async()=>({response:JSON.stringify({is_ad:true,candidates:[phrase]}),finish_reason:'length'});await w.adDetectionReady(h.env);await w.learnPrecisionSpam(h.env,target());assert.equal((await rows(h,'ad_fingerprints')).length,0);assert.equal((await rows(h,'ad_samples')).length,0);});
-test('ordinary sale/contact, generic trade words, names and IDs fail deterministic filter',()=>{for(const v of ['出售二手手机，联系本人','USDT价格行情讨论','高价出售联系私聊咨询','123456789012345','ordinary_username'])assert.equal(w.isPrecisionPhrase(v),false);});
-test('independent evidence uses disjoint spans, never overlapping income terms',()=>{
- for(const value of ['日入1234联系本人','日入1234月入5678联系本人','月入1234日入1234长期联系','网赚日入1234联系本人']) assert.equal(w.isPrecisionPhrase(value),false,value);
- for(const value of ['日入1234四件套联系本人','高价收购实名号联系本人','长期出售USDT联系本人','日入1234博彩招代理联系']) assert.equal(w.isPrecisionPhrase(value),true,value);
+
+test('legacy unsafe short ad_phrase row is not matched', async () => {
+  const h = harness(); await w.adDetectionReady(h.env);
+  await w.learnFingerprints(h.env, [{ type: 'ad_phrase', value: 'usdt' }]);
+  assert.equal((await w.matchFingerprints(h.env, [{ type: 'own_body', value: 'discussion usdt' }])).length, 0);
 });
-test('AI approval cannot bypass overlapping-only deterministic evidence',async()=>{const value='日入1234联系本人';const h=harness({is_ad:true,candidates:[value]});await w.adDetectionReady(h.env);await w.learnPrecisionSpam(h.env,target(value));assert.equal((await rows(h,'ad_fingerprints')).length,0);assert.equal((await rows(h,'ad_samples')).length,0);});
-test('manual addword remains explicit and can store administrator-chosen keywords',async()=>{const h=harness();await w.adDetectionReady(h.env);await w.handleCommand(h.env,{text:'/addword usdt',chat:{id:999,type:'private'},from:{id:999}});const fp=await rows(h,'ad_fingerprints');assert.equal(fp.length,1);assert.equal(fp[0].type,'keyword');assert.equal(fp[0].status,'confirmed');});
-test('join_profile prompt is distinct conservative binary task; precision schema is closed',async()=>{const join=w.reviewTasks('资料','join_profile'),msg=w.reviewTasks('正文');assert.notEqual(join.messages[0].content,msg.messages[0].content);assert.ok(join.messages[0].content.includes('无法确定必须ok'));assert.equal(w.parsePrecisionLearningResponse({response:'{"is_ad":false,"candidates":[],"extra":1}'}).error,'invalid_ai_response');});
+
+test('owner spam enforcement survives review failure and action-note never reaches reviewer', async () => {
+  const h = harness(new Error('review unavailable')); await w.adDetectionReady(h.env);
+  await w.handleCommand(h.env, { text: '/spam ' + phrase, chat: { id: -1001, type: 'supergroup' }, from: { id: 999 }, reply_to_message: target('普通正文', { message_id: 3 }) });
+  assert.equal((await rows(h, 'blacklist')).length, 1);
+  assert.ok(h.calls.some(c => c.method === 'banChatMember'));
+  assert.equal((await rows(h, 'ad_fingerprints')).length, 0);
+  assert.equal((await rows(h, 'ad_samples')).length, 0);
+  assert.ok(h.ai.every(c => !JSON.stringify(c.options).includes(phrase)));
+});
+
+test('binary judge mock cannot approve structured review', async () => {
+  const h = harness({ is_ad: false, candidates: [] }); h.env.__aiJudgeMock = async () => ({ isAd: true });
+  await w.adDetectionReady(h.env);
+  await w.learnPrecisionSpam(h.env, target());
+  assert.equal((await rows(h, 'ad_fingerprints')).length, 0);
+  assert.equal(h.ai.length, 1);
+});
+
+test('automatic structure enforcement cannot re-enroll names, handles, own or quoted raw text', async () => {
+  const h = harness(); await w.adDetectionReady(h.env);
+  await w.detectAdOnMessage(h.env, { ...target(), message_id: 9, chat: { id: -1001, type: 'supergroup' } });
+  assert.ok(h.calls.some(c => c.method === 'restrictChatMember'));
+  assert.equal((await rows(h, 'ad_fingerprints')).length, 0);
+  assert.equal((await rows(h, 'ad_samples')).length, 0);
+});
+
+test('structured precision review shares threshold backup routing and strict completion', async () => {
+  const h = harness(); await w.adDetectionReady(h.env);
+  await h.env.DB.prepare('CREATE TABLE ai_classifier_state (key TEXT PRIMARY KEY,utc_day TEXT,value TEXT,updated_at INTEGER)').run();
+  await h.env.DB.prepare('INSERT INTO ai_classifier_state VALUES (?,?,?,?)').bind('cloudflare_daily', new Date().toISOString().slice(0, 10), JSON.stringify({ neurons: 9000 }), Math.floor(Date.now() / 1000)).run();
+  Object.assign(h.env, { AI_API_BASE_URL: 'https://backup.invalid/v1', AI_API_TOKEN: 'TEST-NOT-REAL' });
+  const prior = globalThis.fetch; let capture;
+  globalThis.fetch = async (url, options) => { capture = { url, options }; return Response.json({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ is_ad: true, candidates: [phrase] }) } }] }); };
+  try {
+    const reviewed = await w.judgeAdWithAI(h.env, phrase, 'precision_learn');
+    assert.equal(reviewed.is_ad, true);
+    assert.equal(h.ai.length, 0);
+    assert.equal(JSON.parse(capture.options.body).max_tokens, 1024);
+    assert.ok(JSON.parse(capture.options.body).messages[0].content.includes('JSON'));
+    assert.equal(capture.options.redirect, 'error');
+    globalThis.fetch = async () => Response.json({ choices: [{ finish_reason: 'length', message: { content: JSON.stringify({ is_ad: true, candidates: [phrase] }) } }] });
+    assert.ok((await w.judgeAdWithAI(h.env, phrase, 'precision_learn')).error);
+  } finally { globalThis.fetch = prior; }
+});
+
+test('CF structured truncated completion cannot enroll semantic samples', async () => {
+  const h = harness(); h.env.AI.run = async () => ({ response: JSON.stringify({ is_ad: true, candidates: [phrase] }), finish_reason: 'length' });
+  await w.adDetectionReady(h.env);
+  await w.learnPrecisionSpam(h.env, target());
+  assert.equal((await rows(h, 'ad_fingerprints')).length, 0);
+  assert.equal((await rows(h, 'ad_samples')).length, 0);
+});
+
+test('ordinary sale/contact, generic trade words, names and IDs fail deterministic filter', () => {
+  for (const v of ['出售二手手机，联系本人', 'USDT价格行情讨论', '高价出售联系私聊咨询', '123456789012345', 'ordinary_username']) assert.equal(w.isPrecisionPhrase(v), false);
+});
+
+test('independent evidence uses disjoint spans, never overlapping income terms', () => {
+  for (const value of ['日入1234联系本人', '日入1234月入5678联系本人', '月入1234日入1234长期联系', '网赚日入1234联系本人']) assert.equal(w.isPrecisionPhrase(value), false, value);
+  for (const value of ['日入1234四件套联系本人', '高价收购实名号联系本人', '长期出售USDT联系本人', '日入1234博彩招代理联系']) assert.equal(w.isPrecisionPhrase(value), true, value);
+});
+
+test('manual addword remains explicit and can store administrator-chosen keywords', async () => {
+  const h = harness(); await w.adDetectionReady(h.env);
+  await w.handleCommand(h.env, { text: '/addword usdt', chat: { id: 999, type: 'private' }, from: { id: 999 } });
+  const fp = await rows(h, 'ad_fingerprints');
+  assert.equal(fp.length, 1); assert.equal(fp[0].type, 'keyword'); assert.equal(fp[0].status, 'confirmed');
+});
+
+test('join_profile prompt is distinct conservative binary task; precision schema is closed', async () => {
+  const join = w.reviewTasks('资料', 'join_profile'), msg = w.reviewTasks('正文');
+  assert.notEqual(join.messages[0].content, msg.messages[0].content);
+  assert.ok(join.messages[0].content.includes('无法确定必须ok'));
+  assert.equal(w.parsePrecisionLearningResponse({ response: '{"is_ad":false,"candidates":[],"extra":1}' }).error, 'invalid_ai_response');
+});

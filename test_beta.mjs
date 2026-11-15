@@ -282,7 +282,7 @@ section('C. 权限分级（R4/R5/R9 + 副主人/授权群命令）');
 	});
 	assert('主人 /spam 全群封禁 2 群', countMethod(c4.tgCalls, 'banChatMember') === 2);
 	const fpCount = await c4.db.prepare('SELECT COUNT(*) AS c FROM ad_fingerprints').first();
-	assert('主人 /spam 学习指纹', Number(fpCount.c) >= 1);
+	assert('主人 /spam 不直接建指纹', Number(fpCount.c) === 0);
 	const sampleCount = await c4.db.prepare('SELECT COUNT(*) AS c FROM ad_samples').first();
 	assert('主人 /spam 保存语义样本', Number(sampleCount.c) >= 1);
 

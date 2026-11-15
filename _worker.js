@@ -343,7 +343,8 @@ const SCHEMA_STATEMENTS = [
 		sample_text TEXT, signature TEXT,
 		variants TEXT DEFAULT '[]', count INTEGER DEFAULT 1,
 		embedding TEXT, dimension INTEGER,
-		source TEXT, created_at INTEGER, updated_at INTEGER)`],
+		source TEXT, kind TEXT DEFAULT 'text',
+		created_at INTEGER, updated_at INTEGER)`],
 	['ad_fingerprints', `CREATE TABLE IF NOT EXISTS ad_fingerprints (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		type TEXT, value TEXT, norm_value TEXT,
@@ -405,6 +406,8 @@ async function adDetectionReady(env) {
 		if (!schemaInit) {
 			schemaInit = (async () => {
 				await env.DB.batch(SCHEMA_STATEMENTS.map(([, sql]) => env.DB.prepare(sql)));
+				// 兼容旧库：给 ad_samples 增加 kind 列；已存在时忽略错误。
+				try { await env.DB.prepare("ALTER TABLE ad_samples ADD COLUMN kind TEXT DEFAULT 'text'").run(); } catch (_) {}
 				schemaReady = true;
 				return true;
 			})();
@@ -454,6 +457,7 @@ async function addAdSample(env, rawText, options = {}) {
 	const existingByHash = await env.DB.prepare('SELECT id, count FROM ad_samples WHERE norm_hash = ?').bind(hash).first();
 	if (existingByHash) {
 		await env.DB.prepare('UPDATE ad_samples SET count = count + 1, updated_at = ? WHERE id = ?').bind(now, existingByHash.id).run();
+		await maybePromoteSampleToFingerprint(env, existingByHash.id);
 		return { ok: true, added: false, merged: true, sampleId: existingByHash.id, tier: 1 };
 	}
 
@@ -464,6 +468,7 @@ async function addAdSample(env, rawText, options = {}) {
 		const sameSig = await env.DB.prepare('SELECT id, sample_text, variants, count FROM ad_samples WHERE signature = ? ORDER BY updated_at DESC LIMIT 1').bind(sig).first();
 		if (sameSig) {
 			await mergeVariant(env, sameSig, normalized, now);
+			await maybePromoteSampleToFingerprint(env, sameSig.id);
 			return { ok: true, added: false, merged: true, sampleId: sameSig.id, tier: 2 };
 		}
 	}
@@ -488,16 +493,41 @@ async function addAdSample(env, rawText, options = {}) {
 		if (best.id && best.sim >= config.mergeSimilarity) {
 			const row = await env.DB.prepare('SELECT id, variants FROM ad_samples WHERE id = ?').bind(best.id).first();
 			await mergeVariant(env, row, normalized, now);
+			await maybePromoteSampleToFingerprint(env, best.id);
 			return { ok: true, added: false, merged: true, sampleId: best.id, tier: 3, sim: best.sim };
 		}
 	}
 
 	// 插入新语义簇。
+	const kind = String(options.kind || 'text');
 	await env.DB.prepare(
-		`INSERT INTO ad_samples (norm_hash, sample_text, signature, variants, count, embedding, dimension, source, created_at, updated_at)
-		 VALUES (?, ?, ?, '[]', 1, ?, ?, ?, ?, ?)`
-	).bind(hash, String(rawText).slice(0, 500), sig, embedding ? JSON.stringify(embedding) : null, embedding ? embedding.length : null, source, now, now).run();
+		`INSERT INTO ad_samples (norm_hash, sample_text, signature, variants, count, embedding, dimension, source, kind, created_at, updated_at)
+		 VALUES (?, ?, ?, '[]', 1, ?, ?, ?, ?, ?, ?)`
+	).bind(hash, String(rawText).slice(0, 500), sig, embedding ? JSON.stringify(embedding) : null, embedding ? embedding.length : null, source, kind, now, now).run();
 	return { ok: true, added: true, merged: false, tier: 0 };
+}
+
+function semanticAutoFpThreshold(env) {
+	const value = Number(env?.SEMANTIC_AUTO_FP_THRESHOLD);
+	return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 3;
+}
+async function maybePromoteSampleToFingerprint(env, sampleId) {
+	try {
+		const threshold = semanticAutoFpThreshold(env);
+		const row = await env.DB.prepare('SELECT id, sample_text, count, kind FROM ad_samples WHERE id = ?').bind(sampleId).first();
+		if (!row || Number(row.count) < threshold) return;
+		// 只有正文类样本才自动升级指纹；名字/简介/名片/引用不升级，避免身份污染。
+		if (String(row.kind || 'text') !== 'text') return;
+		const norm = normalizeFingerprintValue(row.sample_text);
+		if (norm.length < 4 || norm.length > 200) return;
+		await addFingerprintManual(env, String(row.sample_text), 'keyword', 'auto_semantic');
+	} catch (_) { /* 升级失败不影响样本保存或语义判定。 */ }
+}
+async function touchSemanticHit(env, sampleId) {
+	try {
+		await env.DB.prepare('UPDATE ad_samples SET count = count + 1, updated_at = ? WHERE id = ?').bind(nowSeconds(), sampleId).run();
+		await maybePromoteSampleToFingerprint(env, sampleId);
+	} catch (_) {}
 }
 
 async function mergeVariant(env, row, normalized, now) {
@@ -519,7 +549,10 @@ async function matchAdSemantic(env, text, config) {
 	if (normalized.length < MIN_SAMPLE_LEN) return { hit: false };
 	const hash = await sha256Hex(normalized);
 	const exact = await env.DB.prepare('SELECT id, count FROM ad_samples WHERE norm_hash = ?').bind(hash).first();
-	if (exact) return { hit: true, sampleId: exact.id, similarity: 1, exact: true };
+	if (exact) {
+		await touchSemanticHit(env, exact.id);
+		return { hit: true, sampleId: exact.id, similarity: 1, exact: true };
+	}
 
 	// 还没有任何带向量的样本时，embedding 无比较对象，跳过昂贵的 AI 调用。
 	const hasSample = await env.DB.prepare(
@@ -536,7 +569,10 @@ async function matchAdSemantic(env, text, config) {
 		let stored = null;
 		try { stored = JSON.parse(c.embedding); } catch (_) { continue; }
 		const sim = cosineSimilarity(vec, stored);
-		if (sim >= config.aiSimilarity) return { hit: true, sampleId: c.id, similarity: sim };
+		if (sim >= config.aiSimilarity) {
+			await touchSemanticHit(env, c.id);
+			return { hit: true, sampleId: c.id, similarity: sim };
+		}
 	}
 	return { hit: false };
 }
@@ -651,16 +687,10 @@ async function learnPrecisionSpam(env, message) {
 	try {
 		const reviewed = await judgeAdWithAI(env, own, 'precision_learn');
 		if (reviewed.error || reviewed.is_ad !== true) return { learned: 0 };
-		const quote = getQuotedText(message);
-		const identities = [message?.from?.first_name, message?.from?.last_name, message?.from?.username].filter(Boolean).map(normalizeAdText);
-		const phrases = [...new Set(reviewed.candidates)].filter(value => isPrecisionPhrase(value) && own.includes(value)
-			&& (!quote || !normalizeAdText(quote).includes(normalizeAdText(value)))
-			&& !identities.some(identity => identity && normalizeAdText(value).includes(identity)));
-		if (!phrases.length) return { learned: 0 };
-		const result = await learnFingerprints(env, phrases.map(value => ({ type: 'ad_phrase', value })), { source: 'spam_reviewed' });
-		// Samples contain only approved source excerpts, never whole mixed/quoted messages.
-		for (const phrase of phrases) await addAdSample(env, phrase, { source: 'spam_reviewed', computeEmbedding: true });
-		return result;
+		// /spam 的消息只进语义库参与语义匹配，不直接建指纹；达到阈值后由
+		// maybePromoteSampleToFingerprint 自动升级为 keyword 指纹。
+		await addAdSample(env, own.slice(0, 500), { source: 'spam_reviewed', computeEmbedding: true });
+		return { learned: 1 };
 	} catch (_) { return { learned: 0 }; }
 }
 
@@ -2255,6 +2285,7 @@ pre{padding:12px;overflow:auto}
 <tr><td><code>GET /api/fingerprints</code></td><td>广告指纹库（value、type、status、hit_count、fp_count、source、created_at、updated_at）</td><td>limit/offset</td></tr>
 <tr><td><code>GET /api/blacklist</code></td><td>黑名单（user_id、reason、created_at）</td><td>limit/offset</td></tr>
 <tr><td><code>GET /api/blacklist/check?user_id=</code></td><td>查询某 TG ID 是否被封禁</td><td>-</td></tr>
+<tr><td><code>GET /api/samples</code></td><td>AI 语义库（sample_text、kind、source、count）</td><td>limit/offset</td></tr>
 <tr><td><code>GET /health</code></td><td>健康检查，返回 <code>OK</code></td><td>-</td></tr>
 </tbody></table><p>分页默认 <code>limit=200</code>（最大 1000），<code>offset=0</code>。</p></div>
 <div class="card"><h2>示例</h2><p>获取指纹库前 50 条：</p><pre>curl "https://tg-unban-bot-beta.cf77-6b9.workers.dev/api/fingerprints?limit=50"</pre>
@@ -2282,6 +2313,13 @@ async function servePublicList(env, kind, url) {
 				'SELECT user_id, reason, created_at FROM blacklist ORDER BY created_at DESC LIMIT ? OFFSET ?'
 			).bind(limit, offset).all();
 			const total = await env.DB.prepare('SELECT COUNT(*) AS c FROM blacklist').first();
+			return new Response(JSON.stringify({ ok: true, kind, count: (rows.results || []).length, total: Number(total?.c || 0), items: rows.results || [] }), { headers: cors });
+		}
+		if (kind === 'samples') {
+			const rows = await env.DB.prepare(
+				'SELECT id, sample_text, kind, source, count, created_at FROM ad_samples ORDER BY created_at DESC LIMIT ? OFFSET ?'
+			).bind(limit, offset).all();
+			const total = await env.DB.prepare('SELECT COUNT(*) AS c FROM ad_samples').first();
 			return new Response(JSON.stringify({ ok: true, kind, count: (rows.results || []).length, total: Number(total?.c || 0), items: rows.results || [] }), { headers: cors });
 		}
 		return new Response(JSON.stringify({ ok: false, error: 'not_found' }), { status: 404, headers: cors });
@@ -2318,6 +2356,7 @@ export default {
 			if (url.pathname === '/health') return new Response('OK', { status: 200 });
 			if (url.pathname === '/api/fingerprints') return servePublicList(env, 'fingerprints', url);
 			if (url.pathname === '/api/blacklist') return servePublicList(env, 'blacklist', url);
+			if (url.pathname === '/api/samples') return servePublicList(env, 'samples', url);
 			if (url.pathname === '/api/blacklist/check') return serveBlacklistCheck(env, url);
 			if (url.pathname === '/' || url.pathname === '/panel') return servePanel();
 			if (url.pathname === '/docs') return serveApiDocs();
