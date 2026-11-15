@@ -540,6 +540,17 @@ async function matchFingerprints(env, candidates) {
 				&& bodies.some(body => body.includes(row.norm_value)) && !hits.some(hit => hit.id === row.id)) hits.push(row);
 		}
 	}
+	// 主人手工确认的 keyword 指纹对消息正文做归一化子串匹配（≥4 字符），
+	// 使「群---发--推----广」这类加分隔符变体也能命中「群发推广」。
+	const messageBodies = (candidates || []).filter(c => c.type === 'keyword').map(c => normalizeAdText(c.value));
+	if (messageBodies.length) {
+		const rows = await env.DB.prepare("SELECT * FROM ad_fingerprints WHERE type = 'keyword' AND status != 'retired' ORDER BY updated_at DESC LIMIT 500").all();
+		for (const row of rows.results || []) {
+			if (String(row.norm_value || '').length >= 4
+				&& messageBodies.some(body => body.includes(row.norm_value))
+				&& !hits.some(hit => hit.id === row.id)) hits.push(row);
+		}
+	}
 	return hits;
 }
 
