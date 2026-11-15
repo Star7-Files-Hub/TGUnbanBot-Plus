@@ -1181,10 +1181,22 @@ async function handleBan(env, message, arg, config, isOwner, ctx) {
 	return sendGroupReceipt(env, chat, `🎯 已加黑名单并全群封禁 <code>${targetId}</code>\n${renderBanAllReceipt(result)}`, ctx);
 }
 
+function parseIdList(arg) {
+	const ids = [];
+	for (const raw of String(arg || '').split(/[,，]/)) {
+		const s = raw.trim();
+		if (!/^\d{1,16}$/.test(s)) continue;
+		try { const n = String(BigInt(s)); if (!ids.includes(n)) ids.push(n); } catch (_) { /* 非法 ID 忽略 */ }
+	}
+	return ids;
+}
+
 async function handleSpam(env, message, arg, config, isOwner, ctx) {
 	const chat = message.chat;
+	const idList = parseIdList(arg);
+	if (idList.length) return handleSpamByIds(env, message, idList, arg, config, isOwner, ctx);
 	const replied = message.reply_to_message;
-	if (!replied) return sendGroupReceipt(env, chat, '用法：回复一条广告消息后发送 /spam', ctx);
+	if (!replied) return sendGroupReceipt(env, chat, '用法：回复一条广告消息后发送 /spam，或 /spam <用户ID>[,<用户ID>...]', ctx);
 	const targetId = String(replied.from?.id || '');
 	if (!targetId) return sendGroupReceipt(env, chat, '无法确定目标用户', ctx);
 	const contactName = getContactName(replied);
@@ -1222,6 +1234,40 @@ async function handleSpam(env, message, arg, config, isOwner, ctx) {
 	const lines = [`🎬 /spam 已加黑名单并全群封禁 <code>${targetId}</code>`];
 	lines.push(renderBanAllReceipt(result));
 	lines.push(`🧹 已清扫消息 ${sweep.deleted} 条${sweep.failed > 0 ? `，${sweep.failed} 条失败` : ''}`);
+	return sendGroupReceipt(env, chat, lines.join('\n'), ctx);
+}
+
+async function handleSpamByIds(env, message, ids, arg, config, isOwner, ctx) {
+	const chat = message.chat;
+	if (!isOwner) {
+		const admin = isAnonymousAdminMessage(message) || await isGroupAdmin(env, chat.id, message.from.id);
+		if (!admin) return sendGroupReceipt(env, chat, '只有群管理员或主人可以 /spam', ctx);
+		const lines = [];
+		for (const targetId of ids) {
+			const banRes = await banMember(env, chat.id, targetId).catch((e) => ({ ok: false, description: String(e?.message || e) }));
+			await recordBanScope(env, targetId, chat.id, 'group_admin_spam');
+			const sweep = await sweepUserMessages(env, chat.id, targetId);
+			// 按 ID 举报没有正文，保存空报告供确认流程闭合；确认时不会学习。
+			await env.DB.prepare("INSERT INTO ad_spam_reports (target_user_id, chat_id, reporter_id, message_json, status, created_at) VALUES (?, ?, ?, ?, 'open', ?)")
+				.bind(targetId, String(chat.id), getMessageActorId(message), JSON.stringify({ text: '', quote: null, from: { first_name: '', last_name: '', username: '' } }), nowSeconds()).run();
+			await notifySpamForApproval(env, config, chat, targetId, '(按 ID 举报，无正文)', getMessageActorId(message));
+			lines.push(`✅ 已在本群封禁 <code>${targetId}</code> 并清扫消息 ${sweep.deleted} 条${sweep.failed > 0 ? `（${sweep.failed} 条失败）` : ''}`);
+			if (!banRes?.ok) lines.push(`⚠️ 封禁失败：${banRes?.description || ''}`);
+		}
+		lines.push('已上报主人，待确认后全群封禁。');
+		return sendGroupReceipt(env, chat, lines.join('\n'), ctx);
+	}
+
+	const lines = [`🎬 /spam 已加黑名单并全群封禁 ${ids.length} 个用户`, ids.map(id => `<code>${id}</code>`).join('，')];
+	let swept = 0, failed = 0;
+	for (const targetId of ids) {
+		await addBlacklist(env, targetId, 'spam', arg, getMessageActorId(message));
+		await banAllGroups(env, targetId, config, 'spam');
+		const sweep = await sweepUserMessagesAllGroups(env, targetId, config, null, null);
+		swept += sweep.deleted; failed += sweep.failed;
+	}
+	lines.push(`🧹 已清扫消息 ${swept} 条${failed > 0 ? `，${failed} 条失败` : ''}`);
+	lines.push('按 ID 举报无正文，未学习指纹。');
 	return sendGroupReceipt(env, chat, lines.join('\n'), ctx);
 }
 
