@@ -516,11 +516,11 @@ async function maybePromoteSampleToFingerprint(env, sampleId) {
 		const threshold = semanticAutoFpThreshold(env);
 		const row = await env.DB.prepare('SELECT id, sample_text, count, kind FROM ad_samples WHERE id = ?').bind(sampleId).first();
 		if (!row || Number(row.count) < threshold) return;
-		// 只有正文类样本才自动升级指纹；名字/简介/名片/引用不升级，避免身份污染。
-		if (String(row.kind || 'text') !== 'text') return;
+		// 正文、引用频道、名片名字三类样本都可自动升级；其他类型不升级。
+		if (!['text', 'quote', 'card_name'].includes(String(row.kind || 'text'))) return;
 		const norm = normalizeFingerprintValue(row.sample_text);
 		if (norm.length < 4 || norm.length > 200) return;
-		await addFingerprintManual(env, String(row.sample_text), 'keyword', 'auto_semantic');
+		await addFingerprintManual(env, String(row.sample_text), 'keyword', 'auto', 'auto_semantic_' + String(row.kind || 'text'));
 	} catch (_) { /* 升级失败不影响样本保存或语义判定。 */ }
 }
 async function touchSemanticHit(env, sampleId) {
@@ -683,14 +683,28 @@ function parsePrecisionLearningResponse(response) {
 }
 async function learnPrecisionSpam(env, message) {
 	const own = getOwnLearningText(message);
-	if (!own || /^\s*\//.test(own)) return { learned: 0 };
+	const quote = getQuotedText(message);
+	const card = getContactName(message);
+	if (!own && !quote && !card) return { learned: 0 };
 	try {
-		const reviewed = await judgeAdWithAI(env, own, 'precision_learn');
+		const reviewed = await judgeAdWithAI(env, own || quote || card, 'precision_learn');
 		if (reviewed.error || reviewed.is_ad !== true) return { learned: 0 };
 		// /spam 的消息只进语义库参与语义匹配，不直接建指纹；达到阈值后由
 		// maybePromoteSampleToFingerprint 自动升级为 keyword 指纹。
-		await addAdSample(env, own.slice(0, 500), { source: 'spam_reviewed', computeEmbedding: true });
-		return { learned: 1 };
+		let learned = 0;
+		if (own && !/^\s*\//.test(own)) {
+			await addAdSample(env, own.slice(0, 500), { source: 'spam_reviewed', computeEmbedding: true, kind: 'text' });
+			learned++;
+		}
+		if (quote) {
+			await addAdSample(env, quote.slice(0, 500), { source: 'spam_reviewed', computeEmbedding: true, kind: 'quote' });
+			learned++;
+		}
+		if (card) {
+			await addAdSample(env, card.slice(0, 500), { source: 'spam_reviewed', computeEmbedding: true, kind: 'card_name' });
+			learned++;
+		}
+		return { learned };
 	} catch (_) { return { learned: 0 }; }
 }
 
@@ -1777,7 +1791,7 @@ async function notifyAdReport(env, config, chat, reporterId, targetId, targetNam
 // =============================================================================
 // 13c. 主人/副主人管理命令
 // =============================================================================
-async function addFingerprintManual(env, value, type, by) {
+async function addFingerprintManual(env, value, type, by, source = 'manual') {
 	const norm = normalizeFingerprintValue(value);
 	if (norm.length < FINGERPRINT_MIN_LEN) return { ok: false, reason: 'too_short' };
 	const existing = await env.DB.prepare('SELECT id FROM ad_fingerprints WHERE type = ? AND norm_value = ?').bind(type, norm).first();
@@ -1788,8 +1802,8 @@ async function addFingerprintManual(env, value, type, by) {
 	}
 	await env.DB.prepare(
 		`INSERT INTO ad_fingerprints (type, value, norm_value, weight, status, source, confirmed_by, created_at, updated_at)
-		 VALUES (?, ?, ?, 0.8, 'confirmed', 'manual', ?, ?, ?)`
-	).bind(type, String(value).slice(0, 200), norm, String(by || ''), nowSeconds(), nowSeconds()).run();
+		 VALUES (?, ?, ?, 0.8, 'confirmed', ?, ?, ?, ?)`
+	).bind(type, String(value).slice(0, 200), norm, String(source), String(by || ''), nowSeconds(), nowSeconds()).run();
 	return { ok: true, added: true };
 }
 

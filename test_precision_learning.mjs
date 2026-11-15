@@ -18,7 +18,7 @@ function harness(answer = { is_ad: true, candidates: [phrase] }) {
       async all() { return { results: db.prepare(sql).all(...args) }; },
       async run() { const r = db.prepare(sql).run(...args); return { meta: { changes: Number(r.changes), last_row_id: Number(r.lastInsertRowid) } }; }
     }; }, async batch(stmts) { return Promise.all(stmts.map(s => s.run())); } },
-    AI: { async run(model, options) { ai.push({model, options}); if (model.includes('bge-m3')) return {data:[[1,0,0]]}; if (answer instanceof Error) throw answer; return {response: JSON.stringify(answer)}; } },
+    AI: { async run(model, options) { ai.push({model, options}); if (model.includes('bge-m3')) { const seed = JSON.stringify(options?.text || options || ''); let h = 0; for (const ch of seed) h = (h * 31 + ch.charCodeAt(0)) >>> 0; return {data:[[(h % 997) / 997, ((h >> 3) % 991) / 991, ((h >> 5) % 983) / 983]]}; } if (answer instanceof Error) throw answer; return {response: JSON.stringify(answer)}; } },
     __tgMock: Object.fromEntries(['sendMessage','banChatMember','deleteMessage','restrictChatMember','getChatAdministrators','getChatMember'].map(method => [method, async body => { calls.push({method,body}); return {ok:true,result:method === 'getChatAdministrators' ? [] : true}; }]))
   };
   w.resetSchemaState(); w.invalidateOwners(); w.invalidateGroups(); w.invalidateUserWhitelist(); w.invalidateAdminCache();
@@ -57,12 +57,33 @@ for (const answer of [
   });
 }
 
-test('quoted text never enters the semantic sample', async () => {
+test('own text and quoted channel text are collected as separate kinds', async () => {
   const h = harness(); await w.adDetectionReady(h.env);
   await w.learnPrecisionSpam(h.env, target('普通正文', { quote: { text: phrase } }));
   const samples = await rows(h, 'ad_samples');
+  assert.equal(samples.length, 2);
+  const own = samples.find(s => s.kind === 'text');
+  const quote = samples.find(s => s.kind === 'quote');
+  assert.ok(own && own.sample_text === '普通正文');
+  assert.ok(quote && quote.sample_text === phrase);
+});
+
+test('contact card name is collected as card_name kind', async () => {
+  const h = harness(); await w.adDetectionReady(h.env);
+  await w.learnPrecisionSpam(h.env, target('', { contact: { first_name: '缺米的兄弟看过来哦' } }));
+  const samples = await rows(h, 'ad_samples');
   assert.equal(samples.length, 1);
-  assert.ok(!String(samples[0].sample_text).includes(phrase));
+  assert.equal(samples[0].kind, 'card_name');
+  assert.equal(samples[0].sample_text, '缺米的兄弟看过来哦');
+});
+
+test('quote and card_name samples auto-promote to keyword fingerprints at threshold', async () => {
+  const h = harness(); await w.adDetectionReady(h.env);
+  h.env.SEMANTIC_AUTO_FP_THRESHOLD = '2';
+  await w.learnPrecisionSpam(h.env, target('正文A', { quote: { text: phrase } }));
+  await w.learnPrecisionSpam(h.env, target('正文B', { quote: { text: phrase } }));
+  const fps = await rows(h, 'ad_fingerprints');
+  assert.ok(fps.some(f => f.value === phrase && f.status === 'confirmed' && f.type === 'keyword' && f.source === 'auto_semantic_quote'));
 });
 
 test('ad_phrase substring match requires own_body; identity/quote/keyword do not match', async () => {

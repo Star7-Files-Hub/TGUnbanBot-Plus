@@ -53,9 +53,9 @@
 
 ### 语义库与自动升级指纹
 
-- 语义样本现在带 `kind` 类型：`text`（正文）等；名字、简介、名片、引用不进入语义库。
-- `/spam` 的消息不再直接建指纹，AI 审核通过后只保存进语义库（`source=spam_reviewed`）。
-- 语义样本命中或被反复抓到，`count` 会增长；当 `count >= SEMANTIC_AUTO_FP_THRESHOLD`（默认 3，可设 1–1000）时，仅 `kind=text` 的样本自动升级为 confirmed keyword 指纹。
+- 语义样本现在带 `kind` 类型：`text`（本人正文）、`quote`（引用频道/消息广告）、`card_name`（联系人名片名字广告）。
+- `/spam` 的消息不再直接建指纹，AI 审核通过后只保存进语义库（`source=spam_reviewed`），并分别把本人正文、引用频道文本、名片名字按 `kind` 单独采集。
+- 语义样本命中或被反复抓到，`count` 会增长；当 `count >= SEMANTIC_AUTO_FP_THRESHOLD`（默认 3，可设 1–1000）时，`text`、`quote`、`card_name` 三类样本都会自动升级为 confirmed keyword 指纹（`source=auto_semantic_<kind>`）。
 - `GET /api/samples` 公开语义库（sample_text、kind、source、count），不含向量与签名。
 
 ### 观察群（样本采集）
