@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { webcrypto } from 'node:crypto';
 globalThis.crypto ||= webcrypto;
 const source = await fs.readFile(new URL('./_worker.js', import.meta.url), 'utf8');
-const extra = '\nexport {learnPrecisionSpam, isPrecisionPhrase, getOwnLearningText, reviewTasks, runReviewedAiTask, parsePrecisionLearningResponse};';
+const extra = '\nexport {learnPrecisionSpam, isPrecisionPhrase, getOwnLearningText, reviewTasks, runReviewedAiTask, parsePrecisionLearningResponse, extractSemanticFingerprints};';
 const w = await import('data:text/javascript;base64,' + Buffer.from(source + extra).toString('base64'));
 const phrase = '高价收购实名号四件套，长期招代理';
 function harness(answer = { is_ad: true, candidates: [phrase] }) {
@@ -83,7 +83,7 @@ test('quote and card_name samples auto-promote to keyword fingerprints at thresh
   await w.learnPrecisionSpam(h.env, target('正文A', { quote: { text: phrase } }));
   await w.learnPrecisionSpam(h.env, target('正文B', { quote: { text: phrase } }));
   const fps = await rows(h, 'ad_fingerprints');
-  assert.ok(fps.some(f => f.value === phrase && f.status === 'confirmed' && f.type === 'keyword' && f.source === 'auto_semantic_quote'));
+  assert.ok(fps.some(f => phrase.includes(f.value) && Array.from(f.value).length <= 18 && f.status === 'confirmed' && f.type === 'keyword' && f.source === 'auto_semantic_quote'));
 });
 
 test('ad_phrase substring match requires own_body; identity/quote/keyword do not match', async () => {
@@ -175,4 +175,14 @@ test('join_profile prompt is distinct conservative binary task; precision schema
   assert.notEqual(join.messages[0].content, msg.messages[0].content);
   assert.ok(join.messages[0].content.includes('无法确定必须ok'));
   assert.equal(w.parsePrecisionLearningResponse({ response: '{"is_ad":false,"candidates":[],"extra":1}' }).error, 'invalid_ai_response');
+});
+
+
+test('promotion extracts a short original trade phrase without handles or generic words', () => {
+  const text = '🥴替来七氟烷美卡等新品 接批发接面交 @example_contact';
+  const phrases = w.extractSemanticFingerprints(text);
+  assert.deepEqual(phrases, ['七氟烷美卡等新品 接批发接面交']);
+  assert.deepEqual(w.extractSemanticFingerprints('警惕七氟烷 接批发接面交 @example_contact'), []);
+  assert.deepEqual(w.extractSemanticFingerprints('接批发接面交 @example_contact'), []);
+  assert.deepEqual(w.extractSemanticFingerprints('七氟烷 @example_contact'), []);
 });

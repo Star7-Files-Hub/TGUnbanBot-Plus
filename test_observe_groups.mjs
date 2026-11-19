@@ -115,3 +115,30 @@ test('owner save/dismiss callbacks update report and samples', async () => {
   assert.equal(rows(h, 'ad_samples').length, 1);
   assert.equal(rows(h, 'ad_observe_reports')[0].status, 'dismissed');
 });
+
+
+test('confirmation acknowledges first, claims once, and falls back when editing fails', async () => {
+  const h = harness();
+  await worker.adDetectionReady(h.env);
+  await worker.notifyObserveCandidate(h.env, { primaryOwner: OWNER }, msg().chat, TARGET, '', adText, '广告', 7);
+  h.env.__tgMock.editMessageText = async body => { h.calls.push({ method: 'editMessageText', body }); return { ok: false }; };
+  const callback = { id: 'cb', data: 'o:save:1', from: { id: OWNER }, message: { chat: { id: OWNER, type: 'private' }, message_id: 10 } };
+  await Promise.all([worker.handleCallback(h.env, callback), worker.handleCallback(h.env, { ...callback, id: 'cb-duplicate' })]);
+  const ack = h.calls.findIndex(c => c.method === 'answerCallbackQuery' && c.body.text.includes('正在保存'));
+  const bans = h.calls.filter(c => c.method === 'banChatMember');
+  assert.equal(bans.length, 1);
+  assert.ok(ack >= 0 && ack < h.calls.indexOf(bans[0]));
+  assert.equal(rows(h, 'ad_samples')[0].count, 1);
+  assert.equal(h.calls.at(-1).method, 'sendMessage');
+  assert.match(h.calls.at(-1).body.text, /已保存语义样本/);
+});
+
+test('a report without source text confirms the ban but does not claim to save a sample', async () => {
+  const h = harness();
+  await worker.adDetectionReady(h.env);
+  await worker.notifyObserveCandidate(h.env, { primaryOwner: OWNER }, msg().chat, TARGET, '', '(通过 /spam 举报，无正文)', '观察群 /spam 举报', 7);
+  await worker.handleCallback(h.env, { id: 'cb', data: 'o:save:1', from: { id: OWNER }, message: { chat: { id: OWNER, type: 'private' }, message_id: 10 } });
+  assert.equal(rows(h, 'ad_samples').length, 0);
+  assert.equal(rows(h, 'blacklist').length, 1);
+  assert.match(h.calls.find(c => c.method === 'editMessageText').body.text, /未保存语义样本/);
+});

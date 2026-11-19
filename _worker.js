@@ -518,16 +518,49 @@ function semanticAutoFpThreshold(env) {
 	const value = Number(env?.SEMANTIC_AUTO_FP_THRESHOLD);
 	return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 3;
 }
+const SEMANTIC_FINGERPRINT_MAX = 18;
+const RISK_BUSINESS_PATTERN = /(?:实名号|实名账号|实名账户|四件套|卡料|跑分|洗钱|洗白|出黑|黑产|博彩|赌博|网赌|菠菜|棋牌|彩票|时时彩|usdt|泰达|u商|du商|假钞|假币|外围|楼凤|探花|裸聊|约炮|约啪|包夜|福利姬)/i;
+const AD_DISCUSSION = /不是|不要|别信|举报|警惕|警告|测试|举例|例如|讨论|反诈|防骗|曝光|诈骗案例/;
+
+// 从原文保留商品与交易动作的组合，避免把泛词变成独立的全群封禁规则。
+function extractSemanticFingerprints(text) {
+	const clean = String(text || '').slice(0, 500).trim();
+	if (AD_DISCUSSION.test(clean)) return [];
+	const phrases = new Set();
+	for (const part of clean.split(/@[\w]+|(?:https?:\/\/|www\.|t\.me\/)\S+|[\r\n，,。；;！!？?：:、]/iu)) {
+		const productTrade = part.match(/七氟烷[\p{Script=Han}]{0,6}[ \t]{0,2}(?:接批发接面交|接批发|接面交|出售|现货|供货|批发|面交)/u);
+		if (productTrade && Array.from(productTrade[0]).length <= SEMANTIC_FINGERPRINT_MAX) phrases.add(productTrade[0]);
+		for (const run of part.matchAll(/[\p{L}\p{N}]+/gu)) {
+			const normalized = normalizeAdText(run[0]);
+			if (!RISK_BUSINESS_PATTERN.test(normalized) || !matchAnyPattern(SOLICIT_PATTERNS, normalized)) continue;
+			const chars = Array.from(run[0]);
+			let candidate = '';
+			for (let length = 8; length <= Math.min(chars.length, SEMANTIC_FINGERPRINT_MAX) && !candidate; length++) {
+				for (let offset = 0; offset + length <= chars.length; offset++) {
+					const phrase = chars.slice(offset, offset + length).join('');
+					if (isPrecisionPhrase(phrase)) { candidate = phrase; break; }
+				}
+			}
+			if (candidate) phrases.add(candidate);
+			if (phrases.size >= 3) break;
+		}
+		if (phrases.size >= 3) break;
+	}
+	return [...phrases].slice(0, 3);
+}
 async function maybePromoteSampleToFingerprint(env, sampleId) {
 	try {
 		const threshold = semanticAutoFpThreshold(env);
 		const row = await env.DB.prepare('SELECT id, sample_text, count, kind FROM ad_samples WHERE id = ?').bind(sampleId).first();
 		if (!row || Number(row.count) < threshold) return;
-		// 正文、引用频道、名片名字三类样本都可自动升级；其他类型不升级。
-		if (!['text', 'quote', 'card_name'].includes(String(row.kind || 'text'))) return;
-		const norm = normalizeFingerprintValue(row.sample_text);
-		if (norm.length < 4 || norm.length > 200) return;
-		await addFingerprintManual(env, String(row.sample_text), 'keyword', 'auto', 'auto_semantic_' + String(row.kind || 'text'));
+		const kind = String(row.kind || 'text');
+		if (!['text', 'quote', 'card_name'].includes(kind)) return;
+		for (const phrase of extractSemanticFingerprints(row.sample_text)) {
+			const now = nowSeconds();
+			await env.DB.prepare(`INSERT INTO ad_fingerprints (type, value, norm_value, weight, status, source, confirmed_by, created_at, updated_at)
+				VALUES (?, ?, ?, 0.8, 'confirmed', ?, 'auto', ?, ?) ON CONFLICT(type, norm_value) DO NOTHING`)
+				.bind(kind === 'card_name' ? 'card_name' : 'keyword', phrase, normalizeFingerprintValue(phrase), 'auto_semantic_' + kind, now, now).run();
+		}
 	} catch (_) { /* 升级失败不影响样本保存或语义判定。 */ }
 }
 async function touchSemanticHit(env, sampleId) {
@@ -671,7 +704,7 @@ function isPrecisionPhrase(value) {
 	const solicitation = spans(SOLICIT_PATTERNS);
 	// Exclude overlapping generic income words (日入/月入/赚钱). A second
 	// occurrence of the same generic word is not independent risk evidence.
-	const riskBusiness = spans([/(?:实名号|实名账号|实名账户|四件套|卡料|跑分|洗钱|洗白|出黑|黑产|博彩|赌博|网赌|菠菜|棋牌|彩票|时时彩|usdt|泰达|u商|du商|假钞|假币|外围|楼凤|探花|裸聊|约炮|约啪|包夜|福利姬)/i]);
+	const riskBusiness = spans([RISK_BUSINESS_PATTERN]);
 	// Both evidence categories must occupy disjoint spans of the source phrase.
 	// Thus one match such as 日入1234 (or 收U) cannot satisfy two categories.
 	return solicitation.some(a => riskBusiness.some(b => a.end <= b.start || b.end <= a.start));
@@ -2061,6 +2094,56 @@ function renderHelp(isOwner) {
 // =============================================================================
 // 14. 回调：指纹确认/忽略、/spam 上报确认
 // =============================================================================
+async function handleObserveReview(env, callback, config, action, reportId) {
+	const chat = callback.message?.chat;
+	const answer = (text, showAlert = false) => tgCall(env, 'answerCallbackQuery', {
+		callback_query_id: callback.id, text, show_alert: showAlert
+	}).catch(() => null);
+	if (!isPrimaryOwner(callback.from?.id, config) || chat?.type !== 'private' || String(chat.id) !== String(config.primaryOwner)) {
+		return answer('仅第一主人可在本人私聊操作', true);
+	}
+	let claimed = false;
+	let acknowledged = false;
+	async function showResult(text) {
+		const edited = await editMessageText(env, chat.id, callback.message.message_id, text, {
+			reply_markup: { inline_keyboard: [] }
+		}).catch(() => null);
+		if (edited?.ok !== true) await sendMessage(env, chat.id, text).catch(() => null);
+	}
+	try {
+		const report = await env.DB.prepare('SELECT user_id, body_text, status FROM ad_observe_reports WHERE id = ?').bind(reportId).first();
+		if (!report) return answer('记录不存在', true);
+		if (report.status !== 'open') return answer(report.status === 'processing' ? '正在处理，请稍候' : '该记录已处理', true);
+		const nextStatus = action === 'save' ? 'processing' : 'dismissed';
+		const update = await env.DB.prepare("UPDATE ad_observe_reports SET status = ? WHERE id = ? AND status = 'open'").bind(nextStatus, reportId).run();
+		if (update?.success === false) throw new Error('observe_report_write_failed');
+		if (update?.meta?.changes !== 1) return answer('该记录正在处理或已处理', true);
+		if (action === 'dismiss') {
+			await answer('已放行');
+			return showResult('🚫 已放行。');
+		}
+		claimed = true;
+		await answer('已收到，正在保存样本并执行封禁');
+		acknowledged = true;
+		await addBlacklist(env, report.user_id, 'spam', 'observe_confirm', callback.from.id);
+		const banResult = await banAllGroups(env, report.user_id, config, 'observe_confirm');
+		const sample = report.body_text === '(通过 /spam 举报，无正文)'
+			? { ok: false, reason: 'no_semantic_text' }
+			: await addAdSample(env, report.body_text, { source: 'observe_confirm', computeEmbedding: true }).catch(() => null);
+		const saved = await env.DB.prepare("UPDATE ad_observe_reports SET status = 'saved' WHERE id = ? AND status = 'processing'").bind(reportId).run();
+		if (saved?.success === false || saved?.meta?.changes !== 1) throw new Error('observe_report_completion_failed');
+		claimed = false;
+		const sampleLine = sample?.ok === true ? (sample.merged ? '🧠 已合并语义样本' : '🧠 已保存语义样本')
+			: ['no_semantic_text', 'too_short'].includes(sample?.reason) ? '⚠️ 正文不足，未保存语义样本' : '⚠️ 语义样本保存失败';
+		await showResult(`✅ 用户 <code>${escapeHtml(report.user_id)}</code> 已列入黑名单。\n${renderBanAllReceipt(banResult)}\n${sampleLine}`);
+	} catch (_) {
+		console.warn('[observe] confirmation failed');
+		if (claimed) await env.DB.prepare("UPDATE ad_observe_reports SET status = 'open' WHERE id = ? AND status = 'processing'").bind(reportId).run().catch(() => null);
+		if (acknowledged) await sendMessage(env, chat.id, '⚠️ 观察群确认未完成，请检查后重试。').catch(() => null);
+		else await answer('处理失败，请稍后重试', true);
+	}
+}
+
 async function handleCallback(env, callback) {
 	const data = String(callback?.data || '');
 	const from = callback?.from;
@@ -2088,37 +2171,7 @@ async function handleCallback(env, callback) {
 	}
 
 	let m = data.match(/^o:(save|dismiss):(\d+)$/);
-	if (m) {
-		if (!isPrimaryOwner(from?.id, config)) {
-			await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id, text: '仅第一主人可操作', show_alert: true });
-			return;
-		}
-		const action = m[1];
-		const reportId = Number(m[2]);
-		const report = await env.DB.prepare('SELECT * FROM ad_observe_reports WHERE id = ?').bind(reportId).first();
-		if (!report) {
-			await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id, text: '记录不存在', show_alert: true });
-			return;
-		}
-		if (String(report.status) !== 'open') {
-			await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id, text: '该记录已处理', show_alert: true });
-			return;
-		}
-		if (action === 'save') {
-			await addAdSample(env, report.body_text, { source: 'observe_confirm', computeEmbedding: true });
-			await addBlacklist(env, report.user_id, 'spam', 'observe_confirm', from.id);
-			const banResult = await banAllGroups(env, report.user_id, config, 'observe_confirm');
-			await env.DB.prepare("UPDATE ad_observe_reports SET status = 'saved' WHERE id = ?").bind(reportId).run();
-			await editMessageText(env, callback.message?.chat?.id, callback.message?.message_id,
-				`✅ 已抓取样本并列入黑名单全群封禁 <code>${escapeHtml(String(report.user_id || ''))}</code>。\n${renderBanAllReceipt(banResult)}\n\n📄 <code>${escapeHtml(String(report.body_text || '').slice(0, 300))}</code>`).catch(() => {});
-		} else {
-			await env.DB.prepare("UPDATE ad_observe_reports SET status = 'dismissed' WHERE id = ?").bind(reportId).run();
-			await editMessageText(env, callback.message?.chat?.id, callback.message?.message_id,
-				`🚫 已放行，不做任何操作。`).catch(() => {});
-		}
-		await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback.id });
-		return;
-	}
+	if (m) return handleObserveReview(env, callback, config, m[1], Number(m[2]));
 
 	m = data.match(/^c:fp:(\d+):(confirm|ignore):(\d+)$/);
 	if (m) {
