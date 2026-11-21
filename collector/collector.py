@@ -409,17 +409,28 @@ class Scanner:
 
 
 async def login_phone(client: Any) -> None:
-    if not sys.stdin.isatty():
-        raise ConfigError("--login-phone requires an interactive terminal")
-    phone = getpass.getpass("Telegram phone (hidden): ")
-    sent = await client.send_code_request(phone)
-    code = getpass.getpass("Telegram login code (hidden): ")
+    # Non-interactive mode reads secrets from env; never from CLI arguments.
+    phone = os.environ.get("TG_LOGIN_PHONE", "").strip()
+    code = os.environ.get("TG_LOGIN_CODE", "").strip()
+    password = os.environ.get("TG_2FA_PASSWORD", "").strip()
+    if not phone or not code:
+        if not sys.stdin.isatty():
+            raise ConfigError("--login-phone requires TG_LOGIN_PHONE and TG_LOGIN_CODE, or an interactive terminal")
+        phone = getpass.getpass("Telegram phone (hidden): ")
+        sent = await client.send_code_request(phone)
+        code = getpass.getpass("Telegram login code (hidden): ")
+    else:
+        sent = await client.send_code_request(phone)
     try:
         await client.sign_in(phone=phone, code=code, phone_code_hash=sent.phone_code_hash)
     except Exception as exc:
         if type(exc).__name__ != "SessionPasswordNeededError":
             raise
-        await client.sign_in(password=getpass.getpass("Telegram 2FA password (hidden): "))
+        if not password:
+            if not sys.stdin.isatty():
+                raise ConfigError("TG_2FA_PASSWORD is required for two-factor accounts in non-interactive mode") from None
+            password = getpass.getpass("Telegram 2FA password (hidden): ")
+        await client.sign_in(password=password)
     LOG.info("AUTHORIZED")
 
 
@@ -430,7 +441,7 @@ async def login_qr(client: Any, directory: Path) -> None:
         from qrcode.image.pure import PyPNGImage
     except ImportError:
         raise ConfigError("--login-qr requires the pinned qrcode package") from None
-    for attempt in range(5):
+    for attempt in range(2):
         qr = await client.qr_login()
         filename = directory / "login-qr.png"
         private_file(filename)
@@ -440,7 +451,8 @@ async def login_qr(client: Any, directory: Path) -> None:
         # Only a protected local pathname is shown, never the embedded tg:// token.
         print("Protected login QR file: " + str(filename), flush=True)
         try:
-            await qr.wait(timeout=60)
+            # 2FA（若开启）在手机端输入；给足时间让用户在手机上完成确认。
+            await qr.wait(timeout=240)
             LOG.info("AUTHORIZED")
             return
         except asyncio.TimeoutError:
