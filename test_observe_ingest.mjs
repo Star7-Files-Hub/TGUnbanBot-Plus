@@ -38,13 +38,17 @@ test('known fingerprints skip review; novel normal text calls classifier but nev
  assert.equal((await send(h)).body.status,'pass');assert.equal(h.calls.length,0);
  assert.equal((await send(h,{...sample,message_id:13,text:'今天聊聊日常天气'})).body.status,'pass');assert.equal(h.ai.length,1);assert.equal(h.calls.length,0);
 });
-test('novel AI advertising produces one review; AI errors stay retryable',async()=>{
- const h=await harness();h.env.AI.run=async()=>({response:'ad'});
- const r=await send(h,{...sample,text:'欢迎参加产品推广活动联系本人'});assert.equal(r.body.status,'observe');assert.equal(h.calls.length,1);
- h.env.AI.run=async()=>({response:'unknown'});
- assert.equal((await send(h,{...sample,message_id:13,text:'今天日常天气如何'})).status,503);
- h.env.AI.run=async()=>({response:'ok'});
- assert.equal((await send(h,{...sample,message_id:13,text:'今天日常天气如何'})).status,200);
+test('novel AI advertising produces one review; AI errors fall back to owner review', async () => {
+  const h = await harness(); h.env.AI.run = async () => ({ response: 'ad' });
+  const r = await send(h, { ...sample, text: '欢迎参加产品推广活动联系本人' });
+  assert.equal(r.body.status, 'observe'); assert.equal(h.calls.length, 1);
+  h.env.AI.run = async () => ({ response: 'unknown' });
+  const fallback = await send(h, { ...sample, message_id: 13, text: '今天日常天气如何' });
+  assert.equal(fallback.status, 200);
+  assert.equal(fallback.body.status, 'observe');
+  assert.ok(String(h.calls.at(-1).body.text).includes('AI 暂不可用'));
+  h.env.AI.run = async () => ({ response: 'ok' });
+  assert.equal((await send(h, { ...sample, message_id: 14, text: '今天日常天气如何' })).status, 200);
 });
 test('owner notification error is retryable and reuses report instead of enrolling duplicate',async()=>{
  const h=await harness();h.env.__tgMock.sendMessage=async()=>({ok:false});

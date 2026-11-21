@@ -913,8 +913,15 @@ async function detectAdOnMessage(env, message, options = {}) {
 
 	if (options.observe && options.collector && bodyText.length >= MIN_SAMPLE_LEN) {
 		// 指纹/已有语义未覆盖的新话术送文本分类器，只有明确 ad 才通知主人。
-		const verdict = await judgeAdWithAI(env, buildAdReportText(message));
-		if (verdict.error) return { action: 'pass', error: 'classification_unavailable' };
+		let verdict;
+		try { verdict = await judgeAdWithAI(env, buildAdReportText(message)); }
+		catch (_) { verdict = { error: 'classification_unavailable' }; }
+		if (verdict.error) {
+			// 观察群本意是让主人复核未命中的消息；AI 暂不可用也不阻塞，照常推主人。
+			console.warn('[ingest] ai unavailable, falling back to owner review', String(verdict.error));
+			await notifyObserveCandidate(env, config, chat, userId, name, bodyText, '采集客户端（AI 暂不可用）', message.message_id, { strictDelivery: true });
+			return { action: 'observe', reason: 'collector_fallback' };
+		}
 		if (verdict.isAd) {
 			await notifyObserveCandidate(env, config, chat, userId, name, bodyText, '采集客户端 AI 判定', message.message_id, { strictDelivery: true });
 			return { action: 'observe', reason: 'collector_ai' };
@@ -2612,11 +2619,12 @@ async function serveObserveIngest(request, env) {
 			const completed = await env.DB.prepare("UPDATE observe_ingest_receipts SET status='done',updated_at=? WHERE chat_id=? AND message_id=?").bind(nowSeconds(),input.chat_id,input.message_id).run();
 			if (completed?.success === false) throw new Error('receipt_completion_failed');
 			return json(200, { ok: true, status: action });
-		} catch (_) {
+		} catch (error) {
+			console.warn('[ingest] processing failed', String(error?.message || error?.name || 'unknown'));
 			await env.DB.prepare("UPDATE observe_ingest_receipts SET status='retry',updated_at=? WHERE chat_id=? AND message_id=?").bind(nowSeconds(),input.chat_id,input.message_id).run();
 			return json(503, { ok: false, error: 'processing_failed' });
 		}
-	} catch (_) { return json(503, { ok: false, error: 'storage_unavailable' }); }
+	} catch (error) { console.warn('[ingest] storage failed', String(error?.message || error?.name || 'unknown')); return json(503, { ok: false, error: 'storage_unavailable' }); }
 }
 
 export default {

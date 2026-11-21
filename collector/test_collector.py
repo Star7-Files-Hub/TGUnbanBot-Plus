@@ -360,6 +360,8 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(opener.timeout, 20)
         self.assertEqual(opener.req.method, "POST")
         self.assertEqual(opener.req.get_header("Authorization"), "Bearer test-token")
+        self.assertEqual(opener.req.get_header("User-agent"), "tg-sample-collector/1.0")
+        self.assertEqual(opener.req.get_header("Content-type"), "application/json")
 
     def test_http_error_does_not_leak_body_or_url(self):
         class Opener:

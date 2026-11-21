@@ -243,6 +243,7 @@ def send_http(url: str, token: str, payload: str) -> tuple[bool, str, str | None
     opener = request.build_opener(NoRedirect())
     req = request.Request(url, data=payload.encode("utf-8"), method="POST", headers={
         "Content-Type": "application/json", "Authorization": "Bearer " + token,
+        "User-Agent": "tg-sample-collector/1.0",
     })
     try:
         with opener.open(req, timeout=20) as response:
