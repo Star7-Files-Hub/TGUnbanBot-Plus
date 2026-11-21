@@ -832,7 +832,8 @@ async function detectAdOnMessage(env, message, options = {}) {
 
 	if (await isUserWhitelisted(env, userId)) return null;
 	if (isOwner(userId, config)) return null;
-	if (await isGroupAdmin(env, chat.id, userId)) return null;
+	// Bot 未加入采集目标群，不能用 Bot API 核查其中管理员身份。
+	if (!options.collector && await isGroupAdmin(env, chat.id, userId)) return null;
 
 	const text = String(message.text ?? message.caption ?? '').trim();
 	// 所有命令文本都不进检测（避免 /start 等未知命令触发指纹/AI 查询拖慢响应）。
@@ -892,7 +893,7 @@ async function detectAdOnMessage(env, message, options = {}) {
 	if (structureKill || semantic.hit) {
 		const reason = structureKill ? '结构规则命中' : 'AI 语义命中';
 		if (options.observe) {
-			await notifyObserveCandidate(env, config, chat, userId, name, bodyText, reason, message.message_id);
+			await notifyObserveCandidate(env, config, chat, userId, name, bodyText, reason, message.message_id, { strictDelivery: options.collector === true });
 			return { action: 'observe', reason: structureKill ? 'structure' : 'ai', semantic };
 		}
 		const autoNotify = await getBotSetting(env, 'auto_ban_notify', '0') === '1';
@@ -910,6 +911,15 @@ async function detectAdOnMessage(env, message, options = {}) {
 		return { action: 'mute', reason: structureKill ? 'structure' : 'ai', semantic };
 	}
 
+	if (options.observe && options.collector && bodyText.length >= MIN_SAMPLE_LEN) {
+		// 指纹/已有语义未覆盖的新话术送文本分类器，只有明确 ad 才通知主人。
+		const verdict = await judgeAdWithAI(env, buildAdReportText(message));
+		if (verdict.error) return { action: 'pass', error: 'classification_unavailable' };
+		if (verdict.isAd) {
+			await notifyObserveCandidate(env, config, chat, userId, name, bodyText, '采集客户端 AI 判定', message.message_id, { strictDelivery: true });
+			return { action: 'observe', reason: 'collector_ai' };
+		}
+	}
 	return { action: 'pass' };
 }
 
@@ -987,7 +997,7 @@ async function notifyAutoBan(env, config, chat, userId, userName, reason, previe
 		sweepLine, { reply_markup: kb });
 }
 
-async function handleObserveCommand(env, message) {
+async function handleObserveCommand(env, message, delivery = {}) {
 	// 观察群内只监听 /spam 命令：不回复、不处置，只把举报通知主人。
 	const text = String(message?.text || message?.caption || '').trim();
 	const m = text.match(COMMAND_RE);
@@ -1005,20 +1015,28 @@ async function handleObserveCommand(env, message) {
 	await adDetectionReady(env);
 	const config = await loadConfig(env);
 	for (const t of targets) {
-		await notifyObserveCandidate(env, config, message.chat, t.id, '', t.text || '(通过 /spam 举报，无正文)', '观察群 /spam 举报', replied?.message_id);
+		await notifyObserveCandidate(env, config, message.chat, t.id, '', t.text || '(通过 /spam 举报，无正文)', '观察群 /spam 举报', replied?.message_id || message.message_id, delivery);
 	}
 }
 
-async function notifyObserveCandidate(env, config, chat, userId, userName, text, reason, messageId) {
-	const inserted = await env.DB.prepare(
+async function notifyObserveCandidate(env, config, chat, userId, userName, text, reason, messageId, delivery = {}) {
+	const existing = delivery.strictDelivery ? await env.DB.prepare('SELECT id, status FROM ad_observe_reports WHERE chat_id=? AND message_id=? AND user_id=? ORDER BY id DESC LIMIT 1').bind(String(chat?.id || ''), messageId, String(userId)).first() : null;
+	if (existing && existing.status !== 'open') return;
+	const inserted = existing ? null : await env.DB.prepare(
 		"INSERT INTO ad_observe_reports (user_id, chat_id, message_id, body_text, name, reason, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'open', ?)"
 	).bind(String(userId), String(chat?.id || ''), Number(messageId) || null, String(text || '').slice(0, 2000), String(userName || ''), String(reason || ''), nowSeconds()).run();
-	const reportId = Number(inserted?.meta?.last_row_id || 0);
+	const reportId = Number(existing?.id || inserted?.meta?.last_row_id || 0);
+	if (delivery.strictDelivery && (!Number.isSafeInteger(reportId) || reportId <= 0)) throw new Error('report_write_failed');
 	const kb = { inline_keyboard: [[
 		{ text: '✅ 是广告，抓样本', callback_data: `o:save:${reportId}` },
 		{ text: '🚫 误判，放行', callback_data: `o:dismiss:${reportId}` }
 	]] };
-	await notifyOwners(env, config,
+	const notify = delivery.strictDelivery ? async (env, config, text, extra) => {
+		if (!/^\d+$/.test(String(config.primaryOwner || ''))) throw new Error('no_owner');
+		const sent = await sendMessage(env, config.primaryOwner, text, extra);
+		if (sent?.ok !== true) throw new Error('notification_failed');
+	} : notifyOwners;
+	await notify(env, config,
 		`👀 观察群疑似广告（未命中指纹）：\n\n` +
 		`👤 用户 <code>${escapeHtml(userId)}</code>${userName ? `（${escapeHtml(userName)}）` : ''}\n` +
 		`📍 群「${escapeHtml(chat?.title || chat?.id || '')}」\n` +
@@ -2524,9 +2542,87 @@ function serveApiDocs() {
 	return new Response(DOCS_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
+// 用户客户端专用入口，与 Telegram webhook 的 secret 分离；只允许配置的观察群。
+async function serveObserveIngest(request, env) {
+	const json = (status, body) => Response.json(body, { status, headers: { 'Cache-Control': 'no-store' } });
+	if (request.method !== 'POST') return json(405, { ok: false, error: 'method_not_allowed' });
+	const token = String(env.OBSERVE_INGEST_TOKEN || '');
+	if (!token) return json(503, { ok: false, error: 'ingest_disabled' });
+	const auth = request.headers.get('Authorization') || '';
+	const expected = 'Bearer ' + token;
+	let diff = auth.length ^ expected.length;
+	for (let i = 0; i < expected.length; i++) diff |= (auth.charCodeAt(i) || 0) ^ expected.charCodeAt(i);
+	if (diff !== 0) return json(401, { ok: false, error: 'unauthorized' });
+	let input;
+	try {
+		const reader = request.body?.getReader();
+		if (!reader) return json(400, { ok: false, error: 'invalid_payload' });
+		const chunks = []; let size = 0;
+		for (;;) {
+			const { value, done } = await reader.read(); if (done) break;
+			size += value.length;
+			if (size > 32768) { await reader.cancel(); return json(413, { ok: false, error: 'payload_too_large' }); }
+			chunks.push(value);
+		}
+		const bytes = new Uint8Array(size); let offset = 0;
+		for (const c of chunks) { bytes.set(c, offset); offset += c.length; }
+		input = JSON.parse(new TextDecoder().decode(bytes));
+	} catch (_) { return json(400, { ok: false, error: 'invalid_payload' }); }
+	if (!input || typeof input !== 'object' || Array.isArray(input)
+		|| typeof input.chat_id !== 'string' || !/^-[1-9]\d{1,15}$/.test(input.chat_id)
+		|| typeof input.user_id !== 'string' || !/^[1-9]\d{0,15}$/.test(input.user_id)
+		|| !Number.isSafeInteger(input.message_id) || input.message_id <= 0
+		|| ['text', 'quote', 'contact_name'].some(k => input[k] != null && (typeof input[k] !== 'string' || input[k].length > 4000))
+		|| ['chat_title','first_name','last_name','username'].some(k => input[k] != null && (typeof input[k] !== 'string' || input[k].length > 256))) {
+		return json(400, { ok: false, error: 'invalid_payload' });
+	}
+	const message = {
+		chat: { id: input.chat_id, type: 'supergroup', title: input.chat_title || '' },
+		from: { id: input.user_id, first_name: input.first_name || '', last_name: input.last_name || '', username: input.username || '', is_bot: input.is_bot === true },
+		message_id: input.message_id, text: input.text || '',
+		quote: input.quote ? { text: input.quote } : undefined,
+		contact: input.contact_name ? { first_name: input.contact_name } : undefined
+	};
+	try {
+		await adDetectionReady(env);
+		if (!await isObserveGroup(env, input.chat_id)) return json(403, { ok: false, error: 'group_not_allowed' });
+		await env.DB.prepare(`CREATE TABLE IF NOT EXISTS observe_ingest_receipts (
+			chat_id TEXT, message_id INTEGER, status TEXT NOT NULL, updated_at INTEGER NOT NULL,
+			PRIMARY KEY(chat_id, message_id))`).run();
+		const now = nowSeconds();
+		const claimed = await env.DB.prepare(`INSERT INTO observe_ingest_receipts (chat_id, message_id, status, updated_at)
+			VALUES (?, ?, 'processing', ?) ON CONFLICT(chat_id, message_id) DO UPDATE SET status='processing',updated_at=excluded.updated_at
+			WHERE observe_ingest_receipts.status='retry' OR (observe_ingest_receipts.status='processing' AND observe_ingest_receipts.updated_at < ?)`)
+			.bind(input.chat_id, input.message_id, now, now - 120).run();
+		if (claimed?.success === false) throw new Error('receipt_write');
+		if (claimed?.meta?.changes !== 1) {
+			const row = await env.DB.prepare('SELECT status FROM observe_ingest_receipts WHERE chat_id=? AND message_id=?').bind(input.chat_id,input.message_id).first();
+			return row?.status === 'done' ? json(200, { ok: true, status: 'duplicate' }) : json(409, { ok: false, error: 'busy' });
+		}
+		try {
+			const match = String(message.text).trim().match(COMMAND_RE);
+			let action;
+			if (match) {
+				await handleObserveCommand(env, message, { strictDelivery: true }); action = 'command';
+			} else {
+				const result = await detectAdOnMessage(env, message, { observe: true, collector: true });
+				if (result?.error) throw new Error('classification_unavailable');
+				action = result?.action || 'pass';
+			}
+			const completed = await env.DB.prepare("UPDATE observe_ingest_receipts SET status='done',updated_at=? WHERE chat_id=? AND message_id=?").bind(nowSeconds(),input.chat_id,input.message_id).run();
+			if (completed?.success === false) throw new Error('receipt_completion_failed');
+			return json(200, { ok: true, status: action });
+		} catch (_) {
+			await env.DB.prepare("UPDATE observe_ingest_receipts SET status='retry',updated_at=? WHERE chat_id=? AND message_id=?").bind(nowSeconds(),input.chat_id,input.message_id).run();
+			return json(503, { ok: false, error: 'processing_failed' });
+		}
+	} catch (_) { return json(503, { ok: false, error: 'storage_unavailable' }); }
+}
+
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
+		if (url.pathname === '/api/observe/ingest') return serveObserveIngest(request, env);
 		if (request.method === 'GET') {
 			if (url.pathname === '/health') return new Response('OK', { status: 200 });
 			if (url.pathname === '/api/fingerprints') return servePublicList(env, 'fingerprints', url);

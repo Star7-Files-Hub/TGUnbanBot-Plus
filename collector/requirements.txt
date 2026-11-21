@@ -1,0 +1,5 @@
+# Parent agent must verify these pins before installing; no network install was performed here.
+Telethon==1.42.0
+# PNG QR generation uses pure Python (no Pillow needed).
+qrcode[pypng]==8.0
+pypng==0.20220715.0

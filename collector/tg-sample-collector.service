@@ -1,0 +1,44 @@
+[Unit]
+Description=Read-only Telegram sample collector (single allowed group)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tg-sample-collector
+Group=tg-sample-collector
+WorkingDirectory=/opt/tg-sample-collector
+EnvironmentFile=/etc/tg-sample-collector.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/tg-sample-collector/venv/bin/python /opt/tg-sample-collector/collector.py
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2 3 4
+TimeoutStopSec=35
+UMask=0077
+StateDirectory=tg-sample-collector
+StateDirectoryMode=0700
+MemoryHigh=128M
+MemoryMax=192M
+CPUQuota=25%
+Nice=10
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/tg-sample-collector
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
