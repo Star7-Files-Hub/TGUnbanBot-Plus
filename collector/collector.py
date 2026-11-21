@@ -448,11 +448,17 @@ async def login_qr(client: Any, directory: Path) -> None:
         fd = os.open(filename, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "wb") as stream:
             qrcode.make(qr.url, image_factory=PyPNGImage).save(stream)
-        # Only a protected local pathname is shown, never the embedded tg:// token.
+        # 终端直接可扫的文本二维码：黑块为暗模块，空格为亮模块。
+        if sys.stdout.isatty():
+            matrix = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_L)
+            matrix.add_data(qr.url); matrix.make()
+            for row in matrix.get_matrix():
+                print("".join("\u2588\u2588" if cell else "  " for cell in row), flush=True)
+        # 只输出受保护文件路径，不回显 tg:// 令牌。
         print("Protected login QR file: " + str(filename), flush=True)
         try:
-            # 2FA（若开启）在手机端输入；给足时间让用户在手机上完成确认。
-            await qr.wait(timeout=240)
+            # 令牌本身只有十几秒有效期；wait() 默认等至令牌过期，未扫到会抛超时后重建。
+            await qr.wait()
             LOG.info("AUTHORIZED")
             return
         except asyncio.TimeoutError:
@@ -460,9 +466,12 @@ async def login_qr(client: Any, directory: Path) -> None:
         except Exception as exc:
             if type(exc).__name__ != "SessionPasswordNeededError":
                 raise
-            if not sys.stdin.isatty():
-                raise ConfigError("Telegram 2FA requires an interactive terminal") from None
-            await client.sign_in(password=getpass.getpass("Telegram 2FA password (hidden): "))
+            password = os.environ.get("TG_2FA_PASSWORD", "").strip()
+            if not password:
+                if not sys.stdin.isatty():
+                    raise ConfigError("TG_2FA_PASSWORD is required for two-factor accounts in non-interactive mode") from None
+                password = getpass.getpass("Telegram 2FA password (hidden): ")
+            await client.sign_in(password=password)
             LOG.info("AUTHORIZED")
             return
     raise UnauthorizedError("QR authorization timed out; rerun --login-qr explicitly")
