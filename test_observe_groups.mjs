@@ -95,6 +95,37 @@ test('observe mode skips messages already covered by fingerprints', async () => 
   assert.equal(h.calls.filter(c => c.method === 'restrictChatMember').length, 0);
 });
 
+for (const text of [adText, '午后聊聊天气与日常']) {
+  test('observe semantic hit skips notification, including a simultaneous structure hit: ' + text, async () => {
+    const h = harness();
+    await worker.adDetectionReady(h.env);
+    h.sqlite.prepare('INSERT INTO ad_observe_groups VALUES (?, ?, ?, ?)').run(GROUP, '广告群', OWNER, 1);
+    // Synthetic vectors are identical; labels must never be classified after a semantic hit.
+    h.sqlite.prepare("INSERT INTO ad_samples (norm_hash, sample_text, signature, variants, count, embedding, dimension, source, kind, created_at, updated_at) VALUES (?, ?, ?, '[]', 1, ?, ?, 'manual', 'text', 1, 1)")
+      .run('nonmatching-hash', adText, '', JSON.stringify([1, 0, 0]), 3);
+    worker.invalidateObserveGroups();
+    const result = await worker.detectAdOnMessage(h.env, { ...msg(), text }, { observe: true });
+    assert.equal(result.action, 'pass');
+    assert.equal(result.reason, 'semantic_hit');
+    assert.equal(result.semantic.hit, true);
+    assert.equal(rows(h, 'ad_observe_reports').length, 0);
+    assert.equal(rows(h, 'ad_samples')[0].count, 2, 'existing hit counts must be preserved');
+    assert.equal(rows(h, 'blacklist').length, 0);
+    assert.equal(h.calls.filter(c => ['sendMessage', 'restrictChatMember', 'banChatMember', 'deleteMessage'].includes(c.method)).length, 0);
+  });
+}
+
+test('authorized moderation groups still act on semantic hits', async () => {
+  const h = harness();
+  await worker.adDetectionReady(h.env);
+  h.sqlite.prepare("INSERT INTO ad_samples (norm_hash, sample_text, count, embedding, source, kind) VALUES (?, ?, 1, ?, 'manual', 'text')")
+    .run('nonmatching-hash', adText, JSON.stringify([1, 0, 0]));
+  const result = await worker.detectAdOnMessage(h.env, { ...msg(), chat: { id: '-1001', type: 'supergroup' } });
+  assert.equal(result.action, 'mute');
+  assert.equal(result.semantic.hit, true);
+  assert.equal(h.calls.filter(c => c.method === 'restrictChatMember').length, 1);
+});
+
 test('owner save/dismiss callbacks update report and samples', async () => {
   const h = harness();
   await worker.adDetectionReady(h.env);

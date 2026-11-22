@@ -889,6 +889,9 @@ async function detectAdOnMessage(env, message, options = {}) {
 	const structureKill = solicit && biz && !(exemptHits.length > 0 && tradeHits.length === 0);
 
 	const semantic = await matchAdSemantic(env, bodyText, config);
+	// 观察群已有语义覆盖：保留命中计数/指纹升级，但不创建复核记录或发通知。
+	// 即使同时命中结构规则，也优先静默跳过；普通授权群的处置不受影响。
+	if (options.observe && semantic.hit) return { action: 'pass', reason: 'semantic_hit', semantic };
 
 	if (structureKill || semantic.hit) {
 		const reason = structureKill ? '结构规则命中' : 'AI 语义命中';

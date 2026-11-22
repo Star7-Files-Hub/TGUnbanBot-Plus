@@ -38,6 +38,38 @@ test('known fingerprints skip review; novel normal text calls classifier but nev
  assert.equal((await send(h)).body.status,'pass');assert.equal(h.calls.length,0);
  assert.equal((await send(h,{...sample,message_id:13,text:'今天聊聊日常天气'})).body.status,'pass');assert.equal(h.ai.length,1);assert.equal(h.calls.length,0);
 });
+for (const exact of [true, false]) {
+  for (const text of [sample.text, '午后聊聊天气与日常']) {
+    test(`collector semantic hit is accepted without a review: exact=${exact}, text=${text}`, async () => {
+      const h = await harness();
+      const normalized = w.normalizeAdText(text);
+      const hash = exact ? (await import('node:crypto')).createHash('sha256').update(normalized).digest('hex') : 'nonmatching-hash';
+      h.db.prepare("INSERT INTO ad_samples (norm_hash, sample_text, count, embedding, source, kind, created_at, updated_at) VALUES (?, ?, 1, ?, 'manual', 'text', 1, 1)")
+        .run(hash, text, exact ? null : JSON.stringify([1, 0, 0]));
+      const r = await send(h, { ...sample, text });
+      assert.equal(r.status, 200);
+      assert.equal(r.body.status, 'pass');
+      assert.equal(h.calls.length, 0, 'no notification, target member lookup, or moderation');
+      assert.equal(h.db.prepare('SELECT COUNT(*) n FROM ad_observe_reports').get().n, 0);
+      assert.equal(h.db.prepare('SELECT COUNT(*) n FROM blacklist').get().n, 0);
+      assert.equal(h.db.prepare('SELECT count FROM ad_samples').get().count, 2);
+      assert.equal(h.db.prepare('SELECT status FROM observe_ingest_receipts').get().status, 'done');
+      assert.deepEqual(h.ai, exact ? [] : ['@cf/baai/bge-m3'], 'do not call ad/ok classifier for known semantics');
+      assert.equal((await send(h, { ...sample, text })).body.status, 'duplicate');
+      assert.equal(h.db.prepare('SELECT count FROM ad_samples').get().count, 2, 'transport retry must not recount');
+    });
+  }
+}
+
+test('explicit ID-form /spam reports still notify the owner', async () => {
+  const h = await harness();
+  const r = await send(h, { ...sample, text: '/spam 555555' });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.status, 'command');
+  assert.equal(h.calls.filter(c => c.name === 'sendMessage').length, 1);
+  assert.equal(h.db.prepare('SELECT COUNT(*) n FROM ad_observe_reports').get().n, 1);
+});
+
 test('novel AI advertising produces one review; AI errors fall back to owner review', async () => {
   const h = await harness(); h.env.AI.run = async () => ({ response: 'ad' });
   const r = await send(h, { ...sample, text: '欢迎参加产品推广活动联系本人' });
