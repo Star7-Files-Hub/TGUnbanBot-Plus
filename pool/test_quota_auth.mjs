@@ -7,7 +7,7 @@ import {
   utcDay, usageRatio, availability, eligibleAccounts, parseD1Usage, mergeUsage,
 } from './quota.mjs';
 import {
-  authenticatedBearer, clearCookie, handleLogin, htmlPage, sameOrigin, sessionCookie, validSession,
+  authenticatedBearer, clearCookie, handleLogin, loginPage, htmlPage, sameOrigin, sessionCookie, validSession,
 } from './auth.mjs';
 import { ADMIN_HTML, LOGIN_HTML, ADMIN_HEADERS, CSP_NONCE_PLACEHOLDER } from './admin-page.mjs';
 
@@ -177,6 +177,68 @@ test('oversized login form is rejected and never echoes submitted data', async (
   const res = await handleLogin(loginRequest({ body: FIELD + '=' + 'x'.repeat(5000) }), AUTH_ENV, async () => true);
   assert.equal(res.status, 413); assert.equal(res.headers.get('Set-Cookie'), null);
   assert.equal((await res.json()).error, 'payload_too_large');
+});
+async function loginForm(now = NOW, origin = ORIGIN) {
+  const response = await loginPage(new Request(origin + '/login'), AUTH_ENV, LOGIN_HTML, ADMIN_HEADERS, now);
+  const html = await response.text();
+  const csrf = html.match(/name="csrf" value="([^"]+)"/)?.[1];
+  assert.ok(csrf); assert.doesNotMatch(csrf, /__LOGIN_CSRF__/);
+  return { response, csrf, cookie: response.headers.get('Set-Cookie').split(';')[0] };
+}
+function fallbackLogin(form, { origin, referer, fetchSite, csrf = form.csrf, cookie = form.cookie, password = AUTH_ENV.ADMIN_PASSWORD } = {}) {
+  const headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  if (cookie) headers.Cookie = cookie;
+  if (origin !== undefined) headers.Origin = origin;
+  if (referer !== undefined) headers.Referer = referer;
+  if (fetchSite !== undefined) headers['Sec-Fetch-Site'] = fetchSite;
+  return new Request(ORIGIN + '/login', { method: 'POST', headers, body: new URLSearchParams({ [FIELD]: password, csrf }) });
+}
+test('login page emits a short-lived signed form token without session or credential leakage', async () => {
+  const form = await loginForm(); const next = await loginForm();
+  assert.match(form.cookie, /^__Host-observe-login=/); assert.notEqual(form.csrf, next.csrf);
+  const cookie = form.response.headers.get('Set-Cookie');
+  assert.match(cookie, /Secure/); assert.match(cookie, /HttpOnly/); assert.match(cookie, /SameSite=Strict/); assert.match(cookie, /Max-Age=600/);
+  assert.equal(form.response.headers.get('Referrer-Policy'), 'same-origin');
+  assert.equal(form.response.headers.get('Cache-Control'), 'no-store');
+  assert.equal(await validSession(cookieRequest(cookie), AUTH_ENV, NOW), false, 'form token grants no authenticated session');
+  assert.doesNotMatch(form.csrf, /unit-test-only-admin-secret|unit-test-only-cookie-signing-secret/);
+  const unavailable = await loginPage(new Request(ORIGIN + '/login'), {}, LOGIN_HTML, ADMIN_HEADERS, NOW); assert.equal(unavailable.status, 503);
+});
+for (const origin of [undefined, 'null']) test('native signed form login works when Origin is missing or opaque: ' + String(origin), async () => {
+  const form = await loginForm();
+  const result = await handleLogin(fallbackLogin(form, { origin }), AUTH_ENV, async () => true, NOW);
+  assert.equal(result.status, 303); assert.equal(result.headers.get('Location'), '/');
+  const cookies = result.headers.getSetCookie(); assert.equal(cookies.length, 2);
+  assert.equal(await validSession(cookieRequest(cookies[0]), AUTH_ENV, NOW), true);
+  assert.match(cookies[1], /__Host-observe-login=;.*Max-Age=0/);
+});
+test('missing Origin still requires matching signed form cookie, expiry and host', async () => {
+  const form = await loginForm();
+  for (const change of [{ cookie: '' }, { csrf: 'unit-test-only-forged' }, { cookie: '__Host-observe-login=unit-test-only-forged', csrf: 'unit-test-only-forged' }]) {
+    const response = await handleLogin(fallbackLogin(form, change), AUTH_ENV, async () => true, NOW);
+    assert.equal(response.status, 403); assert.equal(response.headers.get('Set-Cookie'), null);
+  }
+  const expired = await handleLogin(fallbackLogin(form), AUTH_ENV, async () => true, NOW + 600_000); assert.equal(expired.status, 403);
+  const other = await loginForm(NOW, 'https://other.unit.workers.dev');
+  const wrongHost = await handleLogin(fallbackLogin(other), AUTH_ENV, async () => true, NOW); assert.equal(wrongHost.status, 403);
+  const wrongKey = await handleLogin(fallbackLogin(form), { ...AUTH_ENV, SESSION_SECRET: 'unit-test-only-wrong-key' }, async () => true, NOW); assert.equal(wrongKey.status, 403);
+});
+test('foreign origins, referers and Fetch Metadata are never rescued by a signed form', async () => {
+  const form = await loginForm(); let attempts = 0;
+  for (const change of [{ origin: 'https://other.unit.workers.dev' }, { referer: 'https://other.unit.workers.dev/login' }, { referer: 'not a URL' }, { fetchSite: 'cross-site' }]) {
+    const response = await handleLogin(fallbackLogin(form, change), AUTH_ENV, async () => { attempts++; return true; }, NOW);
+    assert.equal(response.status, 403); assert.equal(response.headers.get('Set-Cookie'), null);
+  }
+  assert.equal(attempts, 0);
+  const wrongPassword = await handleLogin(fallbackLogin(form, { password: 'unit-test-only-wrong' }), AUTH_ENV, async () => true, NOW);
+  assert.equal(wrongPassword.status, 401);
+});
+test('authenticated mutation Origin fallback requires same-origin Referer and never mere absence', () => {
+  assert.equal(sameOrigin(new Request(ORIGIN + '/api/admin/control/pause', { method: 'POST', headers: { Referer: ORIGIN + '/' } })), true);
+  assert.equal(sameOrigin(new Request(ORIGIN, { headers: { Origin: 'null', Referer: ORIGIN + '/login' } })), true);
+  assert.equal(sameOrigin(new Request(ORIGIN, { headers: { Origin: 'https://other.unit.workers.dev', Referer: ORIGIN + '/' } })), false);
+  assert.equal(sameOrigin(new Request(ORIGIN, { headers: { Referer: ORIGIN + '/', 'Sec-Fetch-Site': 'cross-site' } })), false);
+  assert.equal(sameOrigin(new Request(ORIGIN, { headers: { 'Sec-Fetch-Site': 'same-origin' } })), false);
 });
 test('each page receives one matching CSP/style/script nonce and never renders test credentials', async () => {
   const first = htmlPage(ADMIN_HTML, ADMIN_HEADERS);

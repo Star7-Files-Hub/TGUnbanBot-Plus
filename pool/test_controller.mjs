@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, webcrypto } from 'node:crypto';
-import worker, { ObservePool, MAX_QUEUE, REFRESH_MS, DICTIONARY_MAX_AGE, accountConfig } from './controller-worker.js';
+import worker, { ObservePool, MAX_QUEUE, REFRESH_MS, DICTIONARY_MAX_AGE, accountConfig, describeRule } from './controller-worker.js';
 import { sessionCookie } from './auth.mjs';
 import { normalized } from './protocol.mjs';
 import { MAX_USAGE_AGE, utcDay } from './quota.mjs';
@@ -505,6 +505,81 @@ test('content send claims survive unknown Telegram responses without repeated al
   const h = await harness(t); h.hooks.classify = c => candidate(c); h.hooks.telegram = c => { if (c.path.endsWith('/sendMessage')) throw new Error('unit-uncertain'); };
   await ingest(h, message({ message_id: 160 })); await ingest(h, message({ message_id: 161, user_id: '666666' }));
   assert.equal(h.notifications().length, 1); assert.equal(h.db.prepare("SELECT COUNT(*) n FROM events WHERE status='notification_uncertain'").get().n, 1);
+});
+test('rule descriptions separate AI text advertising from semantic/fingerprint matches', () => {
+  const label = describeRule({ kind: 'candidate', reason: 'ai_ad', sample_id: 10, fingerprint_id: 2, similarity: 1, matched_field: 'text' });
+  assert.match(label, /AI 文本判定广告/); assert.match(label, /指纹\/语义未命中，经 AI 文本判定/);
+  assert.doesNotMatch(label, /ai_ad|AI 语义命中|指纹命中 #|样本 #/);
+  assert.equal(describeRule({ kind: 'candidate', reason: 'structure', matched_field: 'quote' }), '结构规则命中，待人工复核（引用）');
+  assert.equal(describeRule({ kind: 'candidate', reason: 'ai_unavailable' }), 'AI 不可用，待人工复核');
+  assert.equal(describeRule({ kind: 'semantic', sample_id: 10, similarity: 0.823, matched_field: 'card_name' }), 'AI 语义命中（样本 #10），相似度 82.3%（名片名字）');
+  assert.equal(describeRule({ kind: 'fingerprint', fingerprint_id: 7, matched_field: 'name' }), '指纹命中 #7（姓名）');
+  assert.equal(describeRule({ kind: 'candidate', reason: '主动 /spam 举报' }), '主动 /spam 举报，待人工复核');
+  assert.equal(describeRule({ kind: 'candidate', reason: 'legacy_review' }), '历史观察复核，原分类规则未记录');
+  assert.equal(describeRule({ kind: 'normal', reason: 'blacklisted' }), '黑名单用户，静默跳过');
+});
+test('unknown rules and invalid hit metadata do not echo raw data or invent matches', () => {
+  for (const value of [null, {}, { kind: '<script>', reason: '<b>private-unknown</b>' }, { kind: 'candidate', reason: 'semantic', sample_id: 10 }]) {
+    const label = describeRule(value); assert.match(label, /分类规则未记录/); assert.doesNotMatch(label, /<|private|AI 语义命中|指纹命中/);
+  }
+  for (const similarity of [-1, 1.01, Infinity, '0.9']) assert.doesNotMatch(describeRule({ kind: 'semantic', sample_id: -2, similarity, matched_field: '<b>bad</b>' }), /相似度|#|<|bad/);
+});
+for (const [reason, label] of [['ai_ad', 'AI 文本判定广告'], ['structure', '结构规则命中'], ['ai_unavailable', 'AI 不可用']]) {
+  test('candidate notice displays a Chinese rule without changing verdict: ' + reason, async t => {
+    const h = await harness(t); h.hooks.classify = c => candidate(c, { reason, sample_id: 99, fingerprint_id: 77, similarity: 1 });
+    const res = await (await ingest(h)).json(); assert.equal(res.status, 'candidate'); assert.equal(h.notifications().length, 1);
+    const text = h.notifications()[0].body.text;
+    assert.match(text, new RegExp('🎯 ' + label)); assert.doesNotMatch(text, /ai_ad|ai_unavailable|AI 语义命中|指纹命中 #|样本 #99/);
+    const stored = JSON.parse(h.pool.event(res.event_id).result);
+    assert.deepEqual(stored, { classification: { kind: 'candidate', reason, matched_field: 'text' } });
+    assert.equal(h.db.prepare('SELECT COUNT(*) n FROM hits').get().n, 0);
+  });
+}
+test('pending notice preserves classification through restart and alarm recovery', async t => {
+  const h = await harness(t); h.hooks.classify = c => candidate(c, { reason: 'ai_ad', private_provider_payload: 'must-not-persist' });
+  h.hooks.source = c => c.path === '/api/pool/user-status' ? json({ ok: false }, 503) : null;
+  const res = await (await ingest(h)).json(); const row = h.pool.event(res.event_id);
+  assert.equal(row.status, 'notify_pending'); assert.equal(row.reason, 'blacklist_check_pending');
+  assert.deepEqual(JSON.parse(row.result), { classification: { kind: 'candidate', reason: 'ai_ad', matched_field: 'text' } });
+  assert.equal(h.notifications().length, 0);
+  h.db.prepare('UPDATE events SET updated_at=? WHERE id=?').run(Date.now() - REFRESH_MS - 1, res.event_id);
+  h.hooks.source = null;
+  const restoredState = fakeState(h.db), restored = new ObservePool(restoredState.ctx, h.env); await restoredState.initialized();
+  await restored.alarm();
+  assert.equal(h.notifications().length, 1); assert.match(h.notifications()[0].body.text, /🎯 AI 文本判定广告/);
+  assert.doesNotMatch(h.notifications()[0].body.text, /ai_ad|黑名单核查已恢复|must-not-persist|AI 语义命中/);
+  assert.equal(restored.event(res.event_id).status, 'review');
+});
+test('legacy pending notice without recorded classification states unknown after recovery', async t => {
+  const h = await harness(t), now = Date.now(), body = message({ message_id: 210 });
+  h.db.prepare("INSERT INTO events(id,event_key,message,status,evidence,kind,reason,created_at,updated_at) VALUES (?,?,?,'notify_pending',?,'text','blacklist_check_pending',?,?)")
+    .run('a'.repeat(24), 'legacy-pending-key', JSON.stringify(body), body.text, now, now - REFRESH_MS - 1);
+  await h.pool.alarm(); assert.equal(h.notifications().length, 1);
+  assert.match(h.notifications()[0].body.text, /分类规则未记录，待人工复核/);
+  assert.doesNotMatch(h.notifications()[0].body.text, /AI 文本判定广告|AI 语义命中|指纹命中 #|黑名单核查已恢复/);
+});
+for (const kind of ['semantic', 'fingerprint', 'normal']) {
+  test('direct notify call cannot push known or normal verdicts: ' + kind, async t => {
+    const h = await harness(t), now = Date.now(), id = 'b'.repeat(24);
+    h.db.prepare("INSERT INTO events(id,event_key,message,status,evidence,kind,reason,created_at,updated_at) VALUES (?,?,?,'notifying',?,'text','unit',?,?)")
+      .run(id, 'direct-known-key', JSON.stringify(message()), message().text, now, now);
+    await h.pool.notify(id, message(), { kind, reason: 'ai_ad', sample_id: 10, fingerprint_id: 1, similarity: 1 });
+    assert.equal(h.notifications().length, 0); assert.equal(h.calls.filter(c => c.origin === BETA).length, 0);
+    assert.equal(h.db.prepare('SELECT COUNT(*) n FROM hits').get().n, 0); assert.equal(h.pool.event(id).result, null);
+  });
+}
+test('unknown provider reason is never echoed in an owner notice', async t => {
+  const h = await harness(t); h.hooks.classify = c => candidate(c, { reason: '<b>SECRET-provider-reason</b>', matched_field: '<script>' });
+  await ingest(h); assert.equal(h.notifications().length, 1);
+  assert.match(h.notifications()[0].body.text, /分类规则未记录，待人工复核/);
+  assert.doesNotMatch(h.notifications()[0].body.text, /SECRET-provider-reason|&lt;script&gt;|&lt;b&gt;/);
+});
+test('notification retries never replace a completed approval result with classification metadata', async t => {
+  const h = await harness(t); h.hooks.classify = c => candidate(c, { reason: 'ai_ad' });
+  const id = (await (await ingest(h)).json()).event_id; await callback(h, id);
+  const before = h.pool.event(id).result; const sent = h.notifications().length;
+  await h.pool.notify(id, message(), { kind: 'candidate', reason: 'structure' });
+  assert.equal(h.pool.event(id).result, before); assert.equal(h.notifications().length, sent); assert.equal(h.pool.event(id).status, 'approved');
 });
 test('account configuration refuses unsafe targets and missing authentication', () => {
   for (const url of ['http://node.unit.workers.dev/', 'https://outside.invalid/', 'https://user:unit@node.unit.workers.dev/', NODES[0] + '/admin']) {

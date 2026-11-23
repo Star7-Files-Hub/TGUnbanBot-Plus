@@ -9,7 +9,7 @@ export const ADMIN_HEADERS = Object.freeze({
   'Pragma': 'no-cache',
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
-  'Referrer-Policy': 'no-referrer',
+  'Referrer-Policy': 'same-origin',
   'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
   'Content-Security-Policy': "default-src 'none'; script-src 'nonce-__ADMIN_CSP_NONCE__'; style-src 'nonce-__ADMIN_CSP_NONCE__'; connect-src 'self'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
 });
@@ -366,4 +366,4 @@ const PASSWORD_FIELD = 'pass' + 'word';
 export const LOGIN_HTML = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark"><title>登录 · 观察池后台</title><style nonce="${CSP_NONCE_PLACEHOLDER}">${CSS}</style></head>
 <body><main class="login-shell"><section class="panel login-card"><p class="eyebrow">OBSERVATION POOL / ACCESS</p><h1 class="title">登录管理后台</h1><p class="subtitle">使用后台密码登录。Cloudflare API 密钥不应在这里输入；账号凭证仅在服务端配置。</p>
-<form method="post" action="/login" enctype="application/x-www-form-urlencoded"><label for="login-${PASSWORD_FIELD}">后台密码</label><input id="login-${PASSWORD_FIELD}" name="${PASSWORD_FIELD}" type="${PASSWORD_FIELD}" autocomplete="current-${PASSWORD_FIELD}" required autofocus><button class="btn primary" type="submit">登录</button></form><p class="muted">密码提交到当前站点，由服务端验证并建立受保护会话。请确认浏览器地址为你的后台域名。</p></section></main></body></html>`;
+<form method="post" action="/login" enctype="application/x-www-form-urlencoded"><input type="hidden" name="csrf" value="__LOGIN_CSRF__"><label for="login-${PASSWORD_FIELD}">后台密码</label><input id="login-${PASSWORD_FIELD}" name="${PASSWORD_FIELD}" type="${PASSWORD_FIELD}" autocomplete="current-${PASSWORD_FIELD}" required autofocus><button class="btn primary" type="submit">登录</button></form><p class="muted">密码提交到当前站点，由服务端验证并建立受保护会话。请确认浏览器地址为你的后台域名。</p></section></main></body></html>`;

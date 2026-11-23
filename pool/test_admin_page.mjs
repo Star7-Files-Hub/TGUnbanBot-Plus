@@ -110,7 +110,11 @@ test('login is a native same-origin form with a real password field and no scrip
   assert.ok(LOGIN_HTML.includes('name="' + PASSWORD_FIELD + '"'));
   assert.ok(LOGIN_HTML.includes('type="' + PASSWORD_FIELD + '"'));
   assert.ok(LOGIN_HTML.includes('autocomplete="current-' + PASSWORD_FIELD + '"'));
-  assert.doesNotMatch(LOGIN_HTML, /<script|value="|\/api\/|localStorage/);
+  assert.match(LOGIN_HTML, /<input type="hidden" name="csrf" value="__LOGIN_CSRF__">/);
+  const passwordInput = LOGIN_HTML.match(new RegExp('<input[^>]*name="' + PASSWORD_FIELD + '"[^>]*>'))?.[0];
+  assert.ok(passwordInput); assert.doesNotMatch(passwordInput, /value=/);
+  assert.doesNotMatch(LOGIN_HTML, /<script|\/api\/|localStorage/);
+  assert.equal(ADMIN_HEADERS['Referrer-Policy'], 'same-origin');
 });
 test('initial state fetch uses same-origin cookies, shows individual read/write percentages and counts', async () => {
   const h = harness(); await h.settle();

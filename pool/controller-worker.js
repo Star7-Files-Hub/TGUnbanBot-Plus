@@ -1,10 +1,10 @@
 // Cloudflare-only observation control plane. No D1 binding or Telegram webhook here.
 import { ADMIN_HTML, LOGIN_HTML, ADMIN_HEADERS } from './admin-page.mjs';
-import { authenticatedBearer, validSession, handleLogin, htmlPage, sameOrigin, clearCookie } from './auth.mjs';
+import { authenticatedBearer, validSession, handleLogin, loginPage, htmlPage, sameOrigin, clearCookie } from './auth.mjs';
 import { ProtocolError, readJson, json, validateMessageInput, validateDictionaryInput, validVector, MAX_DICTIONARY_BYTES } from './protocol.mjs';
 import { READ_LIMIT, WRITE_LIMIT, MAX_THRESHOLD, MAX_USAGE_AGE, utcDay, parseD1Usage, mergeUsage, eligibleAccounts, availability, usageRatio } from './quota.mjs';
 
-export const RUNTIME_REVISION = 'pool-quiet-known-v3';
+export const RUNTIME_REVISION = 'pool-login-labels-v4';
 export const REFRESH_MS = 60_000;
 export const SYNC_MS = 600_000;
 export const DICTIONARY_MAX_AGE = 86_400_000;
@@ -19,6 +19,45 @@ const object = x => x && typeof x === 'object' && !Array.isArray(x);
 const escape = x => String(x ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 const positiveId = x => Number.isSafeInteger(x) && x > 0;
 const finiteNonNegative = x => typeof x === 'number' && Number.isFinite(x) && x >= 0;
+const NOTICE_KINDS = ['candidate', 'fingerprint', 'semantic', 'normal'];
+const RULE_FIELDS = Object.freeze({ text: '正文', quote: '引用', card_name: '名片名字', name: '姓名', username: '用户名', bio: '简介' });
+function ruleMetadata(result) {
+  const kind = NOTICE_KINDS.includes(result?.kind) ? result.kind : 'candidate';
+  const reason = ['ai_ad', 'structure', 'ai_unavailable', 'legacy_review', 'manual_spam', 'blacklisted'].includes(result?.reason)
+    ? result.reason : result?.reason === '主动 /spam 举报' ? 'manual_spam' : 'unknown';
+  const value = { kind, reason };
+  if (Object.hasOwn(RULE_FIELDS, result?.matched_field)) value.matched_field = result.matched_field;
+  // A candidate carrying hit-like fields is still a candidate, never a semantic
+  // or fingerprint match. Persist only small validated classification metadata.
+  if (kind === 'fingerprint' && positiveId(result?.fingerprint_id)) value.fingerprint_id = result.fingerprint_id;
+  if (kind === 'semantic') {
+    if (positiveId(result?.sample_id)) value.sample_id = result.sample_id;
+    if (finiteNonNegative(result?.similarity) && result.similarity <= 1) value.similarity = result.similarity;
+  }
+  return value;
+}
+function savedRule(row) {
+  try {
+    const value = JSON.parse(row?.result || 'null')?.classification;
+    return object(value) && NOTICE_KINDS.includes(value.kind) ? ruleMetadata(value) : null;
+  } catch { return null; }
+}
+export function describeRule(result) {
+  const rule = ruleMetadata(result);
+  const field = RULE_FIELDS[rule.matched_field];
+  const scope = field ? '（' + field + '）' : '';
+  if (rule.kind === 'fingerprint') return '指纹命中' + (rule.fingerprint_id ? ' #' + rule.fingerprint_id : '') + scope;
+  if (rule.kind === 'semantic') return 'AI 语义命中' + (rule.sample_id ? '（样本 #' + rule.sample_id + '）' : '')
+    + (rule.similarity !== undefined ? '，相似度 ' + (rule.similarity * 100).toFixed(1) + '%' : '') + scope;
+  if (rule.kind === 'normal' || rule.reason === 'blacklisted') return rule.reason === 'blacklisted' ? '黑名单用户，静默跳过' : '无需复核，静默跳过';
+  if (rule.reason === 'ai_ad') return 'AI 文本判定广告：指纹/语义未命中，经 AI 文本判定（非语义或指纹命中）' + scope;
+  if (rule.reason === 'structure') return '结构规则命中，待人工复核' + scope;
+  if (rule.reason === 'ai_unavailable') return 'AI 不可用，待人工复核' + scope;
+  if (rule.reason === 'manual_spam') return '主动 /spam 举报，待人工复核' + scope;
+  if (rule.reason === 'legacy_review') return '历史观察复核，原分类规则未记录' + scope;
+  // Never echo free-form provider reasons or invent a missing historic verdict.
+  return '分类规则未记录，待人工复核' + scope;
+}
 export async function digest(value) {
   return [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))].map(x => x.toString(16).padStart(2, '0')).join('');
 }
@@ -282,6 +321,13 @@ export class ObservePool {
     return digest(JSON.stringify(['content', ...parts, ...(parts.some(Boolean) ? [] : [content])]));
   }
   async notify(id, message, result) {
+    // Descriptions are display-only; even a direct caller cannot turn a known
+    // semantic/fingerprint/normal verdict into a new Telegram review.
+    if (NOTICE_KINDS.includes(result?.kind) && result.kind !== 'candidate') return;
+    const remembered = savedRule(this.event(id));
+    const classification = ruleMetadata(NOTICE_KINDS.includes(result?.kind) ? result : remembered || result);
+    if (classification.kind !== 'candidate') return;
+    this.sql.exec("UPDATE events SET result=? WHERE id=? AND status IN ('notifying','notify_pending')", JSON.stringify({ classification }), id);
     if (this.config.manualPaused || !this.selected().length) {
       this.sql.exec("UPDATE events SET status='notify_pending',reason='observation_paused',updated_at=? WHERE id=? AND status IN ('notifying','notify_pending')", Date.now(), id);
       return;
@@ -328,7 +374,7 @@ export class ObservePool {
     // Mark before dispatch; loss of the send response is never silently retried.
     const preview = String(result.evidence || '').slice(0, 700);
     try {
-      const response = await this.tg('sendMessage', { chat_id: owner, parse_mode: 'HTML', text: '👀 观察池待复核\n\n👤 用户 <code>' + escape(message.user_id) + '</code>（' + escape([message.first_name, message.last_name].filter(Boolean).join(' ')) + '）\n📍 ' + escape(message.chat_title || message.chat_id) + '\n🎯 ' + escape(result.reason || '疑似广告') + '\n📄 <code>' + escape(preview || '（按 ID 举报，无正文）') + '</code>\n\n确认后保存样本并在主群/授权群封禁；不操作观察来源群。',
+      const response = await this.tg('sendMessage', { chat_id: owner, parse_mode: 'HTML', text: '👀 观察池待复核\n\n👤 用户 <code>' + escape(message.user_id) + '</code>（' + escape([message.first_name, message.last_name].filter(Boolean).join(' ')) + '）\n📍 ' + escape(message.chat_title || message.chat_id) + '\n🎯 ' + escape(describeRule(classification)) + '\n📄 <code>' + escape(preview || '（按 ID 举报，无正文）') + '</code>\n\n确认后保存样本并在主群/授权群封禁；不操作观察来源群。',
         reply_markup: { inline_keyboard: [[{ text: '✅ 是广告，抓样本并封禁', callback_data: 'op:save:' + id }, { text: '🚫 误判，放行', callback_data: 'op:dismiss:' + id }]] } });
       if (response.ok !== true || !positiveId(response.result?.message_id)) throw new Error('notification_uncertain');
       this.sql.exec("UPDATE events SET status='review',telegram_mid=?,updated_at=? WHERE id=? AND status='notifying'", response.result.message_id, Date.now(), id);
@@ -528,8 +574,10 @@ export class ObservePool {
       const approvals = this.sql.exec("SELECT id FROM events WHERE status='sync_pending' AND updated_at<? LIMIT 3", Date.now() - REFRESH_MS).toArray();
       for (const e of approvals) await this.applyApproval(e.id);
       if (Date.now() - this.get('last_hit_sync', 0) > SYNC_MS) { await this.flushHits(); this.put('last_hit_sync', Date.now()); }
-      const notices = this.sql.exec("SELECT id,message,evidence,kind,reason FROM events WHERE status='notify_pending' AND updated_at<? ORDER BY updated_at LIMIT 3", Date.now() - REFRESH_MS).toArray();
-      for (const notice of notices) await this.notify(notice.id, JSON.parse(notice.message), { evidence: notice.evidence, matched_field: notice.kind, reason: '疑似广告，黑名单核查已恢复' });
+      const notices = this.sql.exec("SELECT id,message,evidence,kind,reason,result FROM events WHERE status='notify_pending' AND updated_at<? ORDER BY updated_at LIMIT 3", Date.now() - REFRESH_MS).toArray();
+      for (const notice of notices) await this.notify(notice.id, JSON.parse(notice.message), {
+        ...(savedRule(notice) || { kind: 'candidate', reason: 'unknown', matched_field: notice.kind }), evidence: notice.evidence
+      });
       this.sql.exec("UPDATE events SET status='notification_uncertain',reason='notification_uncertain',updated_at=? WHERE status='notifying' AND updated_at<?", Date.now(), Date.now() - LEASE_MS);
       this.sql.exec('DELETE FROM notice_keys WHERE hash IN (SELECT hash FROM notice_keys WHERE created_at<? ORDER BY created_at LIMIT 200)', Date.now() - CONTENT_DEDUPE_MS);
       this.sql.exec("DELETE FROM events WHERE id IN (SELECT id FROM events WHERE status IN ('ignored','approved','dismissed') AND updated_at<? ORDER BY updated_at LIMIT 200)", Date.now() - 7 * 86400000);
@@ -599,7 +647,7 @@ export default {
     try {
       if (path === '/health' && request.method === 'GET') return new Response('OK');
       if (path === '/login') {
-        if (request.method === 'GET') return htmlPage(LOGIN_HTML, ADMIN_HEADERS);
+        if (request.method === 'GET') return await loginPage(request, env, LOGIN_HTML, ADMIN_HEADERS);
         if (request.method !== 'POST') return json(405, { ok: false, error: 'method_not_allowed' });
         return await handleLogin(request, env, async () => { const key = await digest(request.headers.get('CF-Connecting-IP') || 'global'); return (await (await forward('/login-attempt', { key })).json()).allowed === true; });
       }
