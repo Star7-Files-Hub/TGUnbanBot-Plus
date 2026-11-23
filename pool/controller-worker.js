@@ -4,7 +4,7 @@ import { authenticatedBearer, validSession, handleLogin, loginPage, htmlPage, sa
 import { ProtocolError, readJson, json, validateMessageInput, validateDictionaryInput, validVector, MAX_DICTIONARY_BYTES } from './protocol.mjs';
 import { READ_LIMIT, WRITE_LIMIT, MAX_THRESHOLD, MAX_USAGE_AGE, utcDay, parseD1Usage, mergeUsage, eligibleAccounts, availability, usageRatio } from './quota.mjs';
 
-export const RUNTIME_REVISION = 'pool-login-labels-v4';
+export const RUNTIME_REVISION = 'pool-four-account-priority-v5';
 export const REFRESH_MS = 60_000;
 export const SYNC_MS = 600_000;
 export const DICTIONARY_MAX_AGE = 86_400_000;
@@ -94,14 +94,16 @@ async function fetchJson(url, options = {}, ms = 15000, maximum = MAX_DICTIONARY
 export function accountConfig(env) {
   let rows; try { rows = JSON.parse(env.POOL_ACCOUNTS || '[]'); } catch { throw new Error('invalid_pool_config'); }
   if (!Array.isArray(rows) || !rows.length || rows.length > 8) throw new Error('invalid_pool_config');
-  const seen = new Set();
+  const seen = new Set(), accountIds = new Set(), urls = new Set();
   return rows.map((row, index) => {
-    if (!object(row) || !/^[-a-zA-Z0-9_]{1,32}$/.test(row.alias) || seen.has(row.alias) || !/^[a-f0-9]{32}$/i.test(row.accountId)) throw new Error('invalid_pool_config');
+    if (!object(row) || !/^[-a-zA-Z0-9_]{1,32}$/.test(row.alias) || seen.has(row.alias) || !/^[a-f0-9]{32}$/i.test(row.accountId)
+        || accountIds.has(row.accountId.toLowerCase()) || (row.priority !== undefined && (!Number.isSafeInteger(row.priority) || row.priority < 0 || row.priority > 2))) throw new Error('invalid_pool_config');
     const url = new URL(row.url);
     if (url.protocol !== 'https:' || !url.hostname.endsWith('.workers.dev') || url.username || url['pass' + 'word'] || url.search || url.hash || url.pathname !== '/') throw new Error('invalid_pool_url');
     if (!/^\w{1,64}$/.test(row.nodeTokenEnv) || !/^\w{1,64}$/.test(row.analyticsTokenEnv) || !env[row.nodeTokenEnv] || !env[row.analyticsTokenEnv]) throw new Error('missing_pool_secret');
-    seen.add(row.alias);
-    return { ...row, url: url.origin, index, enabled: true, readLimit: READ_LIMIT, writeLimit: WRITE_LIMIT, rowsRead: null, rowsWritten: null,
+    if (urls.has(url.origin)) throw new Error('invalid_pool_config');
+    seen.add(row.alias); accountIds.add(row.accountId.toLowerCase()); urls.add(url.origin);
+    return { ...row, url: url.origin, index, priority: row.priority ?? 0, enabled: true, readLimit: READ_LIMIT, writeLimit: WRITE_LIMIT, rowsRead: null, rowsWritten: null,
       observedAt: null, day: null, version: null, error: null, localReads: 0, localWrites: 0, cooldownUntil: 0, lastDispatch: 0 };
   });
 }
@@ -123,7 +125,13 @@ export class ObservePool {
       this.sql.exec('CREATE TABLE IF NOT EXISTS hits (sample_id INTEGER PRIMARY KEY,total INTEGER NOT NULL,synced INTEGER NOT NULL DEFAULT 0)');
       this.sql.exec('CREATE TABLE IF NOT EXISTS hit_batches (id TEXT PRIMARY KEY,payload TEXT NOT NULL,status TEXT NOT NULL)');
       this.sql.exec('CREATE TABLE IF NOT EXISTS auth_attempts (key TEXT PRIMARY KEY,time INTEGER NOT NULL,count INTEGER NOT NULL)');
-      this.accounts = accountConfig(env).map(a => ({ ...a, ...this.get('account:' + a.alias, {}) }));
+      this.accounts = accountConfig(env).map(a => {
+        const restored = { ...a, ...this.get('account:' + a.alias, {}) };
+        // Account identity/priority are trusted deployment configuration, not
+        // writable or stale persisted usage fields from a previous revision.
+        for (const field of ['alias', 'accountId', 'url', 'index', 'priority', 'nodeTokenEnv', 'analyticsTokenEnv']) restored[field] = a[field];
+        return restored;
+      });
       const stored = this.get('config', {});
       this.config = { mode: ['balanced', 'failover'].includes(stored.mode) ? stored.mode : 'balanced',
         threshold: Number.isFinite(stored.threshold) && stored.threshold >= 0.1 ? Math.min(MAX_THRESHOLD, stored.threshold) : MAX_THRESHOLD,
@@ -276,7 +284,7 @@ export class ObservePool {
     const count = statuses => Number(this.sql.exec('SELECT COUNT(*) n FROM events WHERE status IN (' + statuses.map(() => '?').join(',') + ')', ...statuses).toArray()[0].n);
     return { ok: true, data: { paused: !!this.pauseReason(), reason: this.pauseReason() || 'ready', mode: this.config.mode, threshold: this.config.threshold,
       utcDay: utcDay(), runtimeRevision: RUNTIME_REVISION, version: this.version, syncedAt: this.syncedAt, syncError: this.get('sync_error', null), syncDiagnostic: this.get('sync_diagnostic', null),
-      accounts: this.accounts.map(a => ({ alias: a.alias, enabled: a.enabled, rowsRead: a.rowsRead, rowsWritten: a.rowsWritten, readLimit: a.readLimit, writeLimit: a.writeLimit,
+      accounts: this.accounts.map(a => ({ alias: a.alias, priority: a.priority, enabled: a.enabled, rowsRead: a.rowsRead, rowsWritten: a.rowsWritten, readLimit: a.readLimit, writeLimit: a.writeLimit,
         percent: usageRatio(a), localReads: a.localReads, localWrites: a.localWrites, lastDispatch: a.lastDispatch, diagnostic: this.get('usage_error:' + a.alias, null), day: a.day, observedAt: a.observedAt,
         fresh: a.day === utcDay() && Number.isFinite(a.observedAt) && now - a.observedAt >= 0 && now - a.observedAt <= MAX_USAGE_AGE,
         eligible: !availability(a, this.version, this.config.threshold), error: availability(a, this.version, this.config.threshold), cooldownUntil: a.cooldownUntil })),

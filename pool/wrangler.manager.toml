@@ -10,7 +10,7 @@ preview_urls = false
 BETA_URL = "https://tg-unban-bot-beta.cf77-6b9.workers.dev"
 SOURCE_ALIAS = "CF77"
 OWNER_ID = "5608153118"
-POOL_ACCOUNTS = '[{"alias":"CF77","accountId":"6b9ae0e6676be1671f3655e583cdc9b4","url":"https://tg-observe-node.cf77-6b9.workers.dev","nodeTokenEnv":"NODE_CF77_TOKEN","analyticsTokenEnv":"ANALYTICS_CF77_TOKEN"},{"alias":"7Star","accountId":"acc2d30ff4bf9c73b2c00c8bc4942ff2","url":"https://tg-observe-node.7star-acc.workers.dev","nodeTokenEnv":"NODE_7STAR_TOKEN","analyticsTokenEnv":"ANALYTICS_7STAR_TOKEN"}]'
+POOL_ACCOUNTS = '[{"alias":"CF77","accountId":"6b9ae0e6676be1671f3655e583cdc9b4","url":"https://tg-observe-node.cf77-6b9.workers.dev","priority":2,"nodeTokenEnv":"NODE_CF77_TOKEN","analyticsTokenEnv":"ANALYTICS_CF77_TOKEN"},{"alias":"7Star","accountId":"acc2d30ff4bf9c73b2c00c8bc4942ff2","url":"https://tg-observe-node.7star-acc.workers.dev","priority":1,"nodeTokenEnv":"NODE_7STAR_TOKEN","analyticsTokenEnv":"ANALYTICS_7STAR_TOKEN"},{"alias":"1536267368","accountId":"df650f35309e9980f57e1c5dcdff1c6e","url":"https://tg-observe-node.7star.workers.dev","priority":0,"nodeTokenEnv":"NODE_1536267368_TOKEN","analyticsTokenEnv":"ANALYTICS_1536267368_TOKEN"},{"alias":"KF","accountId":"35c5c5208d51fc84a07449fdc474884b","url":"https://tg-observe-node.kf-35c.workers.dev","priority":0,"nodeTokenEnv":"NODE_KF_TOKEN","analyticsTokenEnv":"ANALYTICS_KF_TOKEN"}]'
 
 [[durable_objects.bindings]]
 name = "POOL"
@@ -25,6 +25,7 @@ new_sqlite_classes = ["ObservePool"]
 
 # Keep these as independent runtime secrets, never [vars]:
 # ADMIN_PASSWORD, SESSION_SECRET, COLLECTOR_TOKEN, BETA_CONTROL_TOKEN, BOT_TOKEN,
-# NODE_CF77_TOKEN, NODE_7STAR_TOKEN, ANALYTICS_CF77_TOKEN, ANALYTICS_7STAR_TOKEN.
+# NODE_CF77_TOKEN, NODE_7STAR_TOKEN, NODE_1536267368_TOKEN, NODE_KF_TOKEN,
+# ANALYTICS_CF77_TOKEN, ANALYTICS_7STAR_TOKEN, ANALYTICS_1536267368_TOKEN, ANALYTICS_KF_TOKEN.
 [observability]
 enabled = true

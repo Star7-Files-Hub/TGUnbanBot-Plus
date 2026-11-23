@@ -47,9 +47,21 @@ function fakeState(db = new DatabaseSync(':memory:')) {
   }, blockConcurrencyWhile(callback) { const p = Promise.resolve().then(callback); initialization.push(p); return p; } };
   return { ctx, db, statements, initialized: () => Promise.all(initialization), get alarm() { return alarm; } };
 }
-async function harness(t, { bootstrap = true } = {}) {
+async function harness(t, { bootstrap = true, fourAccounts = false } = {}) {
   const state = fakeState(), env = environment(), calls = [];
-  const usage = new Map(ACCOUNT_IDS.map(id => [id, { rowsRead: 1000, rowsWritten: 100 }]));
+  const nodes = [...NODES];
+  if (fourAccounts) {
+    const rows = JSON.parse(env.POOL_ACCOUNTS);
+    rows[0].priority = 2; rows[1].priority = 1;
+    for (const [alias, number] of [['1536267368', 3], ['KF', 4]]) {
+      const url = 'https://pool-node-' + number + '.unit.workers.dev'; nodes.push(url);
+      const nodeTokenEnv = 'EXTRA_NODE_' + number, analyticsTokenEnv = 'EXTRA_ANALYTICS_' + number;
+      env[nodeTokenEnv] = 'unit-test-extra-node-' + number; env[analyticsTokenEnv] = 'unit-test-extra-analytics-' + number;
+      rows.push({ alias, accountId: String(number).repeat(32), url, priority: 0, nodeTokenEnv, analyticsTokenEnv });
+    }
+    env.POOL_ACCOUNTS = JSON.stringify(rows);
+  }
+  const usage = new Map(JSON.parse(env.POOL_ACCOUNTS).map(row => [row.accountId, { rowsRead: 1000, rowsWritten: 100 }]));
   const hooks = { source: null, classify: null, upload: null, telegram: null, analytics: null }; let mid = 100;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options = {}) => {
@@ -69,7 +81,7 @@ async function harness(t, { bootstrap = true } = {}) {
       if (c.path === '/api/pool/user-status') return json({ ok: true, blacklisted: false });
       if (c.path === '/api/pool/hits') return json({ ok: true, applied: body.hits.length });
     }
-    if (NODES.includes(u.origin)) {
+    if (nodes.includes(u.origin)) {
       if (c.path === '/dictionary') {
         if (hooks.upload) { const r = await hooks.upload(c); if (r) return r; }
         return json({ ok: true, version: body.version, metrics: { rowsRead: 0, rowsWritten: 1 } });
@@ -88,7 +100,7 @@ async function harness(t, { bootstrap = true } = {}) {
   env.POOL = { idFromName(name) { assert.equal(name, 'primary'); return name; }, get: () => ({ fetch: request => pool.fetch(request) }) };
   if (bootstrap) { await pool.refresh(true); await pool.sync(true); assert.ok(pool.version); }
   calls.length = 0;
-  return { ...state, env, pool, calls, usage, hooks,
+  return { ...state, env, pool, calls, usage, hooks, nodes,
     classified: () => calls.filter(c => c.path === '/classify'), notifications: () => calls.filter(c => c.path.endsWith('/sendMessage')),
     setUsage(index, changes) { Object.assign(pool.accounts[index], { rowsRead: 1000, rowsWritten: 100, localReads: 0, localWrites: 0,
       day: utcDay(), observedAt: Date.now(), error: null, version: pool.version, cooldownUntil: 0, ...changes }); },
@@ -580,6 +592,54 @@ test('notification retries never replace a completed approval result with classi
   const before = h.pool.event(id).result; const sent = h.notifications().length;
   await h.pool.notify(id, message(), { kind: 'candidate', reason: 'structure' });
   assert.equal(h.pool.event(id).result, before); assert.equal(h.notifications().length, sent); assert.equal(h.pool.event(id).status, 'approved');
+});
+for (const mode of ['balanced', 'failover']) test('four-account dispatch prioritizes independent nodes over idle controller/main: ' + mode, async t => {
+  const h = await harness(t, { fourAccounts: true }); h.pool.config.mode = mode;
+  h.setUsage(0, { rowsRead: 0, rowsWritten: 0 }); h.setUsage(1, { rowsRead: 0, rowsWritten: 0 });
+  h.setUsage(2, { rowsRead: 2_000_000 }); h.setUsage(3, { rowsRead: 1_000_000 });
+  const response = await ingest(h); assert.equal(response.status, 200);
+  const expected = mode === 'balanced' ? 3 : 2;
+  assert.equal(h.classified()[0].origin, h.nodes[expected]);
+  const state = (await (await internal(h, '/state')).json()).data;
+  assert.deepEqual(state.accounts.map(a => a.priority), [2, 1, 0, 0]);
+  assert.ok(state.accounts[expected].lastDispatch > 0);
+  assert.equal(state.accounts[0].lastDispatch, 0); assert.equal(state.accounts[1].lastDispatch, 0);
+});
+test('four-account failures try both independent nodes before controller and main bot', async t => {
+  const h = await harness(t, { fourAccounts: true }); h.pool.config.mode = 'failover';
+  h.hooks.classify = c => [h.nodes[2], h.nodes[3], h.nodes[1]].includes(c.origin) ? json({ ok: false }, 503)
+    : json({ ok: true, version: c.body.version, kind: 'normal', metrics: { rowsRead: 0, rowsWritten: 0 } });
+  assert.equal((await ingest(h)).status, 200);
+  assert.deepEqual(h.classified().map(c => c.origin), [h.nodes[2], h.nodes[3], h.nodes[1], h.nodes[0]]);
+});
+test('four-account cutoff and missing usage fall back without bypassing protection', async t => {
+  const h = await harness(t, { fourAccounts: true });
+  h.setUsage(2, { rowsRead: 4_000_000 }); h.setUsage(3, { rowsWritten: 80_000 });
+  assert.equal((await ingest(h, message({ message_id: 801 }))).status, 200);
+  assert.equal(h.classified()[0].origin, h.nodes[1]);
+  h.pool.accounts[1].enabled = false;
+  assert.equal((await ingest(h, message({ message_id: 802 }))).status, 200);
+  assert.equal(h.classified()[1].origin, h.nodes[0]);
+  h.setUsage(0, { rowsWritten: 80_000 });
+  assert.equal((await ingest(h, message({ message_id: 803 }))).status, 503);
+  assert.equal(h.classified().length, 2); assert.equal(h.pool.status().observe_allowed, false);
+});
+test('expanded config preserves identity and priority from trusted deployment after restart', async t => {
+  const h = await harness(t, { fourAccounts: true });
+  h.pool.put('account:CF77', { ...h.pool.get('account:CF77', {}), priority: 0, accountId: '9'.repeat(32), url: 'https://untrusted.invalid' });
+  const restoredState = fakeState(h.db), restored = new ObservePool(restoredState.ctx, h.env); await restoredState.initialized();
+  assert.equal(restored.accounts.length, 4); assert.equal(restored.accounts[0].priority, 2);
+  assert.equal(restored.accounts[0].accountId, ACCOUNT_IDS[0]); assert.equal(restored.accounts[0].url, NODES[0]);
+  assert.deepEqual(restored.accounts.map(a => a.priority), [2, 1, 0, 0]);
+  const response = await restored.fetch(new Request('https://pool.internal/control/config', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: 'balanced', threshold: 0.8, accounts: restored.accounts.map(a => ({ alias: a.alias, enabled: a.alias !== 'KF' })) }) }));
+  assert.equal(response.status, 200); assert.equal(restored.accounts[3].enabled, false);
+});
+test('account priority and duplicate resource identities cannot create fake independent quotas', () => {
+  for (const change of [{ priority: -1 }, { priority: 3 }, { priority: '0' }, { accountId: ACCOUNT_IDS[1] }, { url: NODES[1] + '/' }]) {
+    const env = environment(), rows = JSON.parse(env.POOL_ACCOUNTS); Object.assign(rows[0], change); env.POOL_ACCOUNTS = JSON.stringify(rows);
+    assert.throws(() => accountConfig(env));
+  }
 });
 test('account configuration refuses unsafe targets and missing authentication', () => {
   for (const url of ['http://node.unit.workers.dev/', 'https://outside.invalid/', 'https://user:unit@node.unit.workers.dev/', NODES[0] + '/admin']) {

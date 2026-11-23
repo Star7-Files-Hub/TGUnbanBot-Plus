@@ -84,6 +84,22 @@ test('balanced dispatch chooses low load; failover retains configured order and 
   assert.deepEqual(eligibleAccounts([account({ alias: 'recent', lastDispatch: 20 }), account({ alias: 'older', lastDispatch: 10 })], VERSION,
     { mode: 'balanced', threshold: 0.8 }, NOW).map(a => a.alias), ['older', 'recent']);
 });
+for (const mode of ['balanced', 'failover']) test('independent accounts outrank controller and main bot regardless of usage: ' + mode, () => {
+  const main = account({ alias: 'CF77', priority: 2, rowsRead: 1, rowsWritten: 0 });
+  const control = account({ alias: '7Star', priority: 1, rowsRead: 2, rowsWritten: 0 });
+  const first = account({ alias: '1536267368', priority: 0, rowsRead: 2_000_000 });
+  const second = account({ alias: 'KF', priority: 0, rowsRead: 1_000_000 });
+  const input = [main, control, first, second];
+  assert.deepEqual(eligibleAccounts(input, VERSION, { mode, threshold: 0.8 }, NOW).map(a => a.alias),
+    mode === 'balanced' ? ['KF', '1536267368', '7Star', 'CF77'] : ['1536267368', 'KF', '7Star', 'CF77']);
+  assert.deepEqual(input.map(a => a.alias), ['CF77', '7Star', '1536267368', 'KF']);
+  first.rowsWritten = 80_000; second.observedAt = NOW - MAX_USAGE_AGE - 1;
+  assert.deepEqual(eligibleAccounts(input, VERSION, { mode, threshold: 0.8 }, NOW).map(a => a.alias), ['7Star', 'CF77']);
+  control.enabled = false;
+  assert.deepEqual(eligibleAccounts(input, VERSION, { mode, threshold: 0.8 }, NOW).map(a => a.alias), ['CF77']);
+  main.rowsRead = 4_000_000;
+  assert.deepEqual(eligibleAccounts(input, VERSION, { mode, threshold: 0.8 }, NOW), []);
+});
 test('only a valid empty aggregate means measured zero', () => {
   assert.deepEqual(parseD1Usage(analytics([])), { rowsRead: 0, rowsWritten: 0 });
   assert.deepEqual(parseD1Usage(analytics([{ sum: { rowsRead: 120, rowsWritten: 8 } }])), { rowsRead: 120, rowsWritten: 8 });

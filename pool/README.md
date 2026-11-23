@@ -7,7 +7,7 @@
 ## 运行组件
 
 - [controller-worker.js](<controller-worker.js>)：SQLite Durable Object 中央状态、全局事件去重、账户 Analytics 监测、调度、主人复核和低频命中计数写回。
-- [node-worker.js](<node-worker.js>)：只读分类节点，两账户各用独立 D1 字典快照。无 Telegram Bot Token，不发消息、不做封禁。
+- [node-worker.js](<node-worker.js>)：只读分类节点，CF77、7Star、1536267368、KF 四账户各用独立 D1 字典快照。无 Telegram Bot Token，不发消息、不做封禁。
 - [admin-page.mjs](<admin-page.mjs>)：后台页面，签名 HttpOnly/Secure Cookie 登录；只手动刷新，无浏览器端 Cloudflare Token。
 - [quota.mjs](<quota.mjs>)：按 UTC 当日、账户全部 D1 的读/写量保护；统计未知、过期或不同日不派发。
 - [protocol.mjs](<protocol.mjs>)：消息和字典严格类型、大小、版本及向量验证。快照传输上限 1,800,000 字节，避免超过 D1 单行上限。
@@ -27,7 +27,8 @@ Analytics 每分钟刷新，并非实时精确账单；结合持久本地计量�
 
 ## 后台操作
 
-- **负载均衡**：优先低用量健康账号；**顺序故障转移**：按配置账号顺序使用。
+- **先用独立观察账号**：1536267368 与 KF 为第一优先级，7Star 主控账号仅备用，CF77 主机器人账号最后兜底。主控或主机器人用量更低也不会抢先使用。
+- **负载均衡**：相同优先级内优先低用量健康账号；**顺序故障转移**：相同优先级内按配置顺序使用。所有账号仍受 80%、新鲜度、字典版本和冷却保护。
 - 单账号启停、手动暂停/恢复、刷新用量、同步字典。
 - “通知状态不确定”只支持查看与放弃；不盲重发，不自动保存样本或处罚。
 - 后台密码使用独立 runtime secret `ADMIN_PASSWORD`，不输入 Cloudflare API Token。运行时凭证不写入 Git。
@@ -41,6 +42,8 @@ Analytics 每分钟刷新，并非实时精确账单；结合持久本地计量�
 ```bash
 npx wrangler deploy --config pool/wrangler.cf77-node.toml --keep-vars
 npx wrangler deploy --config pool/wrangler.7star-node.toml --keep-vars
+npx wrangler deploy --config pool/wrangler.1536267368-node.toml --keep-vars
+npx wrangler deploy --config pool/wrangler.kf-node.toml --keep-vars
 npx wrangler deploy --config pool/wrangler.manager.toml --keep-vars
 ```
 

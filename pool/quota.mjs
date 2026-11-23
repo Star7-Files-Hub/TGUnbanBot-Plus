@@ -27,8 +27,12 @@ export function availability(account, version, threshold = MAX_THRESHOLD, now = 
 }
 export function eligibleAccounts(accounts, version, config, now = Date.now()) {
   const eligible = accounts.filter(a => availability(a, version, config.threshold, now) === null);
-  return config.mode === 'balanced' ? eligible.sort((a, b) => usageRatio(a) - usageRatio(b)
-    || (a.lastDispatch || 0) - (b.lastDispatch || 0)) : eligible;
+  const priority = a => Number.isSafeInteger(a.priority) && a.priority >= 0 ? a.priority : 0;
+  // Independent observation accounts precede the control account and main bot,
+  // even when a fallback account reports lower usage. Never bypass quota gates.
+  return eligible.sort((a, b) => priority(a) - priority(b)
+    || (config.mode === 'balanced' ? usageRatio(a) - usageRatio(b)
+      || (a.lastDispatch || 0) - (b.lastDispatch || 0) : 0));
 }
 export function parseD1Usage(body) {
   if (!body || (Array.isArray(body.errors) ? body.errors.length > 0 : body.errors != null)) return null;
