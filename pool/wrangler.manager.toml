@@ -1,0 +1,30 @@
+name = "tg-observe-manager"
+account_id = "acc2d30ff4bf9c73b2c00c8bc4942ff2"
+main = "controller-worker.js"
+compatibility_date = "2026-11-01"
+keep_vars = true
+workers_dev = true
+preview_urls = false
+
+[vars]
+BETA_URL = "https://tg-unban-bot-beta.cf77-6b9.workers.dev"
+SOURCE_ALIAS = "CF77"
+OWNER_ID = "5608153118"
+POOL_ACCOUNTS = '[{"alias":"CF77","accountId":"6b9ae0e6676be1671f3655e583cdc9b4","url":"https://tg-observe-node.cf77-6b9.workers.dev","nodeTokenEnv":"NODE_CF77_TOKEN","analyticsTokenEnv":"ANALYTICS_CF77_TOKEN"},{"alias":"7Star","accountId":"acc2d30ff4bf9c73b2c00c8bc4942ff2","url":"https://tg-observe-node.7star-acc.workers.dev","nodeTokenEnv":"NODE_7STAR_TOKEN","analyticsTokenEnv":"ANALYTICS_7STAR_TOKEN"}]'
+
+[[durable_objects.bindings]]
+name = "POOL"
+class_name = "ObservePool"
+
+[durable_objects.code_update_strategy]
+mode = "immediate"
+
+[[migrations]]
+tag = "pool-v1"
+new_sqlite_classes = ["ObservePool"]
+
+# Keep these as independent runtime secrets, never [vars]:
+# ADMIN_PASSWORD, SESSION_SECRET, COLLECTOR_TOKEN, BETA_CONTROL_TOKEN, BOT_TOKEN,
+# NODE_CF77_TOKEN, NODE_7STAR_TOKEN, ANALYTICS_CF77_TOKEN, ANALYTICS_7STAR_TOKEN.
+[observability]
+enabled = true

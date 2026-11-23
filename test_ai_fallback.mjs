@@ -50,7 +50,7 @@ test('gateway URL and key come only from runtime config and redirects are forbid
   assert.equal(result.isAd, true);
   assert.equal(h.calls[0].url, 'https://backup.invalid/v1/chat/completions');
   assert.equal(h.calls[0].options.headers.Authorization, 'Bearer TEST-SECRET-NOT-REAL');
-  assert.equal(h.calls[0].options.redirect, 'error');
+  assert.equal(h.calls[0].options.redirect, 'manual');
   assert.ok(h.calls[0].options.signal instanceof AbortSignal);
   const body = JSON.parse(h.calls[0].options.body);
   assert.equal(body.model, 'DeepSeek-V4.1-Flash');
@@ -214,7 +214,7 @@ test('monitor reads account-wide UTC aggregate then caches it for fresh isolates
   assert.equal(first.cfCalls.length, 1); assert.equal(first.calls.length, 1);
   const call = first.calls[0];
   assert.equal(call.url, ANALYTICS_URL); assert.equal(call.options.method, 'POST');
-  assert.equal(call.options.redirect, 'error');
+  assert.equal(call.options.redirect, 'manual');
   assert.equal(call.options.headers.Authorization, 'Bearer TEST-ANALYTICS-SECRET');
   const body = JSON.parse(call.options.body);
   assert.equal(body.variables.accountTag, 'a'.repeat(32));

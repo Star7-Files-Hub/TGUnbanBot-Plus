@@ -140,7 +140,7 @@ test('structured precision review shares threshold backup routing and strict com
     assert.equal(h.ai.length, 0);
     assert.equal(JSON.parse(capture.options.body).max_tokens, 1024);
     assert.ok(JSON.parse(capture.options.body).messages[0].content.includes('JSON'));
-    assert.equal(capture.options.redirect, 'error');
+    assert.equal(capture.options.redirect, 'manual');
     globalThis.fetch = async () => Response.json({ choices: [{ finish_reason: 'length', message: { content: JSON.stringify({ is_ad: true, candidates: [phrase] }) } }] });
     assert.ok((await w.judgeAdWithAI(h.env, phrase, 'precision_learn')).error);
   } finally { globalThis.fetch = prior; }

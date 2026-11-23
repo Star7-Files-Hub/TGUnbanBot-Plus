@@ -23,6 +23,12 @@ TARGET_CHAT_ID = -1001971423490
 MAX_SPOOL = 1000
 MAX_HISTORY = 100
 MAX_TEXT = 4000
+MAX_RESPONSE_BYTES = 64 * 1024
+STATUS_CACHE_SECONDS = 60.0
+STATUS_MAX_AGE_SECONDS = 300.0
+STATUS_FUTURE_SKEW_SECONDS = 5.0
+INGEST_PATHS = frozenset(("/api/ingest", "/api/observe/ingest"))
+LEGACY_STATUSES = frozenset(("observe", "pass", "duplicate", "command"))
 LOG = logging.getLogger("tg_sample_collector")
 
 
@@ -39,6 +45,10 @@ class TargetUnavailableError(RuntimeError):
 
 
 class SpoolFull(RuntimeError):
+    pass
+
+
+class CollectorPaused(RuntimeError):
     pass
 
 
@@ -63,13 +73,23 @@ class Config:
             raise ConfigError("COLLECTOR_DATA_DIR must be absolute")
         self.url = env.get("OBSERVE_INGEST_URL", "").strip()
         self.token = env.get("OBSERVE_INGEST_TOKEN", "").strip()
+        self.pool_mode = False
+        self.control_status_url = ""
         if require_ingest:
-            u = parse.urlsplit(self.url)
+            try:
+                u = parse.urlsplit(self.url)
+                port = u.port  # Access validates malformed ports; preserve explicit valid ports.
+            except ValueError:
+                raise ConfigError("OBSERVE_INGEST_URL is invalid") from None
             if (u.scheme != "https" or not u.hostname or u.username or u.password
-                    or u.query or u.fragment or u.path != "/api/observe/ingest"):
-                raise ConfigError("OBSERVE_INGEST_URL must be an HTTPS /api/observe/ingest endpoint")
+                    or u.query or u.fragment or u.path not in INGEST_PATHS):
+                raise ConfigError("OBSERVE_INGEST_URL must be an HTTPS /api/ingest or /api/observe/ingest endpoint")
             if not self.token or any(c.isspace() for c in self.token):
                 raise ConfigError("OBSERVE_INGEST_TOKEN is missing or invalid")
+            self.pool_mode = u.path == "/api/ingest"
+            if self.pool_mode:
+                # Controller origin is bound to the ingest origin, never a separate arbitrary URL.
+                self.control_status_url = parse.urlunsplit((u.scheme, u.netloc, "/api/collector/status", "", ""))
         self.rate = number(env.get("COLLECTOR_PER_MINUTE", ""), 20, 1, 20, "COLLECTOR_PER_MINUTE")
         self.history = number(env.get("COLLECTOR_HISTORY_LIMIT", ""), 100, 0, MAX_HISTORY, "COLLECTOR_HISTORY_LIMIT")
         self.max_spool = number(env.get("COLLECTOR_MAX_SPOOL", ""), MAX_SPOOL, 1, MAX_SPOOL, "COLLECTOR_MAX_SPOOL")
@@ -235,42 +255,266 @@ def retry_delay(attempts: int, retry_after: str | None = None) -> float:
     return float(min(900, 5 * 2 ** min(attempts, 8)))
 
 
-def send_http(url: str, token: str, payload: str) -> tuple[bool, str, str | None]:
-    """At-least-once transport: receiver must deduplicate (chat_id,message_id)."""
+class InvalidResponse(ValueError):
+    """A protocol error, deliberately without the upstream body or exception text."""
+
+
+def finite_number(value: Any) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, ValueError):
+        return False
+
+
+def read_json_bounded(response: Any) -> dict[str, Any]:
+    """Read at most 64 KiB + one sentinel byte; never log or return the raw body."""
+    declared = response.headers.get("Content-Length") if response.headers else None
+    if declared is not None:
+        try:
+            if int(declared) < 0 or int(declared) > MAX_RESPONSE_BYTES:
+                raise InvalidResponse("response length invalid")
+        except (TypeError, ValueError):
+            raise InvalidResponse("response length invalid") from None
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = response.read(min(8192, MAX_RESPONSE_BYTES + 1 - size))
+        if not chunk:
+            break
+        if not isinstance(chunk, bytes):
+            raise InvalidResponse("response bytes invalid")
+        size += len(chunk)
+        if size > MAX_RESPONSE_BYTES:
+            raise InvalidResponse("response too large")
+        chunks.append(chunk)
+
+    def unique_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise InvalidResponse("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_constant(_value):
+        raise InvalidResponse("non-finite JSON value")
+
+    try:
+        parsed = json.loads(b"".join(chunks).decode("utf-8"), object_pairs_hook=unique_keys,
+                            parse_constant=reject_constant)
+    except (ValueError, UnicodeError, RecursionError):
+        raise InvalidResponse("invalid JSON response") from None
+    if not isinstance(parsed, dict):
+        raise InvalidResponse("response object required")
+    return parsed
+
+
+def no_redirect_opener():
     class NoRedirect(request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             return None
-    opener = request.build_opener(NoRedirect())
+    return request.build_opener(NoRedirect())
+
+
+def receipt_accepted(url: str, body: dict[str, Any]) -> bool:
+    if body.get("paused") is True:
+        return False
+    event_id = body.get("event_id")
+    if (body.get("ok") is True and body.get("accepted") is True
+            and isinstance(event_id, str) and bool(event_id.strip()) and len(event_id) <= 512):
+        return True
+    # Legacy acceptance is restricted to the exact old endpoint, never the pool path.
+    return (parse.urlsplit(url).path == "/api/observe/ingest" and body.get("ok") is True
+            and "accepted" not in body and isinstance(body.get("status"), str)
+            and body["status"] in LEGACY_STATUSES)
+
+
+def response_retry_after(body: dict[str, Any], header: str | None) -> str | None:
+    value = body.get("retryAfter")
+    if finite_number(value) and value >= 0:
+        return str(value)
+    return header
+
+
+def http_failure(response: Any, status: int) -> tuple[bool, str, str | None]:
+    retry_after = response.headers.get("Retry-After") if response.headers else None
+    if status in (429, 503):
+        try:
+            body = read_json_bounded(response)
+            if body.get("paused") is True:
+                return False, "controller_paused", response_retry_after(body, retry_after)
+        except (InvalidResponse, OSError, TimeoutError):
+            pass
+    if status in (401, 403):
+        return False, "unauthorized", retry_after
+    return False, "http_rate_limited" if status == 429 else "http_rejected", retry_after
+
+
+def send_http(url: str, token: str, payload: str) -> tuple[bool, str, str | None]:
+    """Delete queued data only after a bounded, valid, explicit JSON acceptance receipt."""
     req = request.Request(url, data=payload.encode("utf-8"), method="POST", headers={
         "Content-Type": "application/json", "Authorization": "Bearer " + token,
-        "User-Agent": "tg-sample-collector/1.0",
+        "User-Agent": "tg-sample-collector/1.0", "Accept": "application/json",
     })
     try:
-        with opener.open(req, timeout=20) as response:
-            status = response.status
-            # Response body is neither needed nor logged; close without parsing private text.
-            if status == 200:
+        with no_redirect_opener().open(req, timeout=20) as response:
+            if response.status != 200:
+                return http_failure(response, response.status)
+            try:
+                body = read_json_bounded(response)
+            except InvalidResponse:
+                return False, "invalid_receipt", None
+            if receipt_accepted(url, body):
                 return True, "accepted", None
-            return False, "http_rejected", response.headers.get("Retry-After")
+            if body.get("paused") is True:
+                return False, "controller_paused", response_retry_after(body, None)
+            return False, "invalid_receipt", None
     except error.HTTPError as exc:
-        retry_after = exc.headers.get("Retry-After") if exc.headers else None
-        category = "http_rate_limited" if exc.code == 429 else "http_rejected"
-        exc.close()
-        return False, category, retry_after
+        try:
+            return http_failure(exc, exc.code)
+        finally:
+            exc.close()
     except (error.URLError, TimeoutError, OSError, ValueError):
         return False, "transport_error", None
 
 
+def fetch_control_status(url: str, token: str) -> dict[str, Any] | None:
+    req = request.Request(url, method="GET", headers={
+        "Authorization": "Bearer " + token, "User-Agent": "tg-sample-collector/1.0",
+        "Accept": "application/json",
+    })
+    try:
+        with no_redirect_opener().open(req, timeout=20) as response:
+            if response.status != 200:
+                return None
+            return read_json_bounded(response)
+    except error.HTTPError as exc:
+        exc.close()
+        return None
+    except (error.URLError, TimeoutError, OSError, ValueError):
+        return None
+
+
+class PauseGate:
+    """Shared fail-closed snapshot; Scanner/Dispatcher never fetch status themselves."""
+    def __init__(self, config: Config, *, clock=time.time):
+        self.required = config.pool_mode
+        self.url, self.token = config.control_status_url, config.token
+        self.clock = clock
+        self.observe_allowed = not self.required
+        self.received_at: float | None = None
+        self.checked_at: float | None = None
+        self.next_check = 0.0
+        self.hold_until = 0.0
+        self.retry_seconds = STATUS_CACHE_SECONDS
+        self.reason = "unknown" if self.required else "legacy"
+        self._refresh_lock = asyncio.Lock()
+        self._changed = asyncio.Event()
+
+    def allowed(self) -> bool:
+        if not self.required:
+            return True
+        now = self.clock()
+        return (self.observe_allowed and self.received_at is not None and self.checked_at is not None
+                and 0 <= now - self.received_at < STATUS_CACHE_SECONDS
+                and -STATUS_FUTURE_SKEW_SECONDS <= now - self.checked_at <= STATUS_MAX_AGE_SECONDS
+                and now >= self.hold_until)
+
+    def update(self, body: dict[str, Any] | None) -> None:
+        if not self.required:
+            return
+        now = self.clock()
+        self.observe_allowed = False
+        self.received_at = now
+        self.checked_at = None
+        self.reason = "unknown"
+        self.retry_seconds = STATUS_CACHE_SECONDS
+        self.next_check = now + STATUS_CACHE_SECONDS
+        if (not isinstance(body, dict) or body.get("ok") is not True
+                or type(body.get("observe_allowed")) is not bool
+                or not isinstance(body.get("reason"), str) or len(body["reason"]) > 256
+                or not finite_number(body.get("checked_at"))
+                or not finite_number(body.get("retry_after")) or body["retry_after"] < 0):
+            return
+        checked_at = body["checked_at"] / 1000.0
+        age = now - checked_at
+        if checked_at <= 0 or not -STATUS_FUTURE_SKEW_SECONDS <= age <= STATUS_MAX_AGE_SECONDS:
+            self.reason = "stale"
+            return
+        self.checked_at = checked_at
+        self.observe_allowed = body["observe_allowed"]
+        # Never store/print the server's free-form reason; only local fixed categories.
+        self.reason = "allowed" if self.observe_allowed else "paused"
+        if not self.observe_allowed:
+            self.retry_seconds = max(3.0, float(body["retry_after"]))
+            self.next_check = now + min(STATUS_CACHE_SECONDS, self.retry_seconds)
+        self._changed.set()
+
+    def pause(self, seconds: float = STATUS_CACHE_SECONDS, *, category: str = "paused") -> None:
+        if not self.required:
+            return
+        now = self.clock()
+        seconds = max(3.0, seconds) if finite_number(seconds) else STATUS_CACHE_SECONDS
+        self.observe_allowed = False
+        self.reason = "unauthorized" if category == "unauthorized" else "paused"
+        self.retry_seconds = seconds
+        self.hold_until = max(self.hold_until, now + seconds)
+        self.next_check = now + min(STATUS_CACHE_SECONDS, seconds)
+        self._changed.set()
+
+    def wait_seconds(self) -> float:
+        if self.allowed():
+            return 3.0
+        return min(STATUS_CACHE_SECONDS, max(3.0, self.next_check - self.clock()))
+
+    async def refresh(self, fetcher=fetch_control_status) -> float:
+        if not self.required:
+            return STATUS_CACHE_SECONDS
+        async with self._refresh_lock:
+            if self.clock() < self.next_check:
+                return min(STATUS_CACHE_SECONDS, max(3.0, self.next_check - self.clock()))
+            try:
+                body = await asyncio.to_thread(fetcher, self.url, self.token)
+            except Exception:
+                body = None
+            self.update(body)
+            if self.clock() < self.hold_until:
+                # A later allow snapshot cannot cancel an ingest-requested Retry-After hold.
+                self.next_check = min(self.next_check, self.hold_until)
+            return min(STATUS_CACHE_SECONDS, max(3.0, self.next_check - self.clock()))
+
+    async def watch(self, stop: asyncio.Event, fetcher=fetch_control_status) -> None:
+        # One loop performs all HTTP status reads; data paths only inspect this cache.
+        while not stop.is_set():
+            delay = await self.refresh(fetcher)
+            self._changed.clear()
+            changed = asyncio.create_task(self._changed.wait())
+            stopped = asyncio.create_task(stop.wait())
+            try:
+                await asyncio.wait((changed, stopped), timeout=delay,
+                                   return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                changed.cancel()
+                stopped.cancel()
+                await asyncio.gather(changed, stopped, return_exceptions=True)
+
+
 class Dispatcher:
-    def __init__(self, config: Config, spool: Spool, *, transport=send_http, clock=time.time):
+    def __init__(self, config: Config, spool: Spool, *, transport=send_http, clock=time.time,
+                 pause_gate: PauseGate | None = None):
         self.config = config
         self.spool = spool
         self.transport = transport
         self.clock = clock
+        self.pause_gate = pause_gate if pause_gate is not None else PauseGate(config, clock=clock)
         self.next_send = 0.0
         self.busy = False
 
     async def step(self) -> float:
+        if not self.pause_gate.allowed():
+            return self.pause_gate.wait_seconds()
         if self.busy:
             return 1.0
         row = self.spool.next_item()
@@ -289,34 +533,52 @@ class Dispatcher:
                 self.spool.complete(chat_id, mid)
                 LOG.info("ingest_accepted queued=%d", self.spool.count())
             else:
-                self.spool.retry(chat_id, mid, self.clock() + retry_delay(attempts, retry_after))
+                delay = retry_delay(attempts, retry_after)
+                self.spool.retry(chat_id, mid, self.clock() + delay)
+                if category in ("controller_paused", "unauthorized"):
+                    self.pause_gate.pause(delay if retry_after else STATUS_CACHE_SECONDS,
+                                          category=category)
+                # Fixed categories only: upstream bodies/errors/tokens never reach logs.
+                if category not in ("controller_paused", "unauthorized", "http_rate_limited",
+                                    "http_rejected", "invalid_receipt", "transport_error"):
+                    category = "transport_error"
                 LOG.warning("%s queued=%d", category, self.spool.count())
         except Exception:
             self.spool.retry(chat_id, mid, self.clock() + retry_delay(attempts))
             LOG.warning("transport_error queued=%d", self.spool.count())
         finally:
             self.busy = False
-        return 1.0
+        return 1.0 if self.pause_gate.allowed() else self.pause_gate.wait_seconds()
 
 
-async def authorize_check(client: Any, resolver=peer_id) -> Any:
+async def authorize_check(client: Any, resolver=peer_id, *, pause_gate: PauseGate | None = None) -> Any:
     if not await client.is_user_authorized():
         raise UnauthorizedError("Telegram session unauthorized; run --login-qr or --login-phone explicitly")
+
+    def require_allowed():
+        if pause_gate is not None and not pause_gate.allowed():
+            raise CollectorPaused("controller paused")
+
     try:
+        require_allowed()
         # Resolving a numeric channel needs an access hash in dialogs/session, not just an ID.
         target = None
         async for dialog in client.iter_dialogs():
+            require_allowed()
             if resolver(dialog.entity) == TARGET_CHAT_ID:
                 target = dialog.entity
                 break
         if target is None:
+            require_allowed()
             target = await client.get_entity(TARGET_CHAT_ID)
         if resolver(target) != TARGET_CHAT_ID:
             raise TargetUnavailableError("target group identity mismatch")
+        require_allowed()
         # A bounded read proves the target is readable, not merely cached in a session.
         await client.get_messages(target, limit=1)
+        require_allowed()
         return target
-    except TargetUnavailableError:
+    except (TargetUnavailableError, CollectorPaused):
         raise
     except Exception:
         raise TargetUnavailableError("Authorized account cannot read target group; collector will not join it") from None
@@ -330,13 +592,17 @@ def flood_wait_seconds(exc: BaseException) -> int | None:
 
 class Scanner:
     """NewMessage events only wake a bounded scanner; never retain unbounded event tasks."""
-    def __init__(self, config: Config, spool: Spool, client: Any, target: Any):
+    def __init__(self, config: Config, spool: Spool, client: Any, target: Any, *,
+                 pause_gate: PauseGate | None = None):
         self.config, self.spool, self.client, self.target = config, spool, client, target
+        self.pause_gate = pause_gate if pause_gate is not None else PauseGate(config)
         self.wake = asyncio.Event()
         self.blocked_until = 0.0
         self.full_logged = False
 
     async def scan(self) -> int:
+        if not self.pause_gate.allowed():
+            return 0
         if time.monotonic() < self.blocked_until:
             return 0
         if self.spool.count() >= self.spool.maximum:
@@ -352,7 +618,8 @@ class Scanner:
             # Explicitly choose a live-only baseline via one read, not all historical messages.
             try:
                 messages = await self.client.get_messages(self.target, limit=1)
-                self.spool.bootstrap_empty(messages[0].id if messages else 0)
+                if self.pause_gate.allowed():
+                    self.spool.bootstrap_empty(messages[0].id if messages else 0)
             except Exception as exc:
                 seconds = flood_wait_seconds(exc)
                 self.blocked_until = time.monotonic() + (seconds if seconds else 30)
@@ -364,6 +631,8 @@ class Scanner:
         messages = []
         try:
             async for message in self.client.iter_messages(self.target, **kwargs):
+                if not self.pause_gate.allowed():
+                    return 0
                 messages.append(message)
                 if len(messages) >= MAX_HISTORY:
                     break
@@ -371,11 +640,15 @@ class Scanner:
             stored = 0
             unsupported = 0
             for message in messages:
+                if not self.pause_gate.allowed():
+                    break
                 if self.spool.count() >= self.spool.maximum:
                     LOG.warning("spool_full paused_history queued=%d", self.spool.count())
                     self.full_logged = True
                     break
                 sender = await message.get_sender()
+                if not self.pause_gate.allowed():
+                    break
                 payload = message_payload(message, sender, getattr(self.target, "title", ""), TARGET_CHAT_ID)
                 if payload is None:
                     unsupported += 1
@@ -391,7 +664,7 @@ class Scanner:
                     LOG.warning("spool_full paused_history queued=%d", self.spool.count())
                     self.full_logged = True
                     break
-            if not messages and cursor is None:
+            if not messages and cursor is None and self.pause_gate.allowed():
                 self.spool.bootstrap_empty()
             if stored:
                 LOG.info("source_spooled count=%d queued=%d", stored, self.spool.count())
@@ -405,7 +678,7 @@ class Scanner:
             return 0
 
     async def on_new_message(self, event: Any) -> None:
-        if getattr(event, "chat_id", None) == TARGET_CHAT_ID:
+        if self.pause_gate.allowed() and getattr(event, "chat_id", None) == TARGET_CHAT_ID:
             self.wake.set()
 
 
@@ -478,6 +751,13 @@ async def login_qr(client: Any, directory: Path) -> None:
     raise UnauthorizedError("QR authorization timed out; rerun --login-qr explicitly")
 
 
+async def wait_or_stop(stop: asyncio.Event, seconds: float) -> None:
+    try:
+        await asyncio.wait_for(stop.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
 async def run(config: Config, mode: str = "run") -> None:
     try:
         from telethon import TelegramClient, events
@@ -500,6 +780,8 @@ async def run(config: Config, mode: str = "run") -> None:
                             flood_sleep_threshold=0, request_retries=0, connection_retries=3,
                             auto_reconnect=True, entity_cache_limit=200)
     spool = None
+    control_task = None
+    stop = asyncio.Event()
     try:
         await client.connect()  # Never .start(): it can implicitly initiate authorization.
         if mode == "login-qr":
@@ -508,35 +790,63 @@ async def run(config: Config, mode: str = "run") -> None:
         if mode == "login-phone":
             await login_phone(client)
             return
-        target = await authorize_check(client)
-        LOG.info("authorized_target_readable")
         if mode == "check":
+            await authorize_check(client)
+            LOG.info("authorized_target_readable")
             return
-        spool = Spool(config.data_dir / "spool.sqlite3", config.max_spool)
-        scanner = Scanner(config, spool, client, target)
-        dispatcher = Dispatcher(config, spool)
-        stop = asyncio.Event()
+        if not await client.is_user_authorized():
+            raise UnauthorizedError("Telegram session unauthorized; login must be explicit")
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
+        gate = PauseGate(config)
+        if gate.required:
+            control_task = asyncio.create_task(gate.watch(stop))
+        # No target dialogs/history RPCs while global observation is paused or unknown.
+        while not stop.is_set():
+            if control_task is not None and control_task.done():
+                control_task.result()
+                raise RuntimeError("control loop ended unexpectedly")
+            if not gate.allowed():
+                await wait_or_stop(stop, gate.wait_seconds())
+                continue
+            try:
+                target = await authorize_check(client, pause_gate=gate)
+                break
+            except CollectorPaused:
+                await wait_or_stop(stop, gate.wait_seconds())
+        else:
+            return
+        LOG.info("authorized_target_readable")
+        spool = Spool(config.data_dir / "spool.sqlite3", config.max_spool)
+        scanner = Scanner(config, spool, client, target, pause_gate=gate)
+        dispatcher = Dispatcher(config, spool, pause_gate=gate)
         client.add_event_handler(scanner.on_new_message, events.NewMessage(chats=target))
 
         async def source_loop():
             while not stop.is_set():
                 scanner.wake.clear()
+                if not gate.allowed():
+                    await wait_or_stop(stop, gate.wait_seconds())
+                    continue
                 await scanner.scan()
+                if not gate.allowed():
+                    await wait_or_stop(stop, gate.wait_seconds())
+                    continue
                 try:
                     await asyncio.wait_for(scanner.wake.wait(), timeout=config.poll_seconds)
                 except asyncio.TimeoutError:
                     pass
                 # Coalesce message bursts and keep source CPU/RPC load bounded.
-                await asyncio.sleep(1)
+                await wait_or_stop(stop, 1)
 
         async def send_loop():
             while not stop.is_set():
-                await asyncio.sleep(await dispatcher.step())
+                await wait_or_stop(stop, await dispatcher.step())
 
         tasks = [asyncio.create_task(source_loop()), asyncio.create_task(send_loop())]
+        if control_task is not None:
+            tasks.append(control_task)
         stop_task = asyncio.create_task(stop.wait())
         try:
             done, _ = await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
@@ -549,6 +859,10 @@ async def run(config: Config, mode: str = "run") -> None:
                 task.cancel()
             await asyncio.gather(*tasks, stop_task, return_exceptions=True)
     finally:
+        stop.set()
+        if control_task is not None:
+            control_task.cancel()
+            await asyncio.gather(control_task, return_exceptions=True)
         await client.disconnect()
         private_file(config.session_path)
         if spool:

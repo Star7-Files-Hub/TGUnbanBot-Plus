@@ -1,7 +1,7 @@
 """Pure stdlib tests with synthetic Telegram and HTTP clients; never contact a service."""
 import asyncio
 import contextlib
-from io import StringIO
+from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
@@ -12,8 +12,9 @@ from unittest.mock import patch
 from urllib import error
 
 from collector import (
-    Config, ConfigError, Dispatcher, MAX_SPOOL, Scanner, Spool, SpoolFull,
-    TARGET_CHAT_ID, TargetUnavailableError, UnauthorizedError,
+    Config, ConfigError, Dispatcher, MAX_SPOOL, MAX_RESPONSE_BYTES, Scanner, Spool, SpoolFull,
+    TARGET_CHAT_ID, TargetUnavailableError, UnauthorizedError, CollectorPaused,
+    PauseGate, fetch_control_status, read_json_bounded, InvalidResponse,
     authorize_check, message_payload, retry_delay, send_http, run,
 )
 
@@ -52,6 +53,21 @@ class ConfigTests(unittest.TestCase):
         c = Config({"TG_API_ID": "123", "TG_API_HASH": "b" * 32}, require_ingest=False)
         self.assertEqual(str(c.data_dir), "/var/lib/tg-sample-collector")
 
+    def test_pool_config_derives_same_origin_status_without_new_login(self):
+        env = environment(Path("/tmp/private-collector"))
+        env["OBSERVE_INGEST_URL"] = "https://controller.invalid:8443/api/ingest"
+        c = Config(env)
+        self.assertTrue(c.pool_mode)
+        self.assertEqual(c.control_status_url, "https://controller.invalid:8443/api/collector/status")
+        self.assertEqual(c.session_path.name, "telegram.session")
+        self.assertEqual(c.token, env["OBSERVE_INGEST_TOKEN"])
+        # An arbitrary status origin in the environment cannot send the collector token elsewhere.
+        env["CONTROL_STATUS_URL"] = "https://untrusted.invalid/status"
+        self.assertEqual(Config(env).control_status_url, c.control_status_url)
+        old = Config(environment(Path("/tmp/private-collector")))
+        self.assertFalse(old.pool_mode)
+        self.assertEqual(old.control_status_url, "")
+
     def test_missing_bad_or_excessive_config_is_rejected_without_leaks(self):
         for key, value in [("TG_API_ID", ""), ("TG_API_HASH", "bad"),
                            ("COLLECTOR_PER_MINUTE", "21"), ("COLLECTOR_MAX_SPOOL", "1001"),
@@ -62,9 +78,11 @@ class ConfigTests(unittest.TestCase):
                 Config(env)
 
     def test_endpoint_no_cleartext_embedded_credentials_redirect_target_or_query(self):
-        for url in ["http://receiver.invalid/api/observe/ingest",
+        for url in ["http://receiver.invalid/api/observe/ingest", "http://receiver.invalid/api/ingest",
                     "https://x:password@receiver.invalid/api/observe/ingest",
-                    "https://receiver.invalid/other", "https://receiver.invalid/api/observe/ingest?key=bad"]:
+                    "https://receiver.invalid/other", "https://receiver.invalid/api/observe/ingest?key=bad",
+                    "https://receiver.invalid/api/ingest?token=bad", "https://receiver.invalid/api/ingest/",
+                    "https://receiver.invalid/api/ingest#fragment", "https://receiver.invalid:bad/api/ingest"]:
             env = environment(Path("/tmp/private-collector"))
             env["OBSERVE_INGEST_URL"] = url
             with self.subTest(url=url), self.assertRaises(ConfigError):
@@ -341,35 +359,397 @@ class SourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.spool.count(), 0)
 
 
+class FakePauseGate:
+    def __init__(self, allowed=False):
+        self.is_allowed = allowed
+        self.pauses = []
+    def allowed(self): return self.is_allowed
+    def wait_seconds(self): return 60.0
+    def pause(self, seconds=60, *, category="paused"):
+        self.pauses.append((seconds, category))
+        self.is_allowed = False
+
+
+def pool_config(directory):
+    env = environment(directory)
+    env["OBSERVE_INGEST_URL"] = "https://controller.invalid/api/ingest"
+    return Config(env)
+
+
+class PauseTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.config = pool_config(Path(self.temp.name) / "private")
+        self.spool = Spool(self.config.data_dir / "spool.sqlite3")
+        self.now = 1000.0
+        self.gate = PauseGate(self.config, clock=lambda: self.now)
+
+    async def asyncTearDown(self):
+        self.spool.close()
+        self.temp.cleanup()
+
+    def status(self, **changes):
+        return {"ok": True, "observe_allowed": True, "reason": "quota_available",
+                "checked_at": self.now * 1000, "retry_after": 60, **changes}
+
+    async def test_pool_unknown_or_stale_snapshot_fails_closed(self):
+        self.assertFalse(self.gate.allowed())
+        self.gate.update(self.status())
+        self.assertTrue(self.gate.allowed())
+        self.now += 60
+        self.assertFalse(self.gate.allowed(), "cached allow must expire at 60 seconds")
+        for status in [self.status(checked_at=(self.now - 301) * 1000),
+                       self.status(checked_at=(self.now + 6) * 1000),
+                       self.status(checked_at=0), self.status(checked_at="1000000"),
+                       self.status(observe_allowed="true"), self.status(ok=1),
+                       self.status(retry_after=float("nan")), self.status(retry_after=-1),
+                       self.status(reason=None), {}, None]:
+            with self.subTest(status=status):
+                self.gate.update(status)
+                self.assertFalse(self.gate.allowed())
+
+    async def test_paused_sender_and_scanner_make_no_request_and_keep_cursor_queue(self):
+        self.spool.record(payload(1), 1)
+        before = self.spool.next_item()
+        gate = FakePauseGate(False)
+        called = []
+        def http(*_): called.append("ingest"); return True, "accepted", None
+        client = FakeClient([message(2)])
+        scanner = Scanner(self.config, self.spool, client, client.target, pause_gate=gate)
+        sender = Dispatcher(self.config, self.spool, transport=http, pause_gate=gate)
+        self.assertEqual(await scanner.scan(), 0)
+        self.assertEqual(await sender.step(), 60)
+        await scanner.on_new_message(types.SimpleNamespace(chat_id=TARGET_CHAT_ID))
+        self.assertFalse(scanner.wake.is_set())
+        self.assertEqual(called, [])
+        self.assertEqual(client.kwargs, [])
+        self.assertEqual(self.spool.cursor(), 1)
+        self.assertEqual(self.spool.next_item(), before)
+        # Resume from the very same cursor and spool; no session replacement is needed.
+        gate.is_allowed = True
+        self.assertEqual(await scanner.scan(), 1)
+        await sender.step()
+        self.assertEqual(called, ["ingest"])
+        self.assertEqual(self.spool.cursor(), 2)
+        self.assertEqual(self.spool.next_item()[1], 2)
+
+    async def test_live_only_baseline_does_not_advance_while_paused(self):
+        gate = FakePauseGate(False)
+        self.config.history = 0
+        class Client(FakeClient):
+            async def get_messages(self, *args, **kwargs):
+                raise AssertionError("paused baseline must not read Telegram")
+        client = Client([message(20)])
+        scanner = Scanner(self.config, self.spool, client, client.target, pause_gate=gate)
+        await scanner.scan()
+        self.assertIsNone(self.spool.cursor())
+        self.assertEqual(self.spool.count(), 0)
+
+    async def test_pause_mid_sender_lookup_never_advances_cursor(self):
+        gate = FakePauseGate(True)
+        msg = message(1)
+        async def sender():
+            gate.is_allowed = False
+            return types.SimpleNamespace(id=123, first_name="User")
+        msg.get_sender = sender
+        client = FakeClient([msg])
+        scanner = Scanner(self.config, self.spool, client, client.target, pause_gate=gate)
+        await scanner.scan()
+        self.assertIsNone(self.spool.cursor())
+        self.assertEqual(self.spool.count(), 0)
+
+    async def test_global_pause_from_ingest_stops_both_paths_and_keeps_head(self):
+        self.gate.update(self.status())
+        self.spool.record(payload(1), 1)
+        calls = []
+        def http(*_): calls.append("ingest"); return False, "controller_paused", "60"
+        sender = Dispatcher(self.config, self.spool, transport=http, clock=lambda: self.now,
+                            pause_gate=self.gate)
+        client = FakeClient([message(2)])
+        scanner = Scanner(self.config, self.spool, client, client.target, pause_gate=self.gate)
+        self.assertEqual(await sender.step(), 60)
+        self.assertFalse(self.gate.allowed())
+        await scanner.scan()
+        await sender.step()
+        self.assertEqual(calls, ["ingest"])
+        self.assertEqual(client.kwargs, [])
+        self.assertEqual(self.spool.cursor(), 1)
+        self.assertEqual(self.spool.count(), 1)
+        self.assertEqual(self.spool.next_item()[4], self.now + 60)
+
+    async def test_untrusted_fetch_failure_and_denied_status_keep_unknown_paused(self):
+        calls = []
+        def fetcher(*_): calls.append(1); return None
+        self.assertEqual(await self.gate.refresh(fetcher), 60)
+        self.assertFalse(self.gate.allowed())
+        for _ in range(3):
+            await self.gate.refresh(fetcher)
+        self.assertEqual(len(calls), 1, "unknown status must not busy-loop")
+        self.now += 60
+        await self.gate.refresh(lambda *_: self.status(observe_allowed=False, reason="all_accounts_paused"))
+        self.assertFalse(self.gate.allowed())
+        self.assertEqual(self.gate.reason, "paused")
+        self.assertEqual(self.gate.wait_seconds(), 60)
+
+    async def test_status_refresh_concurrency_fetches_once_for_scanner_and_sender(self):
+        calls = []
+        def fetcher(*_): calls.append(1); return self.status()
+        await asyncio.gather(self.gate.refresh(fetcher), self.gate.refresh(fetcher))
+        self.assertEqual(calls, [1])
+        self.assertTrue(self.gate.allowed())
+        self.assertEqual(await self.gate.refresh(fetcher), 60)
+        self.assertEqual(calls, [1])
+        self.now += 59
+        await self.gate.refresh(fetcher)
+        self.assertEqual(calls, [1])
+        self.now += 1
+        await self.gate.refresh(fetcher)
+        self.assertEqual(calls, [1, 1])
+
+    async def test_control_watch_has_one_fetch_loop_and_stops_cleanly(self):
+        calls = []
+        def fetcher(*_): calls.append(1); return self.status(observe_allowed=False)
+        stop = asyncio.Event()
+        task = asyncio.create_task(self.gate.watch(stop, fetcher))
+        for _ in range(20):
+            if calls: break
+            await asyncio.sleep(0)
+        stop.set()
+        await asyncio.wait_for(task, 1)
+        self.assertEqual(calls, [1])
+        self.assertFalse(self.gate.allowed())
+
+    async def test_unknown_and_paused_default_pool_paths_have_no_implicit_status_fetch(self):
+        client = FakeClient([message(2)])
+        self.spool.record(payload(1), 1)
+        scanner = Scanner(self.config, self.spool, client, client.target)
+        sender = Dispatcher(self.config, self.spool, transport=lambda *_: self.fail("no ingestion"))
+        with patch("collector.fetch_control_status", side_effect=AssertionError("data paths must not fetch status")):
+            await scanner.scan()
+            self.assertGreaterEqual(await sender.step(), 3)
+        self.assertEqual(client.kwargs, [])
+        self.assertEqual(self.spool.cursor(), 1)
+
+    async def test_initial_target_lookup_is_blocked_while_control_is_paused(self):
+        client = FakeClient()
+        with self.assertRaises(CollectorPaused):
+            await authorize_check(client, resolver=lambda e: e.id, pause_gate=self.gate)
+        self.assertEqual(client.kwargs, [])
+
+    async def test_paused_runtime_stays_alive_without_target_scan_and_exits_on_stop(self):
+        class Client:
+            disconnected = False
+            async def connect(self): pass
+            async def disconnect(self): self.disconnected = True
+            async def is_user_authorized(self): return True
+            async def iter_dialogs(self):
+                raise AssertionError("paused runtime must not fetch Telegram dialogs")
+                yield
+            async def get_messages(self, *_args, **_kwargs):
+                raise AssertionError("paused runtime must not fetch Telegram history")
+            def add_event_handler(self, *_args):
+                raise AssertionError("no target setup while paused")
+        client = Client()
+        fake = types.ModuleType("telethon")
+        fake.TelegramClient = lambda *_args, **_kwargs: client
+        fake.events = types.SimpleNamespace()
+        ready = asyncio.Event()
+        holder = {}
+        async def watcher(gate, stop, fetcher=None):
+            gate.update({"ok": True, "observe_allowed": False, "reason": "all_accounts_paused",
+                         "checked_at": gate.clock() * 1000, "retry_after": 60})
+            holder["stop"] = stop
+            ready.set()
+            await stop.wait()
+        with patch.dict("sys.modules", {"telethon": fake}), patch.object(PauseGate, "watch", watcher):
+            task = asyncio.create_task(run(self.config))
+            await asyncio.wait_for(ready.wait(), 1)
+            self.assertFalse(task.done(), "paused runtime should stay alive")
+            holder["stop"].set()
+            await asyncio.wait_for(task, 1)
+        self.assertTrue(client.disconnected)
+
+    async def test_html200_never_removes_a_pending_spool_item(self):
+        self.gate.update(self.status())
+        self.spool.record(payload(1), 1)
+        response = FakeResponse(b"<html>not a controller receipt</html>")
+        class Opener:
+            def open(self, *_args, **_kwargs): return response
+        sender = Dispatcher(self.config, self.spool, clock=lambda: self.now, pause_gate=self.gate)
+        with patch("collector.request.build_opener", return_value=Opener()):
+            await sender.step()
+        self.assertEqual(self.spool.count(), 1)
+        self.assertEqual(self.spool.cursor(), 1)
+        self.assertEqual(self.spool.next_item()[3], 1)
+        self.assertEqual(self.spool.next_item()[4], self.now + 5)
+
+    async def test_ingest_pause_hold_cannot_be_cancelled_by_a_later_allowed_status(self):
+        self.gate.update(self.status())
+        self.gate.pause(120)
+        self.now += 60
+        await self.gate.refresh(lambda *_: self.status())
+        self.assertFalse(self.gate.allowed())
+        self.now += 60
+        await self.gate.refresh(lambda *_: self.status())
+        self.assertTrue(self.gate.allowed())
+
+
+class FakeResponse:
+    def __init__(self, body, status=200, headers=None):
+        self.status = status
+        self.headers = headers or {}
+        self.stream = BytesIO(body if isinstance(body, bytes) else json.dumps(body).encode())
+        self.read_sizes = []
+        self.closed = False
+    def __enter__(self): return self
+    def __exit__(self, *_): self.close()
+    def read(self, size):
+        if size < 0:
+            raise AssertionError("unbounded body read prohibited")
+        self.read_sizes.append(size)
+        return self.stream.read(size)
+    def close(self): self.closed = True
+
+
 class HttpTests(unittest.TestCase):
-    def test_post_bearer_timeout20_and_does_not_read_response(self):
-        class Response:
-            status = 200
-            headers = {}
-            def __enter__(self): return self
-            def __exit__(self, *_): pass
-            def read(self): raise AssertionError("response not needed")
+    def send_fake(self, body, *, path="/api/ingest", status=200, headers=None, as_error=False):
+        response = FakeResponse(body, status, headers)
         class Opener:
             def open(self, req, timeout):
                 self.req, self.timeout = req, timeout
-                return Response()
+                if as_error:
+                    raise error.HTTPError(req.full_url, status, "private reply", response.headers, response)
+                return response
         opener = Opener()
         with patch("collector.request.build_opener", return_value=opener):
-            self.assertEqual(send_http("https://receiver.invalid/api/observe/ingest", "test-token", "{}"),
-                             (True, "accepted", None))
+            result = send_http("https://receiver.invalid" + path, "test-token", "{}")
+        return result, response, opener
+
+    def test_post_bearer_timeout20_and_reads_only_bounded_receipt(self):
+        result, response, opener = self.send_fake({"ok": True, "accepted": True, "event_id": "evt-123"})
+        self.assertEqual(result, (True, "accepted", None))
+        self.assertTrue(response.read_sizes)
+        self.assertTrue(all(0 < n <= 8192 for n in response.read_sizes))
+        self.assertTrue(response.closed)
         self.assertEqual(opener.timeout, 20)
         self.assertEqual(opener.req.method, "POST")
         self.assertEqual(opener.req.get_header("Authorization"), "Bearer test-token")
         self.assertEqual(opener.req.get_header("User-agent"), "tg-sample-collector/1.0")
         self.assertEqual(opener.req.get_header("Content-type"), "application/json")
+        self.assertEqual(opener.req.get_header("Accept"), "application/json")
 
-    def test_http_error_does_not_leak_body_or_url(self):
+    def test_pool_acceptance_is_strict_and_html200_is_not_accepted(self):
+        bodies = [b"<html>private gateway page</html>", b"", [], {},
+                  {"ok": True}, {"ok": True, "status": "observe"},
+                  {"ok": True, "accepted": False, "event_id": "evt"},
+                  {"ok": 1, "accepted": True, "event_id": "evt"},
+                  {"ok": True, "accepted": 1, "event_id": "evt"},
+                  {"ok": True, "accepted": True, "event_id": ""},
+                  {"ok": True, "accepted": True, "event_id": "   "},
+                  {"ok": True, "accepted": True, "event_id": 123},
+                  {"ok": True, "accepted": True, "event_id": "x" * 513},
+                  b'{"ok":true,"ok":false,"accepted":true,"event_id":"evt"}',
+                  b'{"ok":true,"accepted":true,"event_id":"evt","n":NaN}']
+        for body in bodies:
+            with self.subTest(body=body):
+                result, _, _ = self.send_fake(body)
+                self.assertFalse(result[0])
+                self.assertEqual(result[1], "invalid_receipt")
+
+    def test_legacy_receipts_only_work_on_exact_legacy_path(self):
+        for status in ("observe", "pass", "duplicate", "command"):
+            with self.subTest(status=status):
+                body = {"ok": True, "status": status}
+                self.assertTrue(self.send_fake(body, path="/api/observe/ingest")[0][0])
+                self.assertFalse(self.send_fake(body, path="/api/ingest")[0][0])
+        for body in ({"ok": True, "status": "other"}, {"ok": 1, "status": "pass"},
+                     {"ok": True, "status": "pass", "accepted": False}):
+            self.assertFalse(self.send_fake(body, path="/api/observe/ingest")[0][0])
+
+    def test_receipt_size_limit_and_declared_oversize_prevent_unbounded_read(self):
+        large = {"ok": True, "accepted": True, "event_id": "evt", "padding": "x" * MAX_RESPONSE_BYTES}
+        result, response, _ = self.send_fake(large)
+        self.assertEqual(result[1], "invalid_receipt")
+        self.assertEqual(sum(response.read_sizes), MAX_RESPONSE_BYTES + 1)
+        result, response, _ = self.send_fake({"ok": True}, headers={"Content-Length": str(MAX_RESPONSE_BYTES + 1)})
+        self.assertEqual(result[1], "invalid_receipt")
+        self.assertEqual(response.read_sizes, [])
+        # The boundary itself is allowed when it contains a complete object and padding whitespace.
+        raw = b'{"ok":true,"accepted":true,"event_id":"evt"}'
+        self.assertTrue(self.send_fake(raw + b" " * (MAX_RESPONSE_BYTES - len(raw)))[0][0])
+
+    def test_429_and_503_paused_json_keep_retry_after_and_never_accept(self):
+        for status in (429, 503):
+            for as_error in (False, True):
+                with self.subTest(status=status, as_error=as_error):
+                    result, response, _ = self.send_fake({"ok": False, "paused": True, "retryAfter": 120},
+                        status=status, headers={"Retry-After": "30"}, as_error=as_error)
+                    self.assertEqual(result, (False, "controller_paused", "120"))
+                    self.assertTrue(response.closed)
+        result, _, _ = self.send_fake({"paused": True, "retryAfter": "unknown"}, status=503,
+                                      headers={"Retry-After": "45"})
+        self.assertEqual(result, (False, "controller_paused", "45"))
+        contradictory = {"ok": True, "accepted": True, "event_id": "evt", "paused": True, "retryAfter": 60}
+        self.assertEqual(self.send_fake(contradictory)[0], (False, "controller_paused", "60"))
+
+    def test_http_error_does_not_leak_body_url_or_original_exception(self):
+        for status in (301, 401, 403, 429, 503):
+            with self.subTest(status=status):
+                capture = StringIO()
+                with contextlib.redirect_stdout(capture), contextlib.redirect_stderr(capture):
+                    result, _, _ = self.send_fake(b"PRIVATE-RESPONSE", status=status,
+                                                  headers={"Retry-After": "30"}, as_error=True)
+                self.assertFalse(result[0])
+                self.assertEqual(result[2], "30")
+                self.assertEqual(capture.getvalue(), "")
+
+    def test_redirect_handler_refuses_following(self):
         class Opener:
             def open(self, *_args, **_kwargs):
-                raise error.HTTPError("https://secret.invalid/token", 429, "private reply", {"Retry-After": "30"}, None)
+                raise error.HTTPError("https://receiver.invalid/api/ingest", 302, "private", {}, None)
+        with patch("collector.request.build_opener", return_value=Opener()) as build:
+            self.assertFalse(send_http("https://receiver.invalid/api/ingest", "token", "{}")[0])
+        handler = build.call_args.args[0]
+        self.assertIsNone(handler.redirect_request(None, None, 302, "", {}, "https://other.invalid"))
+
+    def test_transport_failure_returns_only_fixed_category(self):
+        class Opener:
+            def open(self, *_args, **_kwargs):
+                raise error.URLError("SECRET-TOKEN-OR-MESSAGE")
         with patch("collector.request.build_opener", return_value=Opener()):
-            self.assertEqual(send_http("https://receiver.invalid/api/observe/ingest", "secret", "private text"),
-                             (False, "http_rate_limited", "30"))
+            self.assertEqual(send_http("https://receiver.invalid/api/ingest", "secret", "private"),
+                             (False, "transport_error", None))
+
+    def test_control_status_request_is_get_bearer_bounded_and_same_protocol(self):
+        body = {"ok": True, "observe_allowed": False, "reason": "all_accounts_paused",
+                "checked_at": 1000000, "retry_after": 60}
+        response = FakeResponse(body)
+        class Opener:
+            def open(self, req, timeout):
+                self.req, self.timeout = req, timeout
+                return response
+        opener = Opener()
+        with patch("collector.request.build_opener", return_value=opener):
+            result = fetch_control_status("https://controller.invalid/api/collector/status", "collector-token")
+        self.assertEqual(result, body)
+        self.assertEqual(opener.req.method, "GET")
+        self.assertEqual(opener.req.get_header("Authorization"), "Bearer collector-token")
+        self.assertEqual(opener.timeout, 20)
+        self.assertTrue(response.closed)
+        self.assertTrue(response.read_sizes)
+
+    def test_control_status_bad_html_unauthorized_and_oversized_are_unknown(self):
+        for status, body in [(200, b"<html>SECRET</html>"), (401, b"SECRET"), (403, b"SECRET"),
+                             (503, b"SECRET"), (200, b"x" * (MAX_RESPONSE_BYTES + 1))]:
+            response = FakeResponse(body, status)
+            class Opener:
+                def open(self, *_args, **_kwargs):
+                    if status != 200:
+                        raise error.HTTPError("https://private.invalid", status, "PRIVATE", {}, response)
+                    return response
+            with self.subTest(status=status), patch("collector.request.build_opener", return_value=Opener()):
+                self.assertIsNone(fetch_control_status("https://controller.invalid/api/collector/status", "secret"))
+                self.assertTrue(response.closed)
 
     def test_backoff_is_bounded_without_retry_header(self):
         self.assertEqual(retry_delay(0), 5)

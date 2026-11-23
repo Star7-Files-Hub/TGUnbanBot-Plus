@@ -1,0 +1,19 @@
+name = "tg-observe-node"
+account_id = "acc2d30ff4bf9c73b2c00c8bc4942ff2"
+main = "node-worker.js"
+compatibility_date = "2026-11-01"
+keep_vars = true
+workers_dev = true
+preview_urls = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "tg-observe-dictionary"
+database_id = "e1b6fc3e-cc9f-4b10-98e2-09c648df9709"
+
+[ai]
+binding = "AI"
+
+# NODE_TOKEN is an independent runtime secret; never put it in this file.
+[observability]
+enabled = true

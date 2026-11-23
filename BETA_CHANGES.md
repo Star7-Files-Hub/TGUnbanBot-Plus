@@ -84,6 +84,17 @@
 - 匿名管理员消息不进入自动广告检测，也不写入普通成员消息台账，避免被误判或误清扫。
 - 复核通知和操作记录中的操作人显示为 `anonymous_admin:<群ID>`，不会显示匿名机器人 ID。
 
+## Cloudflare 多账号观察池
+
+- 后台 `tg-observe-manager` 部署在 Cloudflare `workers.dev`，没有自定义域名或 VPS 后台。中央复核状态与监测数据在独立 SQLite Durable Object，不再逐消息写 Beta 的观察报告/去重 D1 表。
+- CF77 与 7Star 各新增 `tg-observe-node` 和专用字典 D1，一次同步一个版本快照；节点只做分类，无 Bot Token，不直接发通知或处罚。热缓存匹配不访问 D1，冷缓存仅读取快照一行。
+- 账户级 D1 用量由 GraphQL 按 UTC 当日全账户汇总，每分钟刷新；读量或写量任一达到 80% 时停用该观察节点。统计未知/过期、版本不同、节点冷却也不派发；所有节点不可用则暂停观察扫描及派发，保留 VPS 队列与游标。
+- 后台支持负载均衡/顺序故障转移、单账号启停、刷新用量、同步字典、手动暂停/恢复。登录使用独立密码、签名 HttpOnly/Secure Cookie 和同源操作检查，不向浏览器下发账户 Token。
+- 已有指纹或语义命中静默跳过；语义计数集中在观察池并低频批量同步 Beta。新复核按钮用全局 `op:` ID，旧 `o:` 按钮从原 Beta 记录只读迁移为中央复核，服从同一源账号额度守门；确认后由 Beta 单写黑名单、样本并执行主群/授权群封禁，当前白名单与主人身份优先保护。
+- 当前使用免费档保护上限（每天 500 万行读 / 10 万行写），80% 对应 400 万读 / 8 万写。Analytics 有延迟，节点本地计量采取保守余量，不能保证绝不超额。正常群管理仍可能独立消耗 CF77 额度；源账号额度不足时确认结果保留“待同步”，不会虚报成功。
+- Durable Object 也有自身免费额度；队列有界、已处理事件按 TTL 清理。通知发送结果不确定时不自动重发，后台可查看并放弃待核查记录，不做处罚。
+- 后台入口为 `https://tg-observe-manager.7star-acc.workers.dev/`。Nodes 与后台均新建专用服务，不覆盖原有 7Star Workers；CF77 无需取得任何自定义域名权限。调用方使用 Workers 支持的 `redirect: 'manual'` 并拒绝所有非 2xx，避免凭证随重定向传播。
+
 ## 公开只读 API
 
 - `GET /api/fingerprints`：公开指纹库（type、value、status、命中次数等），不含已停用词、规范化值、确认人 ID 或样本正文。
@@ -123,7 +134,8 @@ Analytics 存在统计延迟和自适应采样，9,000 是缓冲阈值，**不�
 ```bash
 node --check _worker.js
 node test_beta.mjs
-node --test test_ad_report.mjs test_flash_receipts.mjs test_ai_fallback.mjs test_precision_learning.mjs test_join_profile.mjs
+node --test test_ad_report.mjs test_flash_receipts.mjs test_ai_fallback.mjs test_precision_learning.mjs test_join_profile.mjs test_pool_beta.mjs pool/test_node.mjs pool/test_controller.mjs pool/test_quota_auth.mjs pool/test_admin_page.mjs
+python3 -m unittest discover -s collector -p 'test_*.py'
 ```
 
 新增回归覆盖 AI 输出解析、错误反馈、仅主人通知、普通成员 `/ad`、8 秒定时生命周期和私聊保留。测试不访问真实 Telegram/Cloudflare，也不处罚真实用户。

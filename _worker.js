@@ -1697,7 +1697,7 @@ async function refreshClassifierQuotaState(env) {
 		// This credential is used only for this account-scoped read query. No model
 		// filter: the budget covers all Workers AI calls in the Cloudflare account.
 		const response = await fetch('https://api.cloudflare.com/client/v4/graphql', {
-			method: 'POST', redirect: 'error', signal: controller.signal,
+			method: 'POST', redirect: 'manual', signal: controller.signal,
 			headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
 			body: JSON.stringify({
 				query: 'query($accountTag:string!,$start:Time!,$end:Time!){viewer{accounts(filter:{accountTag:$accountTag}){aiInferenceAdaptiveGroups(limit:1,filter:{datetime_geq:$start,datetime_lt:$end}){count sum{totalNeurons}}}}}',
@@ -1776,7 +1776,7 @@ async function runBackupReviewedTask(env, messages, parser, maxTokens, config = 
 	const timer = setTimeout(() => controller.abort(), 12000);
 	try {
 		const response = await fetch(config.url, {
-			method: 'POST', redirect: 'error', signal: controller.signal,
+			method: 'POST', redirect: 'manual', signal: controller.signal,
 			headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + config.token },
 			body: JSON.stringify({ model: String(env.AI_FALLBACK_MODEL || '').trim() || 'DeepSeek-V4.1-Flash', messages, max_tokens: Math.max(1024, maxTokens), temperature: 0, stream: false })
 		});
@@ -2142,6 +2142,10 @@ async function handleObserveReview(env, callback, config, action, reportId) {
 		const report = await env.DB.prepare('SELECT user_id, body_text, status FROM ad_observe_reports WHERE id = ?').bind(reportId).first();
 		if (!report) return answer('记录不存在', true);
 		if (report.status !== 'open') return answer(report.status === 'processing' ? '正在处理，请稍候' : '该记录已处理', true);
+		// 旧通知可能在白名单/主人权限改变前发出；本地确认也必须检查实时豁免。
+		if (action === 'save' && await poolProtectedUser(env, String(report.user_id))) {
+			return answer('该用户为主人或白名单用户，未保存样本或处罚', true);
+		}
 		const nextStatus = action === 'save' ? 'processing' : 'dismissed';
 		const update = await env.DB.prepare("UPDATE ad_observe_reports SET status = ? WHERE id = ? AND status = 'open'").bind(nextStatus, reportId).run();
 		if (update?.success === false) throw new Error('observe_report_write_failed');
@@ -2272,8 +2276,22 @@ async function handleCallback(env, callback) {
 // 15. 入口
 // =============================================================================
 async function handleUpdate(env, update, ctx) {
+	// 旧观察通知也先经中央额度/状态检查，不能绕过已启用的观察池。
+	if (env.POOL_CONTROL_URL && update?.callback_query && /^o:/.test(String(update.callback_query.data || ''))) {
+		await forwardPoolLegacyReview(env, update.callback_query);
+		return;
+	}
+	// 观察池自己验证操作者与中央复核状态，转发不先触碰 Beta D1。
+	if (update?.callback_query && /^op:/.test(String(update.callback_query.data || ''))) {
+		await forwardPoolReview(env, update.callback_query);
+		return;
+	}
 	if (update?.message) {
 		const message = update.message;
+		if (env.POOL_CONTROL_URL && ['group', 'supergroup'].includes(message.chat?.type) && await isObserveGroup(env, message.chat.id)) {
+			await forwardPoolObserve(env, message);
+			return;
+		}
 		const text = String(message.text || message.caption || '').trim();
 		const isCommand = COMMAND_RE.test(text);
 		if (isCommand) {
@@ -2552,6 +2570,337 @@ function serveApiDocs() {
 	return new Response(DOCS_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
+// 观察池控制 API：独立 Bearer secret，认证/验证失败不访问 D1 或 Telegram。
+class PoolApiError extends Error {
+	constructor(status, code) { super(code); this.status = status; this.code = code; }
+}
+const poolRecord = value => value && typeof value === 'object' && !Array.isArray(value);
+const poolUserId = value => typeof value === 'string' && /^[1-9]\d{0,15}$/.test(value);
+function poolJson(status, value) {
+	return Response.json(value, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' } });
+}
+function poolAuthenticated(request, env) {
+	const token = String(env.POOL_CONTROL_TOKEN || '');
+	if (!token) throw new PoolApiError(503, 'pool_control_disabled');
+	const actual = request.headers.get('Authorization') || '', expected = 'Bearer ' + token;
+	let difference = actual.length ^ expected.length;
+	for (let i = 0; i < expected.length; i++) difference |= (actual.charCodeAt(i) || 0) ^ expected.charCodeAt(i);
+	if (difference) throw new PoolApiError(401, 'unauthorized');
+}
+async function poolReadJson(request, maximum = 16384) {
+	const reader = request.body?.getReader();
+	if (!reader) throw new PoolApiError(400, 'invalid_json');
+	const chunks = []; let size = 0;
+	try {
+		for (;;) {
+			const { value, done } = await reader.read(); if (done) break;
+			size += value.byteLength;
+			if (size > maximum) { await reader.cancel(); throw new PoolApiError(413, 'payload_too_large'); }
+			chunks.push(value);
+		}
+		const bytes = new Uint8Array(size); let offset = 0;
+		for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+		return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+	} catch (error) {
+		if (error instanceof PoolApiError) throw error;
+		throw new PoolApiError(400, 'invalid_json');
+	} finally { reader.releaseLock(); }
+}
+function poolValidVector(value) {
+	if (!Array.isArray(value) || !value.length || value.length > 4096) return false;
+	let square = 0;
+	for (const component of value) {
+		if (typeof component !== 'number' || !Number.isFinite(component) || Math.abs(component) > 1e6) return false;
+		square += component * component;
+	}
+	return Number.isFinite(square) && square > 0;
+}
+function poolParsedVector(value) {
+	try { const vector = typeof value === 'string' ? JSON.parse(value) : value; return poolValidVector(vector) ? vector : null; }
+	catch (_) { return null; }
+}
+async function servePoolDictionary(env) {
+	if (!env.DB) throw new PoolApiError(503, 'dictionary_unavailable');
+	await adDetectionReady(env);
+	// D1.batch runs these reads in one transaction, so every table belongs to the
+	// same dictionary snapshot rather than mixing pre/post-approval revisions.
+	const queries = [
+		["SELECT id, type, value, norm_value, status, source FROM ad_fingerprints ORDER BY id LIMIT ?", 5000],
+		['SELECT id, norm_hash, sample_text, kind, embedding FROM ad_samples ORDER BY id LIMIT ?', 5000],
+		['SELECT user_id FROM ad_user_whitelist ORDER BY user_id LIMIT ?', 10000],
+		['SELECT user_id FROM ad_owners ORDER BY user_id LIMIT ?', 10000],
+		['SELECT dimension, value FROM ad_allowlist ORDER BY dimension, value LIMIT ?', 10000],
+		['SELECT chat_id FROM ad_observe_groups ORDER BY chat_id LIMIT ?', 1000]
+	];
+	const reads = await env.DB.batch(queries.map(([sql, cap]) => env.DB.prepare(sql).bind(cap + 1)));
+	const rows = reads.map((result, index) => {
+		if (result?.success === false || !Array.isArray(result?.results)) throw new PoolApiError(503, 'dictionary_unavailable');
+		if (result.results.length > queries[index][1]) throw new PoolApiError(413, 'dictionary_capacity_exceeded');
+		return result.results;
+	});
+	const [fingerprintRows, rawSamples, whitelistRows, ownerRows, allowlist, observeRows] = rows;
+	// Bound total scanned rows before filtering retired entries, so retirement
+	// history cannot turn a small active dictionary into an unbounded read.
+	const fingerprints = fingerprintRows.filter(row => row.status !== 'retired');
+	const samples = [];
+	for (const row of rawSamples) {
+		// pool-specific keys isolate source kinds in the existing UNIQUE(norm_hash) schema.
+		const hash = String(row.norm_hash || '').startsWith('pool:') ? await sha256Hex(normalizeAdText(row.sample_text)) : row.norm_hash;
+		samples.push({ id: row.id, norm_hash: hash, sample_text: row.sample_text, kind: row.kind || 'text', embedding: poolParsedVector(row.embedding)?.map(component => Math.round(component * 1e6) / 1e6) || null, count: 0 });
+	}
+	const whitelist = whitelistRows.map(row => String(row.user_id));
+	const owners = ownerRows.map(row => String(row.user_id));
+	const primary = String(env.OWNER_ID || (env.OWNER_IDS || '').split(/[,，]/)[0] || '').trim();
+	if (primary && !owners.includes(primary)) owners.push(primary);
+	if (owners.length > 10000) throw new PoolApiError(413, 'dictionary_capacity_exceeded');
+	owners.sort();
+	const observe_groups = observeRows.map(row => String(row.chat_id));
+	const body = JSON.stringify({ ok: true, data: { fingerprints, samples, whitelist, owners, allowlist }, observe_groups });
+	if (new TextEncoder().encode(body).byteLength > 1_700_000) throw new PoolApiError(413, 'dictionary_too_large');
+	return new Response(body, { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+const poolActionGuard = "id = ? AND json_extract(result, '$.lease') = ? AND status != 'done'";
+async function poolSaveProgress(env, id, lease, sample) {
+	const result = await env.DB.prepare(`UPDATE pool_action_receipts SET status='sample_done', result=json_set(result,'$.sample',json(?)), created_at=? WHERE ${poolActionGuard}`)
+		.bind(JSON.stringify(sample), nowSeconds(), id, lease).run();
+	if (result?.success === false) throw new PoolApiError(503, 'action_unavailable');
+	if (result?.meta?.changes !== 1) throw new PoolApiError(409, 'action_busy');
+	return sample;
+}
+async function poolSaveSampleOnce(env, id, lease, sample) {
+	const meaningful = normalizeAdText(stripMentionsAndLinks(toHalfWidth(sample.text).toLowerCase())).replace(/[^\p{L}\p{N}]/gu, '');
+	if (Array.from(meaningful).length < MIN_SAMPLE_LEN) return poolSaveProgress(env, id, lease, { ok: false, reason: 'empty_or_short' });
+	const normalized = normalizeAdText(sample.text), canonicalHash = await sha256Hex(normalized);
+	let hash = sample.kind === 'text' ? canonicalHash : 'pool:' + sample.kind + ':' + canonicalHash;
+	const now = nowSeconds();
+	let target = await env.DB.prepare("SELECT id, sample_text, variants FROM ad_samples WHERE norm_hash IN (?,?) AND COALESCE(kind,'text')=? ORDER BY id LIMIT 1")
+		.bind(hash, canonicalHash, sample.kind).first();
+	if (!target && sample.kind === 'text') {
+		const collision = await env.DB.prepare('SELECT kind FROM ad_samples WHERE norm_hash=?').bind(canonicalHash).first();
+		if (collision && String(collision.kind || 'text') !== 'text') {
+			hash = 'pool:text:' + canonicalHash;
+			target = await env.DB.prepare("SELECT id, sample_text, variants FROM ad_samples WHERE norm_hash=? AND COALESCE(kind,'text')='text'").bind(hash).first();
+		}
+	}
+	let tier = target ? 1 : 0, embedding = null;
+	const signature = keywordSignature(normalized, TRADE_VERBS, BUSINESS_KEYWORDS, WEAK_VERBS);
+	if (!target && signature) {
+		target = await env.DB.prepare("SELECT id, sample_text, variants FROM ad_samples WHERE signature=? AND COALESCE(kind,'text')=? ORDER BY updated_at DESC,id LIMIT 1").bind(signature, sample.kind).first();
+		if (target) tier = 2;
+	}
+	if (!target && env.AI) {
+		let timer;
+		try { embedding = poolParsedVector(await Promise.race([embedText(env, normalized), new Promise(resolve => { timer = setTimeout(() => resolve(null), 12000); })])); }
+		catch (_) { embedding = null; }
+		finally { clearTimeout(timer); }
+	}
+	if (!target && embedding) {
+		const config = await loadConfig(env);
+		const rows = await env.DB.prepare("SELECT id, sample_text, variants, embedding FROM ad_samples WHERE embedding IS NOT NULL AND COALESCE(kind,'text')=? ORDER BY updated_at DESC,id LIMIT ?").bind(sample.kind, MERGE_CANDIDATE_LIMIT).all();
+		let best = 0;
+		for (const row of rows.results || []) {
+			const similarity = cosineSimilarity(embedding, poolParsedVector(row.embedding));
+			if (similarity >= config.mergeSimilarity && similarity > best) { target = row; best = similarity; tier = 3; }
+		}
+	}
+	const guard = `EXISTS(SELECT 1 FROM pool_action_receipts WHERE ${poolActionGuard} AND status='processing' AND json_extract(result,'$.sample') IS NULL)`;
+	let mutation;
+	if (target) {
+		let variants = []; try { variants = JSON.parse(target.variants || '[]'); } catch (_) {}
+		if (!Array.isArray(variants)) variants = [];
+		if (tier !== 1 && !variants.includes(normalized)) variants.push(normalized.slice(0, 200));
+		mutation = env.DB.prepare(`UPDATE ad_samples SET count=COALESCE(count,0)+1,variants=?,updated_at=? WHERE id=? AND ${guard}`)
+			.bind(JSON.stringify(variants.slice(-MERGE_VARIANTS_MAX)), now, target.id, id, lease);
+	} else {
+		mutation = env.DB.prepare(`INSERT INTO ad_samples (norm_hash,sample_text,signature,variants,count,embedding,dimension,source,kind,created_at,updated_at)
+			SELECT ?,?,?,'[]',1,?,?, 'pool_confirm',?,?,? WHERE ${guard} ON CONFLICT(norm_hash) DO UPDATE
+			SET count=COALESCE(ad_samples.count,0)+1,updated_at=excluded.updated_at WHERE COALESCE(ad_samples.kind,'text')=excluded.kind`)
+			.bind(hash, sample.text, signature, embedding ? JSON.stringify(embedding) : null, embedding?.length || null, sample.kind, now, now, id, lease);
+	}
+	const state = { ok: true, added: !target, merged: Boolean(target), tier };
+	const lookup = target ? 'SELECT id FROM ad_samples WHERE id=?' : 'SELECT id FROM ad_samples WHERE norm_hash=?';
+	const lookupValue = target ? target.id : hash;
+	const progress = env.DB.prepare(`UPDATE pool_action_receipts SET status='sample_done',created_at=?,result=json_set(result,'$.sample',json(?),'$.sample.sampleId',(${lookup}))
+		WHERE ${poolActionGuard} AND status='processing' AND json_extract(result,'$.sample') IS NULL AND EXISTS(${lookup})`)
+		.bind(now, JSON.stringify(state), lookupValue, id, lease, lookupValue);
+	// One transaction commits both count/sample mutation and phase receipt, including crash/retry.
+	const results = await env.DB.batch([mutation, progress]);
+	if (results.some(result => result?.success === false)) throw new PoolApiError(503, 'sample_write_failed');
+	if (results[1]?.meta?.changes !== 1) throw new PoolApiError(409, 'action_busy');
+	if (results[0]?.meta?.changes !== 1) return poolSaveProgress(env, id, lease, { ok: false, reason: 'save_failed' });
+	const receipt = await env.DB.prepare('SELECT result FROM pool_action_receipts WHERE id=?').bind(id).first();
+	return JSON.parse(receipt.result).sample;
+}
+async function poolProtectedUser(env, userId) {
+	const primary = String(env.OWNER_ID || (env.OWNER_IDS || '').split(/[,，]/)[0] || '').trim();
+	if (userId === primary) return true;
+	// Controller snapshots may be 10 minutes old; always recheck live exemption tables.
+	if (await env.DB.prepare('SELECT 1 AS x FROM ad_user_whitelist WHERE user_id=?').bind(userId).first()) return true;
+	return Boolean(await env.DB.prepare('SELECT 1 AS x FROM ad_owners WHERE user_id=?').bind(userId).first());
+}
+async function poolCompleteAction(env, id, lease, response) {
+	const completed = await env.DB.prepare(`UPDATE pool_action_receipts SET status='done',result=json_set(result,'$.response',json(?)),created_at=? WHERE ${poolActionGuard}`)
+		.bind(JSON.stringify(response), nowSeconds(), id, lease).run();
+	if (completed?.success === false) throw new PoolApiError(503, 'action_unavailable');
+	if (completed?.meta?.changes !== 1) throw new PoolApiError(409, 'action_busy');
+	return poolJson(200, response);
+}
+async function servePoolAction(env, input) {
+	if (!poolRecord(input) || Object.keys(input).some(key => !['id','user_id','sample'].includes(key))
+		|| typeof input.id !== 'string' || !/^[a-f0-9]{24}$/.test(input.id) || !poolUserId(input.user_id)
+		|| !poolRecord(input.sample) || Object.keys(input.sample).some(key => !['text','kind'].includes(key))
+		|| typeof input.sample.text !== 'string' || input.sample.text.length > 2000 || !['text','quote','card_name'].includes(input.sample.kind)) throw new PoolApiError(400, 'invalid_action');
+	if (!env.DB) throw new PoolApiError(503, 'action_unavailable');
+	await adDetectionReady(env);
+	await env.DB.prepare('CREATE TABLE IF NOT EXISTS pool_action_receipts (id TEXT PRIMARY KEY,status TEXT NOT NULL,result TEXT NOT NULL,created_at INTEGER NOT NULL)').run();
+	const inputHash = await sha256Hex(JSON.stringify({ user_id: input.user_id, sample: input.sample })), now = nowSeconds(), lease = crypto.randomUUID();
+	const state = { input_hash: inputHash, lease, sample: null };
+	const claim = await env.DB.prepare(`INSERT INTO pool_action_receipts (id,status,result,created_at) VALUES (?,'processing',?,?) ON CONFLICT(id) DO UPDATE
+		SET result=json_set(pool_action_receipts.result,'$.lease',?),created_at=excluded.created_at
+		WHERE pool_action_receipts.status!='done' AND pool_action_receipts.created_at<=? AND json_extract(pool_action_receipts.result,'$.input_hash')=?`)
+		.bind(input.id, JSON.stringify(state), now, lease, now - 30, inputHash).run();
+	if (claim?.success === false) throw new PoolApiError(503, 'action_unavailable');
+	const row = await env.DB.prepare('SELECT status,result FROM pool_action_receipts WHERE id=?').bind(input.id).first();
+	const receipt = row ? JSON.parse(row.result) : null;
+	if (!receipt || receipt.input_hash !== inputHash) throw new PoolApiError(409, 'action_id_conflict');
+	if (row.status === 'done') return poolJson(200, receipt.response);
+	if (claim?.meta?.changes !== 1 || receipt.lease !== lease) throw new PoolApiError(409, 'action_busy');
+	try {
+		if (await poolProtectedUser(env, input.user_id)) return poolCompleteAction(env, input.id, lease, { ok: true, summary: '目标为主人或白名单用户，未保存样本或处罚' });
+		let sample = receipt.sample;
+		if (!sample) {
+			try { sample = await poolSaveSampleOnce(env, input.id, lease, input.sample); }
+			catch (error) {
+				if (error instanceof PoolApiError && error.status === 409) throw error;
+				// The transaction may have committed before its network reply was lost.
+				const recovered = await env.DB.prepare('SELECT result FROM pool_action_receipts WHERE id=?').bind(input.id).first();
+				const progress = recovered ? JSON.parse(recovered.result) : null;
+				if (progress?.lease !== lease) throw new PoolApiError(409, 'action_busy');
+				sample = progress.sample || await poolSaveProgress(env, input.id, lease, { ok: false, reason: 'save_failed' });
+			}
+		}
+		const enforcing = await env.DB.prepare(`UPDATE pool_action_receipts SET status='enforcing',created_at=? WHERE ${poolActionGuard}`).bind(nowSeconds(), input.id, lease).run();
+		if (enforcing?.success === false) throw new PoolApiError(503, 'action_unavailable');
+		if (enforcing?.meta?.changes !== 1) throw new PoolApiError(409, 'action_busy');
+		const config = await loadConfig(env);
+		if (await poolProtectedUser(env, input.user_id)) return poolCompleteAction(env, input.id, lease, { ok: true, summary: '目标已加入主人或白名单，未执行封禁' });
+		await addBlacklist(env, input.user_id, 'spam', 'pool_confirm', 'pool_controller');
+		const bans = await banAllGroups(env, input.user_id, config, 'pool_confirm');
+		const sampleNote = sample.ok ? `${sample.merged ? '已合并' : '已保存'}语义样本${sample.sampleId ? ' #' + sample.sampleId : ''}` : sample.reason === 'empty_or_short' ? '无有效正文，未保存样本' : '样本保存失败';
+		const response = { ok: true, summary: `已列黑名单，群封禁成功 ${bans.okCount}，失败 ${bans.failures.length}；${sampleNote}` };
+		const completed = await poolCompleteAction(env, input.id, lease, response);
+		if (sample.ok && sample.sampleId) await maybePromoteSampleToFingerprint(env, sample.sampleId);
+		return completed;
+	} catch (error) {
+		// A failed enforcement may be retried, but the atomic sample phase remains saved.
+		await env.DB.prepare(`UPDATE pool_action_receipts SET created_at=? WHERE ${poolActionGuard}`).bind(nowSeconds() - 31, input.id, lease).run().catch(() => null);
+		throw error;
+	}
+}
+async function servePoolHits(env, input) {
+	if (!poolRecord(input) || Object.keys(input).some(key => !['id','hits'].includes(key)) || typeof input.id !== 'string' || !/^[a-f0-9]{32}$/.test(input.id)
+		|| !Array.isArray(input.hits) || input.hits.length > 50 || input.hits.some(hit => !poolRecord(hit) || Object.keys(hit).some(key => !['sample_id','count'].includes(key))
+			|| !Number.isSafeInteger(hit.sample_id) || hit.sample_id < 1 || !Number.isSafeInteger(hit.count) || hit.count < 1 || hit.count > 10000)
+		|| new Set(input.hits.map(hit => hit.sample_id)).size !== input.hits.length) throw new PoolApiError(400, 'invalid_hits');
+	if (!env.DB) throw new PoolApiError(503, 'hits_unavailable');
+	await adDetectionReady(env);
+	await env.DB.prepare('CREATE TABLE IF NOT EXISTS pool_hit_batches (id TEXT PRIMARY KEY,marker TEXT NOT NULL,digest TEXT NOT NULL,created_at INTEGER NOT NULL)').run();
+	const marker = crypto.randomUUID(), digest = await sha256Hex(JSON.stringify(input.hits)), now = nowSeconds();
+	const statements = [env.DB.prepare('INSERT OR IGNORE INTO pool_hit_batches (id,marker,digest,created_at) VALUES (?,?,?,?)').bind(input.id, marker, digest, now)];
+	for (const hit of input.hits) statements.push(env.DB.prepare(`UPDATE ad_samples SET count=COALESCE(count,0)+?,updated_at=? WHERE id=?
+		AND EXISTS(SELECT 1 FROM pool_hit_batches WHERE id=? AND marker=?)`).bind(hit.count, now, hit.sample_id, input.id, marker));
+	// Per-attempt marker is only installed by the transaction that inserted this batch ID.
+	// A concurrent duplicate has another marker, so every conditional count update is a no-op.
+	const results = await env.DB.batch(statements);
+	if (results.some(result => result?.success === false)) throw new PoolApiError(503, 'hits_unavailable');
+	if (results[0]?.meta?.changes !== 1) {
+		const row = await env.DB.prepare('SELECT digest FROM pool_hit_batches WHERE id=?').bind(input.id).first();
+		if (!row || row.digest !== digest) throw new PoolApiError(409, 'hit_batch_conflict');
+		return poolJson(200, { ok: true, duplicate: true, applied: 0 });
+	}
+	let applied = 0;
+	for (let index = 0; index < input.hits.length; index++) {
+		if (results[index + 1]?.meta?.changes === 1) { applied++; await maybePromoteSampleToFingerprint(env, input.hits[index].sample_id); }
+	}
+	return poolJson(200, { ok: true, applied });
+}
+async function servePoolLegacyReport(env, input) {
+	if (!poolRecord(input) || Object.keys(input).some(key => key !== 'report_id')
+		|| !Number.isSafeInteger(input.report_id) || input.report_id < 1) throw new PoolApiError(400, 'invalid_report_id');
+	if (!env.DB) throw new PoolApiError(503, 'legacy_report_unavailable');
+	// No schema initialization or report mutations: this endpoint only projects the existing record.
+	const report = await env.DB.prepare('SELECT user_id, body_text, status FROM ad_observe_reports WHERE id = ?').bind(input.report_id).first();
+	if (!report) return poolJson(200, { ok: true, report: null });
+	return poolJson(200, { ok: true, report: {
+		user_id: String(report.user_id || ''), body_text: String(report.body_text || '').slice(0, 2000), status: String(report.status || '')
+	} });
+}
+async function handlePoolApi(request, env, path) {
+	try {
+		poolAuthenticated(request, env);
+		if (request.method !== (path === '/api/pool/dictionary' ? 'GET' : 'POST')) throw new PoolApiError(405, 'method_not_allowed');
+		if (path === '/api/pool/dictionary') return await servePoolDictionary(env);
+		const input = await poolReadJson(request);
+		if (path === '/api/pool/legacy-report') return await servePoolLegacyReport(env, input);
+		return path === '/api/pool/action' ? await servePoolAction(env, input) : await servePoolHits(env, input);
+	} catch (error) { return poolJson(error instanceof PoolApiError ? error.status : 503, { ok: false, error: error instanceof PoolApiError ? error.code : 'pool_api_unavailable' }); }
+}
+function poolControlUrl(env, path) {
+	const url = new URL(String(env.POOL_CONTROL_URL || ''));
+	if (url.protocol !== 'https:' || !url.hostname || url.username || url.password || url.search || url.hash || !env.POOL_CONTROL_TOKEN) throw new PoolApiError(503, 'pool_unconfigured');
+	url.pathname = url.pathname.replace(/\/+$/, '') + path;
+	return url.toString();
+}
+async function poolPost(env, path, body) {
+	const serialized = JSON.stringify(body);
+	if (new TextEncoder().encode(serialized).byteLength > 65536) throw new PoolApiError(413, 'payload_too_large');
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 20000);
+	try {
+		// Workers fetch supports manual redirects; reject every non-2xx response without following it.
+		const response = await fetch(poolControlUrl(env, path), { method: 'POST', redirect: 'manual', headers: { 'Content-Type': 'application/json', 'User-Agent': 'tg-beta-pool/1.0', Authorization: 'Bearer ' + env.POOL_CONTROL_TOKEN }, body: serialized, signal: controller.signal });
+		if (!response.ok) { await response.body?.cancel(); throw new PoolApiError(503, 'pool_unavailable'); }
+		const result = await poolReadJson(response, 65536);
+		if (result?.ok !== true) throw new PoolApiError(503, 'pool_unavailable');
+		return result;
+	} finally { clearTimeout(timer); }
+}
+async function forwardPoolCallback(env, callback, path) {
+	try {
+		if (!callback || typeof callback.id !== 'string' || callback.id.length > 256 || typeof callback.data !== 'string' || callback.data.length > 64) throw new PoolApiError(400, 'invalid_callback');
+		const fromId = String(callback.from?.id || ''), chatId = String(callback.message?.chat?.id || '');
+		if (!poolUserId(fromId) || !/^-?[1-9]\d{0,15}$/.test(chatId) || !Number.isSafeInteger(callback.message?.message_id) || callback.message.message_id <= 0) throw new PoolApiError(400, 'invalid_callback');
+		return await poolPost(env, path, { callback: { id: callback.id, data: callback.data, from: { id: fromId }, message: { message_id: callback.message.message_id, chat: { id: chatId, type: String(callback.message.chat.type || '').slice(0, 32) } } } });
+	} catch (_) {
+		await tgCall(env, 'answerCallbackQuery', { callback_query_id: callback?.id, text: '观察池暂不可用，请重试', show_alert: true }).catch(() => null);
+		return null;
+	}
+}
+async function forwardPoolReview(env, callback) {
+	return forwardPoolCallback(env, callback, '/api/beta/review');
+}
+async function forwardPoolLegacyReview(env, callback) {
+	return forwardPoolCallback(env, callback, '/api/beta/legacy-review');
+}
+async function forwardPoolObserve(env, message) {
+	const text = String(message.text || message.caption || '').trim(), command = text.match(COMMAND_RE);
+	if (command && (command[1].toLowerCase() !== 'spam' || (!message.reply_to_message && !/^[1-9]\d{0,15}(?:\s*[,，]\s*[1-9]\d{0,15})*$/.test(command[2]?.trim() || '')))) return;
+	const userId = String(message.from?.id || ''), chatId = String(message.chat?.id || '');
+	if (!poolUserId(userId) || !/^-[1-9]\d{1,15}$/.test(chatId) || isAnonymousAdminMessage(message) || !Number.isSafeInteger(message.message_id) || message.message_id < 1) return;
+	const input = { chat_id: chatId, chat_title: String(message.chat?.title || '').slice(0, 256), user_id: userId, message_id: message.message_id,
+		text: String(message.text || message.caption || '').slice(0, 4000), quote: getQuotedText(message).slice(0, 4000), contact_name: getContactName(message).slice(0, 4000),
+		first_name: String(message.from?.first_name || '').slice(0, 256), last_name: String(message.from?.last_name || '').slice(0, 256), username: String(message.from?.username || '').slice(0, 64), is_bot: message.from?.is_bot === true };
+	const reply = message.reply_to_message;
+	if (reply && poolUserId(String(reply.from?.id || '')) && Number.isSafeInteger(reply.message_id) && reply.message_id > 0) {
+		input.reply = { message_id: reply.message_id, user_id: String(reply.from.id), text: String(reply.text || reply.caption || '').slice(0, 4000),
+			quote: getQuotedText(reply).slice(0, 4000), contact_name: getContactName(reply).slice(0, 4000),
+			first_name: String(reply.from?.first_name || '').slice(0, 256), last_name: String(reply.from?.last_name || '').slice(0, 256), username: String(reply.from?.username || '').slice(0, 64) };
+	}
+	if (!input.text && !input.quote && !input.contact_name) return;
+	try { return await poolPost(env, '/api/beta/ingest', input); }
+	catch (_) { return null; } // 观察池暂停/异常：来源群绝不发消息，不退回本地 D1 复核。
+}
+
 // 用户客户端专用入口，与 Telegram webhook 的 secret 分离；只允许配置的观察群。
 async function serveObserveIngest(request, env) {
 	const json = (status, body) => Response.json(body, { status, headers: { 'Cache-Control': 'no-store' } });
@@ -2633,6 +2982,7 @@ async function serveObserveIngest(request, env) {
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
+		if (['/api/pool/dictionary', '/api/pool/action', '/api/pool/hits', '/api/pool/legacy-report'].includes(url.pathname)) return handlePoolApi(request, env, url.pathname);
 		if (url.pathname === '/api/observe/ingest') return serveObserveIngest(request, env);
 		if (request.method === 'GET') {
 			if (url.pathname === '/health') return new Response('OK', { status: 200 });
