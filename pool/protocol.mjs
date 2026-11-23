@@ -5,6 +5,9 @@ export const MAX_MESSAGE_BYTES = 64 * 1024;
 export const HEX_VERSION = /^[a-f0-9]{64}$/i;
 export const MAX_FINGERPRINTS = 5000;
 export const MAX_SAMPLES = 5000;
+export const MAX_BLACKLIST = 10000;
+export const MAX_SAMPLE_VARIANTS = 8;
+export const MAX_SAMPLE_VARIANT_LENGTH = 200;
 export const MAX_VECTOR_DIMENSIONS = 4096;
 
 export class ProtocolError extends Error {
@@ -155,8 +158,11 @@ export function validateDictionaryInput(body) {
   const fail = () => ({ ok: false, error: 'invalid_dictionary' });
   if (!keysAllowed(body, ['version', 'data']) || typeof body.version !== 'string'
       || !HEX_VERSION.test(body.version)
-      || !keysAllowed(body.data, ['fingerprints', 'samples', 'whitelist', 'owners', 'allowlist'])) return fail();
+      || !keysAllowed(body.data, ['fingerprints', 'samples', 'whitelist', 'owners', 'allowlist', 'blacklist'])) return fail();
   const data = body.data;
+  const hasBlacklist = Object.hasOwn(data, 'blacklist');
+  if (hasBlacklist && (!Array.isArray(data.blacklist) || data.blacklist.length > MAX_BLACKLIST
+      || data.blacklist.some(value => !validUserId(value)) || new Set(data.blacklist).size !== data.blacklist.length)) return fail();
   const caps = { fingerprints: MAX_FINGERPRINTS, samples: MAX_SAMPLES, whitelist: 10000, owners: 10000, allowlist: 10000 };
   for (const [key, cap] of Object.entries(caps)) {
     if (!Array.isArray(data[key]) || data[key].length > cap) return fail();
@@ -180,16 +186,21 @@ export function validateDictionaryInput(body) {
       norm_value: item.norm_value, status: item.status, source: item.source || '' });
   }
   for (const item of data.samples) {
-    if (!keysAllowed(item, ['id', 'norm_hash', 'sample_text', 'kind', 'embedding', 'count'])
+    if (!keysAllowed(item, ['id', 'norm_hash', 'sample_text', 'kind', 'embedding', 'count', 'variants'])
         || !positiveId(item.id) || sampleIds.has(item.id)
         || typeof item.norm_hash !== 'string' || !HEX_VERSION.test(item.norm_hash)
         || typeof item.sample_text !== 'string' || item.sample_text.length < 1 || item.sample_text.length > 4000
         || (item.kind != null && !['text', 'quote', 'card_name', 'name', 'bio', 'username'].includes(item.kind))
         || !Number.isSafeInteger(item.count) || item.count < 0
         || (item.embedding !== null && !validVector(item.embedding))) return fail();
+    const hasVariants = Object.hasOwn(item, 'variants');
+    if (hasVariants && (!Array.isArray(item.variants) || item.variants.length > MAX_SAMPLE_VARIANTS
+        || item.variants.some(value => typeof value !== 'string' || value.length < 1 || value.length > MAX_SAMPLE_VARIANT_LENGTH)
+        || new Set(item.variants).size !== item.variants.length)) return fail();
     sampleIds.add(item.id);
     samples.push({ id: item.id, norm_hash: item.norm_hash.toLowerCase(), sample_text: item.sample_text,
-      kind: item.kind || 'text', embedding: item.embedding === null ? null : [...item.embedding], count: item.count });
+      kind: item.kind || 'text', embedding: item.embedding === null ? null : [...item.embedding], count: item.count,
+      ...(hasVariants ? { variants: [...item.variants] } : {}) });
   }
   for (const key of ['whitelist', 'owners']) if (data[key].some(value => !validUserId(value))) return fail();
   for (const item of data.allowlist) {
@@ -198,8 +209,11 @@ export function validateDictionaryInput(body) {
         || typeof item.value !== 'string' || item.value.length < 1 || item.value.length > 4000) return fail();
     allowlist.push({ dimension: item.dimension, value: item.value });
   }
+  // Absent optional fields remain absent in the serialized validation result,
+  // preserving already-generated legacy snapshot versions and payload bytes.
   return { ok: true, version: body.version.toLowerCase(), data: { fingerprints, samples,
-    whitelist: [...new Set(data.whitelist)], owners: [...new Set(data.owners)], allowlist } };
+    whitelist: [...new Set(data.whitelist)], owners: [...new Set(data.owners)], allowlist,
+    ...(hasBlacklist ? { blacklist: [...data.blacklist] } : {}) } };
 }
 
 function labelValue(value) {

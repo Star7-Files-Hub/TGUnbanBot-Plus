@@ -65,7 +65,8 @@ async function harness(t, { bootstrap = true } = {}) {
     if (u.origin === BETA) {
       if (hooks.source) { const r = await hooks.source(c); if (r) return r; }
       if (c.path === '/api/pool/dictionary') return json({ ok: true, data: dictionaryData(), observe_groups: [GROUP] });
-      if (c.path === '/api/pool/action') return json({ ok: true, summary: 'Unit approval persisted.' });
+      if (c.path === '/api/pool/action') return json({ ok: true, summary: 'Unit approval persisted.', blacklisted: true });
+      if (c.path === '/api/pool/user-status') return json({ ok: true, blacklisted: false });
       if (c.path === '/api/pool/hits') return json({ ok: true, applied: body.hits.length });
     }
     if (NODES.includes(u.origin)) {
@@ -353,7 +354,7 @@ test('config cannot increase threshold or include duplicate/unknown account alia
 test('source request budget blocks concurrent approvals and persists uncertain cost', async t => {
   const h = await harness(t); h.hooks.classify = c => candidate(c);
   const ids = [];
-  for (const message_id of [70, 71]) ids.push((await (await ingest(h, message({ message_id }))).json()).event_id);
+  for (const message_id of [70, 71]) ids.push((await (await ingest(h, message({ message_id, text: '不同广告内容用于额度测试 ' + message_id }))).json()).event_id);
   h.setUsage(0, { rowsWritten: 79850 });
   const began = defer(), finish = defer();
   h.hooks.source = async c => { if (c.path === '/api/pool/action') { began.resolve(); await finish.promise; return json({ ok: false }, 503); } };
@@ -415,6 +416,95 @@ test('legacy dismissal requires no source reads and cannot later become approval
   const row = h.db.prepare("SELECT * FROM events WHERE event_key='legacy:57'").get(); assert.equal(row.status, 'dismissed');
   body.callback.data = 'o:save:57'; await internal(h, '/legacy-review', body);
   assert.equal(h.calls.filter(c => c.origin === BETA).length, 0);
+});
+test('identical candidate contents across users, messages, accounts and restart push once', async t => {
+  const h = await harness(t); h.hooks.classify = c => candidate(c);
+  const first = await (await ingest(h)).json(); assert.equal(h.notifications().length, 1);
+  h.pool.config.mode = 'failover'; h.pool.accounts[1].enabled = false;
+  const second = await (await ingest(h, message({ user_id: '666666', message_id: 90 }))).json();
+  assert.equal(second.accepted, true); assert.equal(h.pool.event(second.event_id).reason, 'duplicate_content'); assert.equal(h.notifications().length, 1);
+  const restoredState = fakeState(h.db), restored = new ObservePool(restoredState.ctx, h.env); await restoredState.initialized();
+  const third = await restored.ingest(message({ user_id: '777777', message_id: 91 })); assert.equal(third.status, 200);
+  assert.equal(h.notifications().length, 1); assert.equal(h.db.prepare('SELECT COUNT(*) n FROM notice_keys').get().n, 1);
+  assert.equal(h.pool.event(first.event_id).status, 'review');
+});
+test('concurrent identical candidates claim one content notice even with two message IDs', async t => {
+  const h = await harness(t); const began = defer(), finish = defer(); let n = 0;
+  h.hooks.classify = async c => { if (++n === 1) { began.resolve(); await finish.promise; } return candidate(c); };
+  const first = ingest(h, message({ message_id: 111 })); await began.promise;
+  const second = await ingest(h, message({ user_id: '777777', message_id: 112 })); assert.equal(second.status, 200);
+  finish.resolve(); await first; assert.equal(h.notifications().length, 1);
+});
+test('long shared preview prefixes and quoted contexts do not falsely collapse distinct contents', async t => {
+  const h = await harness(t); h.hooks.classify = c => candidate(c, { evidence: c.body.message.text.slice(0, 2000) });
+  for (const [id, suffix] of [[120, '尾部甲'], [121, '尾部乙']]) await ingest(h, message({ message_id: id, text: '同一长前缀'.repeat(450) + suffix }));
+  assert.equal(h.notifications().length, 2);
+  for (const [id, quote] of [[122, '独立引用甲'], [123, '独立引用乙']]) await ingest(h, message({ message_id: id, text: '同一句广告', quote }));
+  assert.equal(h.notifications().length, 4);
+});
+test('upgrade seeds every historical notice beyond queue capacity before marking completion', async t => {
+  const h = await harness(t); const now = Date.now();
+  const insert = h.db.prepare('INSERT INTO events(id,event_key,message,status,evidence,kind,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)');
+  h.db.exec('BEGIN');
+  for (let i = 0; i < 1000; i++) insert.run('history-' + i, 'history-key-' + i, JSON.stringify(message({ message_id: 3000 + i, text: '已处理广告 ' + i })), 'approved', '已处理广告 ' + i, 'text', now - 10000, now - 10000);
+  const pending = message({ message_id: 4500, text: '新的未处理复核内容' });
+  insert.run('newest-open', 'newest-open-key', JSON.stringify(pending), 'review', pending.text, 'text', now - 1, now - 1);
+  h.db.exec('COMMIT');
+  h.pool.put('notice_claims_seeded', 'content-fields-v2');
+  const restoredState = fakeState(h.db), restored = new ObservePool(restoredState.ctx, h.env); await restoredState.initialized();
+  assert.equal(restored.get('notice_claims_seeded', ''), 'content-fields-v3');
+  assert.equal(h.db.prepare('SELECT COUNT(*) n FROM notice_keys').get().n, 1001);
+  const hash = await restored.noticeHash(pending, { evidence: pending.text, matched_field: 'text' });
+  assert.equal(h.db.prepare('SELECT event_id FROM notice_keys WHERE hash=?').get(hash).event_id, 'newest-open');
+  h.hooks.classify = c => candidate(c);
+  await restored.ingest({ ...pending, user_id: '777777', message_id: 4501 });
+  assert.equal(h.notifications().length, 0);
+});
+test('matching content does not repush when different nodes choose a different evidence field', async t => {
+  const h = await harness(t); let n = 0;
+  h.hooks.classify = c => candidate(c, { matched_field: ++n === 1 ? 'text' : 'quote', evidence: n === 1 ? c.body.message.text : c.body.message.quote });
+  await ingest(h, message({ message_id: 125, quote: '同一引用广告' }));
+  await ingest(h, message({ message_id: 126, user_id: '666666', quote: '同一引用广告' }));
+  assert.equal(h.notifications().length, 1);
+});
+test('blacklisted snapshot user is accepted silently before node, AI or source reads', async t => {
+  const h = await harness(t); h.pool.dictionary.blacklist = ['555555'];
+  const response = await ingest(h); assert.equal((await response.json()).status, 'blacklisted');
+  assert.equal(h.classified().length, 0); assert.equal(h.notifications().length, 0); assert.equal(h.calls.filter(c => c.origin === BETA).length, 0);
+});
+test('a stale snapshot cannot notify a user already blacklisted in live Beta', async t => {
+  const h = await harness(t); h.hooks.classify = c => candidate(c);
+  h.hooks.source = c => c.path === '/api/pool/user-status' ? json({ ok: true, blacklisted: true }) : null;
+  const r = await (await ingest(h)).json(); assert.equal(r.accepted, true); assert.equal(h.pool.event(r.event_id).reason, 'blacklisted'); assert.equal(h.notifications().length, 0);
+  await ingest(h, message({ message_id: 131, text: '另一句' })); assert.equal(h.classified().length, 1);
+});
+test('unknown live blacklist check retains candidate for retry and does not push blindly', async t => {
+  const h = await harness(t); h.hooks.classify = c => candidate(c);
+  h.hooks.source = c => c.path === '/api/pool/user-status' ? json({ ok: false }, 503) : null;
+  const r = await (await ingest(h)).json(); assert.equal(r.accepted, true); assert.equal(h.pool.event(r.event_id).status, 'notify_pending'); assert.equal(h.notifications().length, 0);
+  h.hooks.source = null; await h.pool.notify(r.event_id, message(), { evidence: message().text, matched_field: 'text' });
+  assert.equal(h.notifications().length, 1); assert.equal(h.pool.event(r.event_id).status, 'review');
+});
+test('semantic hits stay silent for multiple messages and do not query live blacklist per hit', async t => {
+  const h = await harness(t); h.hooks.classify = c => json({ ok: true, version: c.body.version, kind: 'semantic', sample_id: 10, matched_field: 'text', evidence: c.body.message.text, metrics: { rowsRead: 0, rowsWritten: 0 } });
+  for (const message_id of [140, 141, 142]) await ingest(h, message({ message_id }));
+  assert.equal(h.notifications().length, 0); assert.equal(h.calls.filter(c => c.path === '/api/pool/user-status').length, 0); assert.equal(h.db.prepare('SELECT total FROM hits WHERE sample_id=10').get().total, 3);
+});
+test('manual spam batches skip blacklisted targets but preserve other IDs without evidence', async t => {
+  const h = await harness(t); h.pool.dictionary.blacklist = ['111111'];
+  await ingest(h, message({ text: '/spam 111111,222222' })); assert.equal(h.notifications().length, 1);
+  assert.ok(h.notifications()[0].body.text.includes('222222')); assert.equal(h.classified().length, 0);
+});
+test('approving a user immediately suppresses fresh alerts before the next dictionary sync', async t => {
+  const h = await harness(t); h.hooks.classify = c => candidate(c);
+  const id = (await (await ingest(h)).json()).event_id; await callback(h, id); assert.equal(h.pool.event(id).status, 'approved');
+  const r = await (await ingest(h, message({ message_id: 151, text: '另一则新内容' }))).json();
+  assert.equal(r.status, 'blacklisted'); assert.equal(h.classified().length, 1); assert.equal(h.notifications().length, 1);
+});
+test('content send claims survive unknown Telegram responses without repeated alerts', async t => {
+  const h = await harness(t); h.hooks.classify = c => candidate(c); h.hooks.telegram = c => { if (c.path.endsWith('/sendMessage')) throw new Error('unit-uncertain'); };
+  await ingest(h, message({ message_id: 160 })); await ingest(h, message({ message_id: 161, user_id: '666666' }));
+  assert.equal(h.notifications().length, 1); assert.equal(h.db.prepare("SELECT COUNT(*) n FROM events WHERE status='notification_uncertain'").get().n, 1);
 });
 test('account configuration refuses unsafe targets and missing authentication', () => {
   for (const url of ['http://node.unit.workers.dev/', 'https://outside.invalid/', 'https://user:unit@node.unit.workers.dev/', NODES[0] + '/admin']) {

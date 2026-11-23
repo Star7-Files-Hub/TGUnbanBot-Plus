@@ -4,14 +4,17 @@ import { authenticatedBearer, validSession, handleLogin, htmlPage, sameOrigin, c
 import { ProtocolError, readJson, json, validateMessageInput, validateDictionaryInput, validVector, MAX_DICTIONARY_BYTES } from './protocol.mjs';
 import { READ_LIMIT, WRITE_LIMIT, MAX_THRESHOLD, MAX_USAGE_AGE, utcDay, parseD1Usage, mergeUsage, eligibleAccounts, availability, usageRatio } from './quota.mjs';
 
-export const RUNTIME_REVISION = 'pool-manual-v2';
+export const RUNTIME_REVISION = 'pool-quiet-known-v3';
 export const REFRESH_MS = 60_000;
 export const SYNC_MS = 600_000;
 export const DICTIONARY_MAX_AGE = 86_400_000;
 export const MAX_QUEUE = 1000;
+export const CONTENT_DEDUPE_MS = 30 * 86_400_000;
+const NOTICE_SEED_VERSION = 'content-fields-v3';
+const NOTICE_SEED_PAGE = 200;
 const LEASE_MS = 240_000;
 const RESERVE_READ = 10, RESERVE_WRITE = 2;
-const ACTIVE = ['processing', 'notifying', 'review', 'sync_pending', 'notification_uncertain'];
+const ACTIVE = ['processing', 'notifying', 'notify_pending', 'review', 'sync_pending', 'notification_uncertain'];
 const object = x => x && typeof x === 'object' && !Array.isArray(x);
 const escape = x => String(x ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 const positiveId = x => Number.isSafeInteger(x) && x > 0;
@@ -75,6 +78,9 @@ export class ObservePool {
         status TEXT NOT NULL,evidence TEXT,kind TEXT,reason TEXT,node TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,
         telegram_mid INTEGER,result TEXT)`);
       this.sql.exec('CREATE INDEX IF NOT EXISTS events_status_time ON events(status,updated_at)');
+      this.sql.exec('CREATE TABLE IF NOT EXISTS notice_keys (hash TEXT PRIMARY KEY,event_id TEXT NOT NULL,created_at INTEGER NOT NULL)');
+      this.sql.exec('CREATE INDEX IF NOT EXISTS notice_keys_time ON notice_keys(created_at)');
+      this.sql.exec('CREATE TABLE IF NOT EXISTS blocked_users (user_id TEXT PRIMARY KEY,created_at INTEGER NOT NULL)');
       this.sql.exec('CREATE TABLE IF NOT EXISTS hits (sample_id INTEGER PRIMARY KEY,total INTEGER NOT NULL,synced INTEGER NOT NULL DEFAULT 0)');
       this.sql.exec('CREATE TABLE IF NOT EXISTS hit_batches (id TEXT PRIMARY KEY,payload TEXT NOT NULL,status TEXT NOT NULL)');
       this.sql.exec('CREATE TABLE IF NOT EXISTS auth_attempts (key TEXT PRIMARY KEY,time INTEGER NOT NULL,count INTEGER NOT NULL)');
@@ -86,6 +92,9 @@ export class ObservePool {
       this.dictionary = this.get('dictionary', null); this.version = this.get('dictionary_version', '');
       this.groups = this.get('observe_groups', []); this.syncedAt = this.get('synced_at', 0);
       this.dictionaryEpoch = this.get('dictionary_epoch', 0);
+      // Seed content claims from already sent reviews so upgrading does not
+      // push the backlog's identical messages again under new message IDs.
+      if (this.get('notice_claims_seeded', '') !== NOTICE_SEED_VERSION) await this.seedNoticeClaims();
       // Once this revision is adopted, reschedule maintenance and expose its
       // marker so deployment checks do not mistake deferred old code for new.
       if (this.get('runtime_revision', '') !== RUNTIME_REVISION) {
@@ -160,10 +169,10 @@ export class ObservePool {
     const sampleCount = this.dictionary?.samples?.length || 256;
     const fingerprintCount = this.dictionary?.fingerprints?.length || 64;
     const budget = path === '/api/pool/dictionary'
-      ? { rowsRead: 42_000, rowsWritten: 0 } // six bounded source tables, including cap+1 overflow rows and schema margin
+      ? { rowsRead: 52_000, rowsWritten: 0 } // seven bounded source tables, including blacklist, cap+1 overflow and schema margin
       : path === '/api/pool/hits'
         ? { rowsRead: Math.max(256, sampleCount + fingerprintCount * 4), rowsWritten: (body?.hits?.length || 0) * 4 + 100 }
-        : path === '/api/pool/legacy-report'
+        : ['/api/pool/legacy-report', '/api/pool/user-status'].includes(path)
           ? { rowsRead: 4, rowsWritten: 0 }
           : { rowsRead: Math.max(512, sampleCount * 6 + fingerprintCount * 4), rowsWritten: 100 };
     const projected = { ...source, localReads: (source.localReads || 0) + budget.rowsRead,
@@ -197,6 +206,10 @@ export class ObservePool {
             this.ctx.storage.transactionSync(() => {
               this.put('dictionary', this.dictionary); this.put('dictionary_version', this.version); this.put('observe_groups', this.groups);
               this.put('synced_at', this.syncedAt); this.put('sync_error', null); this.put('sync_diagnostic', null);
+              if (Array.isArray(this.dictionary.blacklist)) {
+                this.sql.exec('DELETE FROM blocked_users');
+                for (const userId of this.dictionary.blacklist) this.sql.exec('INSERT INTO blocked_users(user_id,created_at) VALUES (?,?)', userId, Date.now());
+              }
             });
           } catch (error) { this.put('sync_error', 'source_unavailable'); this.put('sync_diagnostic', safeFailure(error)); }
         }
@@ -228,14 +241,88 @@ export class ObservePool {
         percent: usageRatio(a), localReads: a.localReads, localWrites: a.localWrites, lastDispatch: a.lastDispatch, diagnostic: this.get('usage_error:' + a.alias, null), day: a.day, observedAt: a.observedAt,
         fresh: a.day === utcDay() && Number.isFinite(a.observedAt) && now - a.observedAt >= 0 && now - a.observedAt <= MAX_USAGE_AGE,
         eligible: !availability(a, this.version, this.config.threshold), error: availability(a, this.version, this.config.threshold), cooldownUntil: a.cooldownUntil })),
-      queue: { pending: count(['processing', 'retry', 'sync_pending']), reviews: count(['review']), uncertain: count(['notifying', 'notification_uncertain']) } } };
+      queue: { pending: count(['processing', 'retry', 'notify_pending', 'sync_pending']), reviews: count(['review']), uncertain: count(['notifying', 'notification_uncertain']) } } };
   }
   async tg(method, body) {
     if (!this.env.BOT_TOKEN) throw new Error('telegram_unconfigured');
     return fetchJson('https://api.telegram.org/bot' + this.env.BOT_TOKEN + '/' + method, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, 12000, 65536);
   }
   event(id) { return this.sql.exec('SELECT * FROM events WHERE id=?', id).toArray()[0]; }
+  async seedNoticeClaims() {
+    let progress = this.get('notice_seed_cursor', null);
+    if (progress?.version !== NOTICE_SEED_VERSION) progress = { version: NOTICE_SEED_VERSION, since: Date.now() - CONTENT_DEDUPE_MS, time: 0, id: '' };
+    for (;;) {
+      const rows = this.sql.exec("SELECT id,message,evidence,kind,created_at FROM events WHERE status IN ('review','approved','notification_uncertain','notifying') AND created_at>=? AND (created_at>? OR (created_at=? AND id>?)) ORDER BY created_at,id LIMIT ?", progress.since, progress.time, progress.time, progress.id, NOTICE_SEED_PAGE).toArray();
+      if (!rows.length) break;
+      const claims = await Promise.all(rows.map(async row => {
+        try { return { hash: await this.noticeHash(JSON.parse(row.message), { evidence: row.evidence, matched_field: row.kind }), id: row.id, time: row.created_at }; }
+        catch { return null; }
+      }));
+      const last = rows[rows.length - 1];
+      progress = { ...progress, time: last.created_at, id: last.id };
+      this.ctx.storage.transactionSync(() => {
+        for (const claim of claims.filter(Boolean)) this.sql.exec('INSERT OR IGNORE INTO notice_keys(hash,event_id,created_at) VALUES (?,?,?)', claim.hash, claim.id, claim.time);
+        this.put('notice_seed_cursor', progress);
+      });
+    }
+    this.put('notice_claims_seeded', NOTICE_SEED_VERSION);
+  }
+  knownBlocked(userId) {
+    return (this.dictionary?.blacklist || []).includes(userId)
+      || Boolean(this.sql.exec('SELECT 1 x FROM blocked_users WHERE user_id=?', userId).toArray()[0]);
+  }
+  async noticeHash(message, result) {
+    const field = result?.matched_field || 'text';
+    const supplied = field === 'card_name' ? message.contact_name || result?.evidence : message[field] || result?.evidence;
+    // Exact, full-field content hash: keep links/handles/emoji, unlike semantic
+    // normalization, and never dedupe by a 700/2000-character preview prefix.
+    const content = String(supplied || '').normalize('NFKC').trim();
+    if (!content) return digest(JSON.stringify(['id_report', message.user_id, field]));
+    const parts = [message.text || '', message.quote || '', message.contact_name || ''].map(value => String(value).normalize('NFKC').trim());
+    return digest(JSON.stringify(['content', ...parts, ...(parts.some(Boolean) ? [] : [content])]));
+  }
   async notify(id, message, result) {
+    if (this.config.manualPaused || !this.selected().length) {
+      this.sql.exec("UPDATE events SET status='notify_pending',reason='observation_paused',updated_at=? WHERE id=? AND status IN ('notifying','notify_pending')", Date.now(), id);
+      return;
+    }
+    if (this.knownBlocked(message.user_id)) {
+      this.sql.exec("UPDATE events SET status='ignored',reason='blacklisted',updated_at=? WHERE id=? AND status IN ('notifying','notify_pending')", Date.now(), id);
+      return;
+    }
+    // A stale pool snapshot must not send a fresh alert for an already banned
+    // user. One indexed read only for candidates; known semantic hits stay local.
+    let current;
+    try {
+      current = await this.source('/api/pool/user-status', { user_id: message.user_id });
+      if (current.ok !== true || typeof current.blacklisted !== 'boolean') throw new Error('invalid_user_status');
+    } catch {
+      this.sql.exec("UPDATE events SET status='notify_pending',reason='blacklist_check_pending',updated_at=? WHERE id=? AND status IN ('notifying','notify_pending')", Date.now(), id);
+      return;
+    }
+    if (this.config.manualPaused || !this.selected().length) {
+      this.sql.exec("UPDATE events SET status='notify_pending',reason='observation_paused',updated_at=? WHERE id=? AND status IN ('notifying','notify_pending')", Date.now(), id);
+      return;
+    }
+    if (current.blacklisted || this.knownBlocked(message.user_id)) {
+      this.sql.exec('INSERT INTO blocked_users(user_id,created_at) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET created_at=excluded.created_at', message.user_id, Date.now());
+      this.sql.exec("UPDATE events SET status='ignored',reason='blacklisted',updated_at=? WHERE id=? AND status IN ('notifying','notify_pending')", Date.now(), id);
+      return;
+    }
+    const hash = await this.noticeHash(message, result);
+    const previous = this.sql.exec('SELECT event_id FROM notice_keys WHERE hash=? AND created_at>=?', hash, Date.now() - CONTENT_DEDUPE_MS).toArray()[0];
+    const stored = this.event(id);
+    if (!stored || !['notifying', 'notify_pending'].includes(stored.status)) return;
+    if (previous) {
+      this.sql.exec("UPDATE events SET status='ignored',reason='duplicate_content',updated_at=? WHERE id=? AND status IN ('notifying','notify_pending')", Date.now(), id);
+      return;
+    }
+    // Persist the send claim before Telegram await, across concurrent events,
+    // nodes and restarts. Uncertain delivery is never sent again blindly.
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec('INSERT INTO notice_keys(hash,event_id,created_at) VALUES (?,?,?) ON CONFLICT(hash) DO UPDATE SET event_id=excluded.event_id,created_at=excluded.created_at', hash, id, Date.now());
+      this.sql.exec("UPDATE events SET status='notifying',updated_at=? WHERE id=? AND status IN ('notifying','notify_pending')", Date.now(), id);
+    });
     const owner = String(this.env.OWNER_ID || '');
     if (!/^[1-9]\d{0,15}$/.test(owner)) throw new Error('owner_unconfigured');
     // Mark before dispatch; loss of the send response is never silently retried.
@@ -260,7 +347,7 @@ export class ObservePool {
     const subject = targets.length === 1 && message.reply?.user_id === targets[0] ? message.reply : null;
     return Promise.all(targets.map(async userId => {
       const childId = (await digest(parentId + ':' + userId)).slice(0, 24);
-      const childMessage = { ...message, user_id: userId, first_name: subject?.first_name || '', last_name: subject?.last_name || '', username: subject?.username || '' };
+      const childMessage = { ...message, user_id: userId, text: subject?.text || '', quote: subject?.quote || '', contact_name: subject?.contact_name || '', first_name: subject?.first_name || '', last_name: subject?.last_name || '', username: subject?.username || '' };
       delete childMessage.reply;
       const field = subject?.text ? 'text' : subject?.quote ? 'quote' : subject?.contact_name ? 'card_name' : 'text';
       const evidence = subject ? (field === 'card_name' ? subject.contact_name : subject[field]) : '';
@@ -275,6 +362,10 @@ export class ObservePool {
     let existing = this.event(id);
     if (existing && !['processing', 'retry'].includes(existing.status)) return json(200, { ok: true, accepted: true, event_id: id, status: 'duplicate' });
     const manual = await this.manualTargets(message, id);
+    if (!manual && this.knownBlocked(message.user_id)) {
+      this.sql.exec("INSERT INTO events(id,event_key,message,status,reason,created_at,updated_at) VALUES (?,?,?,'ignored','blacklisted',?,?) ON CONFLICT(id) DO UPDATE SET status='ignored',reason='blacklisted',updated_at=excluded.updated_at", id, key, JSON.stringify(message), Date.now(), Date.now());
+      return json(200, { ok: true, accepted: true, event_id: id, status: 'blacklisted' });
+    }
     await this.refresh();
     if (this.pauseReason()) return json(503, { ok: false, paused: true, error: this.pauseReason(), retryAfter: 60 });
     if (this.pending.has(id)) return json(409, { ok: false, error: 'busy' });
@@ -397,6 +488,7 @@ export class ObservePool {
       const result = await this.source('/api/pool/action', { id, user_id: message.user_id, sample: { text: event.evidence || '', kind: ['text', 'quote', 'card_name'].includes(event.kind) ? event.kind : 'text' } });
       if (result.ok !== true || typeof result.summary !== 'string' || result.summary.length > 1500) throw new Error('action_failed');
       this.sql.exec("UPDATE events SET status='approved',result=?,updated_at=? WHERE id=? AND status='sync_pending'", JSON.stringify(result), Date.now(), id);
+      if (result.blacklisted === true) this.sql.exec('INSERT INTO blocked_users(user_id,created_at) VALUES (?,?) ON CONFLICT(user_id) DO UPDATE SET created_at=excluded.created_at', message.user_id, Date.now());
       await this.resultNotice(this.event(id), '✅ 观察复核已确认\n用户 <code>' + escape(message.user_id) + '</code>\n' + escape(result.summary));
       this.invalidateDictionary();
     } catch {
@@ -436,7 +528,10 @@ export class ObservePool {
       const approvals = this.sql.exec("SELECT id FROM events WHERE status='sync_pending' AND updated_at<? LIMIT 3", Date.now() - REFRESH_MS).toArray();
       for (const e of approvals) await this.applyApproval(e.id);
       if (Date.now() - this.get('last_hit_sync', 0) > SYNC_MS) { await this.flushHits(); this.put('last_hit_sync', Date.now()); }
+      const notices = this.sql.exec("SELECT id,message,evidence,kind,reason FROM events WHERE status='notify_pending' AND updated_at<? ORDER BY updated_at LIMIT 3", Date.now() - REFRESH_MS).toArray();
+      for (const notice of notices) await this.notify(notice.id, JSON.parse(notice.message), { evidence: notice.evidence, matched_field: notice.kind, reason: '疑似广告，黑名单核查已恢复' });
       this.sql.exec("UPDATE events SET status='notification_uncertain',reason='notification_uncertain',updated_at=? WHERE status='notifying' AND updated_at<?", Date.now(), Date.now() - LEASE_MS);
+      this.sql.exec('DELETE FROM notice_keys WHERE hash IN (SELECT hash FROM notice_keys WHERE created_at<? ORDER BY created_at LIMIT 200)', Date.now() - CONTENT_DEDUPE_MS);
       this.sql.exec("DELETE FROM events WHERE id IN (SELECT id FROM events WHERE status IN ('ignored','approved','dismissed') AND updated_at<? ORDER BY updated_at LIMIT 200)", Date.now() - 7 * 86400000);
       this.sql.exec('DELETE FROM auth_attempts WHERE key IN (SELECT key FROM auth_attempts WHERE time<? LIMIT 100)', Date.now() - 3600_000);
     } catch { this.put('alarm_error', 'maintenance_unavailable'); }

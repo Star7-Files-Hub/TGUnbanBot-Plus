@@ -6,7 +6,7 @@ import { createHash, webcrypto } from 'node:crypto';
 import worker, { clearSnapshotCache, SNAPSHOT_TTL_MS, EMBEDDING_MODEL, CLASSIFIER_MODEL } from './node-worker.js';
 import {
   constantEqual, normalized, parseSingleLabel, readJson, validateDictionaryInput,
-  validateMessageInput, validVector, MAX_DICTIONARY_BYTES, ProtocolError,
+  validateMessageInput, validVector, MAX_DICTIONARY_BYTES, MAX_SAMPLE_VARIANTS, MAX_BLACKLIST, ProtocolError,
 } from './protocol.mjs';
 globalThis.crypto ||= webcrypto;
 const VERSION = 'a'.repeat(64), NEXT_VERSION = 'b'.repeat(64), TOKEN = 'unit-test-only-node-token';
@@ -115,6 +115,29 @@ test('dictionary guards sizes, vectors, counts, type normalization and duplicate
   assert.equal(validVector([1, 2, 3]), true);
   assert.equal(validVector([1, Infinity]), false);
 });
+test('optional blacklist and sample variants preserve legacy payload serialization', () => {
+  const legacy=data({samples:[sample('普通广告样本')]});
+  const validated=validateDictionaryInput({version:VERSION,data:legacy});
+  assert.equal(validated.ok,true);assert.equal(Object.hasOwn(validated.data,'blacklist'),false);
+  assert.equal(Object.hasOwn(validated.data.samples[0],'variants'),false);
+  assert.equal(JSON.stringify(validated.data),JSON.stringify(legacy));
+  const newData=data({blacklist:['123','456'],samples:[sample('普通广告样本',{variants:['广告另一变体']})]});
+  const current=validateDictionaryInput({version:VERSION,data:newData});assert.equal(current.ok,true);
+  assert.deepEqual(current.data.blacklist,['123','456']);assert.deepEqual(current.data.samples[0].variants,['广告另一变体']);
+  newData.blacklist[0]='999';newData.samples[0].variants[0]='已更改';
+  assert.deepEqual(current.data.blacklist,['123','456']);assert.deepEqual(current.data.samples[0].variants,['广告另一变体']);
+});
+test('blacklist and variants strictly reject malformed, duplicate or over-capacity values', () => {
+  const invalid=[
+    data({blacklist:null}),data({blacklist:['123','123']}),data({blacklist:['-123']}),data({blacklist:[123]}),
+    data({blacklist:Array.from({length:MAX_BLACKLIST+1},(_,i)=>String(i+100000))}),
+    data({samples:[sample(text,{variants:null})]}),data({samples:[sample(text,{variants:'text'})]}),
+    data({samples:[sample(text,{variants:['']})]}),data({samples:[sample(text,{variants:[123]})]}),
+    data({samples:[sample(text,{variants:['x'.repeat(201)]})]}),data({samples:[sample(text,{variants:['same','same']})]}),
+    data({samples:[sample(text,{variants:Array.from({length:MAX_SAMPLE_VARIANTS+1},(_,i)=>'变体'+i)})]})
+  ];
+  for(const value of invalid)assert.equal(validateDictionaryInput({version:VERSION,data:value}).ok,false);
+});
 test('auth failure, health and method/routing checks perform no DB queries', async () => {
   const h = harness();
   assert.equal((await call(h, '/health', null, { headers: { Authorization: '' } })).body, 'OK');
@@ -203,6 +226,47 @@ test('whitelist, owners, allowlist and command paths return normal without AI or
   }
   assert.equal(h.ai.length, 0);
   assert.equal(h.sqlite.prepare('SELECT COUNT(*) n FROM dictionary_snapshot').get().n, 1);
+});
+test('blacklisted senders return quiet normal before all AI, fingerprint or semantic classification', async () => {
+  const h=harness();await dictionary(h,data({blacklist:['555555'],owners:['555555'],whitelist:['555555'],
+    fingerprints:[fp(text)],samples:[sample(text)]}));
+  h.sql.length=0;h.writes.length=0;
+  h.env.AI.run=async()=>{throw new Error('must not run AI');};
+  for(const input of [message(),message({text:'新的可疑交易招揽内容'}),message({text:'/spam 123456'})]){
+    const result=await classify(h,input);assert.equal(result.status,200);assert.equal(result.body.kind,'normal');
+    assert.equal(result.body.reason,'blacklisted');assert.equal(result.body.evidence,'');assert.equal(result.body.metrics.rowsWritten,0);
+  }
+  assert.equal(h.sql.length,0);assert.equal(h.writes.length,0);assert.equal(h.ai.length,0);
+  clearSnapshotCache(h.env.DB);
+  const cold=await classify(h);assert.equal(cold.body.reason,'blacklisted');assert.equal(cold.body.metrics.rowsRead,1);
+});
+test('semantic variant aliases match complete normalized fields of the same kind without AI or writes', async () => {
+  const h=harness();const alias='高价收购实名号四件套长期招代理最新报价';
+  await dictionary(h,data({samples:[sample('已有广告正文',{variants:[alias]}),
+    sample('已有引用广告',{id:2,kind:'quote',variants:['引用广告群发推广长期合作']}),
+    sample('已有名片广告',{id:3,kind:'card_name',variants:['名片名字招代理广告']})]}));
+  delete h.env.AI;h.sql.length=0;h.writes.length=0;
+  for(const [field,value,id] of [['text',alias,1],['quote','引用广告群---发--推----广长期合作',2],['contact_name','名片名字招代理广告',3]]){
+    const result=await classify(h,message({text:'',[field]:value}));
+    assert.equal(result.body.kind,'semantic');assert.equal(result.body.sample_id,id);assert.equal(result.body.similarity,1);
+    assert.equal(result.body.metrics.rowsRead,0);assert.equal(result.body.metrics.rowsWritten,0);
+  }
+  assert.notEqual((await classify(h,message({text:'引用广告群发推广长期合作'}))).body.kind,'semantic');
+  assert.notEqual((await classify(h,message({text:alias+'不同条件'}))).body.kind,'semantic');
+  assert.equal(h.sql.length,0);assert.equal(h.writes.length,0);assert.equal(h.ai.length,0);
+  clearSnapshotCache(h.env.DB);
+  const cold=await classify(h,message({text:alias}));assert.equal(cold.body.kind,'semantic');assert.equal(cold.body.metrics.rowsRead,1);
+});
+test('a truncated 200-character variant is never a prefix match for a longer body', async () => {
+  const h=harness();const alias='a'.repeat(200);
+  await dictionary(h,data({samples:[sample('已有样本长正文',{variants:[alias]})]}));delete h.env.AI;
+  assert.equal((await classify(h,message({text:alias}))).body.kind,'semantic');
+  assert.equal((await classify(h,message({text:alias+'b'.repeat(2000)}))).body.kind,'candidate');
+});
+test('embedding semantic hit wins over structure candidate and never calls text classifier', async () => {
+  const h=harness();await dictionary(h,data({samples:[sample('不同的已存广告话术',{embedding:[1,0,0]})]}));
+  const result=await classify(h,message());assert.equal(result.body.kind,'semantic');assert.equal(result.body.sample_id,1);
+  assert.equal(result.body.metrics.rowsWritten,0);assert.deepEqual(h.ai.map(x=>x.model),[EMBEDDING_MODEL]);
 });
 test('hash semantic matches require matching kind and do not increment sample count', async () => {
   const h = harness(); await dictionary(h, data({ samples: [sample(text), sample('名片广告样本', { id: 2, kind: 'card_name' }), sample('引用广告样本', { id: 3, kind: 'quote' })] }));

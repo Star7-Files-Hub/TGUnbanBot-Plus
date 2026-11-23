@@ -62,7 +62,7 @@ const rowCount = (h, table) => h.sqlite.prepare('SELECT COUNT(*) n FROM '+table)
 
 test('control APIs authenticate before DB/schema and webhook authentication is separate', async () => {
   const h = harness();
-  for (const path of ['/api/pool/dictionary','/api/pool/action','/api/pool/hits','/api/pool/legacy-report']) {
+  for (const path of ['/api/pool/dictionary','/api/pool/action','/api/pool/hits','/api/pool/legacy-report','/api/pool/user-status']) {
     const body = path.endsWith('dictionary') ? undefined : {};
     assert.equal((await request(h,path,{body,token:'wrong'})).status,401);
     delete h.env.POOL_CONTROL_TOKEN;
@@ -102,6 +102,28 @@ test('legacy report unavailable database never triggers schema creation or mutat
   assert.equal(h.sqls.length,0);assert.equal(h.calls.length,0);
 });
 
+test('user-status validates before any schema/read and returns indexed blacklist presence only', async () => {
+  const h=harness();
+  for (const user_id of [0,-1,'0','-123','1.5',555,null,'a','9'.repeat(17)]) {
+    assert.equal((await request(h,'/api/pool/user-status',{body:{user_id}})).status,400);
+  }
+  assert.equal((await request(h,'/api/pool/user-status',{body:{user_id:'555',extra:true}})).status,400);
+  assert.equal(h.sqls.length,0); assert.equal(h.calls.length,0);
+  await init(h);h.sqlite.prepare("INSERT INTO blacklist VALUES ('555','PRIVATE-REASON','PRIVATE-NOTE','PRIVATE-OPERATOR',1)").run();h.sqls.length=0;
+  const result=await request(h,'/api/pool/user-status',{body:{user_id:'555'}});
+  assert.deepEqual(result.body,{ok:true,blacklisted:true});assert.equal(result.status,200);
+  assert.equal(h.sqls.length,1);assert.equal(h.sqls[0],'SELECT user_id FROM blacklist WHERE user_id = ?');
+  assert.deepEqual((await request(h,'/api/pool/user-status',{body:{user_id:'556'}})).body,{ok:true,blacklisted:false});
+  assert.equal(h.calls.length,0);assert.equal(rowCount(h,'blacklist'),1);
+  assert.equal(rowCount(h,'ad_samples'),0);
+});
+test('user-status storage failure is unknown rather than an invented false result', async () => {
+  const h=harness();h.env.DB={prepare(){throw new Error('PRIVATE-DB-ERROR');}};
+  let result=await request(h,'/api/pool/user-status',{body:{user_id:'555'}});
+  assert.equal(result.status,503);assert.equal(result.body.blacklisted,undefined);assert.ok(!JSON.stringify(result.body).includes('PRIVATE'));
+  delete h.env.DB;result=await request(h,'/api/pool/user-status',{body:{user_id:'555'}});assert.equal(result.status,503);
+  assert.equal(h.sqls.length,0);assert.equal(h.calls.length,0);
+});
 test('dictionary explicitly projects stable public match data, valid vectors and count zero', async () => {
   const h=harness(); await init(h);
   h.sqlite.prepare("INSERT INTO ad_fingerprints(id,type,value,norm_value,status,source,confirmed_by) VALUES (1,'keyword','群发推广','群发推广','confirmed','manual','PRIVATE-OPERATOR')").run();
@@ -115,6 +137,8 @@ test('dictionary explicitly projects stable public match data, valid vectors and
   assert.deepEqual(r.body.data.fingerprints[0],{id:1,type:'keyword',value:'群发推广',norm_value:'群发推广',status:'confirmed',source:'manual'});
   assert.deepEqual(r.body.data.samples.map(x=>x.embedding),[[1,0,0],null,null]); assert.ok(r.body.data.samples.every(x=>x.count===0));
   assert.deepEqual(r.body.data.whitelist,['111']); assert.deepEqual(r.body.data.owners,['222',OWNER]); assert.deepEqual(r.body.observe_groups,[OBSERVE]);
+  assert.deepEqual(r.body.data.blacklist,['333']);assert.ok(r.body.data.samples.every(x=>Array.isArray(x.variants)));
+  assert.ok(h.sqls.includes('SELECT user_id FROM blacklist ORDER BY user_id LIMIT ?'));
   assert.ok(!JSON.stringify(r.body).includes('PRIVATE-')); assert.ok(!h.sqls.some(sql=>/SELECT \*/.test(sql)));
 });
 test('dictionary refuses entity and serialized size caps instead of silently truncating', async () => {
@@ -126,13 +150,60 @@ test('dictionary refuses entity and serialized size caps instead of silently tru
   h2.sqlite.prepare("INSERT INTO ad_allowlist VALUES ('text',?,0,1)").run('a'.repeat(1_700_001));
   const sized=await request(h2,'/api/pool/dictionary'); assert.equal(sized.status,413); assert.equal(sized.body.error,'dictionary_too_large');
 });
+test('dictionary exports parsed kind-scoped variants and rejects their legal capacity overflow', async () => {
+  const h=harness();await init(h);
+  seedSample(h,1,'高价收购实名号四件套长期招代理','text');seedSample(h,2,'广告引用样本','quote');seedSample(h,3,'广告名片样本','card_name');
+  const values=['高价收购实名号四件套长期招代理不同报价','有意请联系名片'];
+  h.sqlite.prepare('UPDATE ad_samples SET variants=? WHERE id=1').run(JSON.stringify(values));
+  h.sqlite.prepare('UPDATE ad_samples SET variants=? WHERE id=2').run('{bad JSON');
+  h.sqlite.prepare('UPDATE ad_samples SET variants=? WHERE id=3').run('{"PRIVATE-FIELD":"not an array"}');
+  const result=await request(h,'/api/pool/dictionary');assert.equal(result.status,200);
+  assert.deepEqual(result.body.data.samples.map(x=>x.variants),[values,[],[]]);
+  assert.deepEqual(result.body.data.samples.map(x=>x.kind),['text','quote','card_name']);
+  assert.ok(!JSON.stringify(result.body).includes('PRIVATE'));
+  h.sqlite.prepare('UPDATE ad_samples SET variants=? WHERE id=1').run(JSON.stringify(Array.from({length:9},(_,i)=>'变体'+i)));
+  assert.equal((await request(h,'/api/pool/dictionary')).status,413);
+  h.sqlite.prepare('UPDATE ad_samples SET variants=? WHERE id=1').run(JSON.stringify(['x'.repeat(201)]));
+  assert.equal((await request(h,'/api/pool/dictionary')).status,503);
+});
+test('dictionary blacklist capacity is rejected rather than silently dropping IDs', async () => {
+  const h=harness();await init(h);
+  const insert=h.sqlite.prepare("INSERT INTO blacklist(user_id,reason,created_at) VALUES (?,'private',1)");
+  h.sqlite.exec('BEGIN');for(let i=0;i<10001;i++)insert.run(String(i+100000));h.sqlite.exec('COMMIT');
+  const result=await request(h,'/api/pool/dictionary');assert.equal(result.status,413);assert.equal(result.body.error,'dictionary_capacity_exceeded');
+});
 test('action saves once, bans configured groups only, returns cached result and sends no notification', async () => {
   const h=harness(); const input=action();
   const first=await request(h,'/api/pool/action',{body:input}); assert.equal(first.status,200); assert.equal(first.body.ok,true); assert.match(first.body.summary,/成功 1，失败 0.*已保存/);
+  assert.equal(first.body.blacklisted,true);assert.deepEqual(first.body.failures,[]);
   const again=await request(h,'/api/pool/action',{body:input}); assert.equal(again.status,200); assert.deepEqual(again.body,first.body);
   assert.equal(rowCount(h,'ad_samples'),1); assert.equal(h.sqlite.prepare('SELECT count FROM ad_samples').get().count,1);
   assert.equal(rowCount(h,'blacklist'),1); assert.deepEqual(h.calls.map(c=>c.name),['banChatMember']); assert.equal(h.calls[0].body.chat_id,GROUP);
   assert.equal((await request(h,'/api/pool/action',{body:{...input,user_id:'556'}})).status,409);
+});
+test('future action failure details preserve each native code safely and keep blacklisted true', async () => {
+  const h=harness();await init(h);const second='-1002';
+  h.sqlite.prepare('INSERT INTO ad_groups(chat_id,added_by,created_at) VALUES (?,\'test\',1)').run(second);worker.invalidateGroups();
+  const raw='Bad Request: PARTICIPANT_ID_INVALID';
+  h.env.SECRET_TEST='PRIVATE-SECRET';
+  h.env.__tgMock.banChatMember=async body=>{h.calls.push({name:'banChatMember',body});return {ok:false,description:body.chat_id===GROUP?raw:'Bad Request: CHAT_ADMIN_REQUIRED https://private.invalid/token PRIVATE-SECRET '+TOKEN+' Bearer test-credential-token'};};
+  const result=await request(h,'/api/pool/action',{body:action()});assert.equal(result.status,200);assert.equal(result.body.blacklisted,true);
+  assert.equal(result.body.failures.length,2);assert.deepEqual(result.body.failures.map(x=>x.gid).sort(),[GROUP,second].sort());
+  const participant=result.body.failures.find(x=>x.gid===GROUP);assert.ok(participant.error.includes('PARTICIPANT_ID_INVALID'));assert.ok(participant.error.includes('无法识别目标用户'));
+  assert.ok(result.body.failures.find(x=>x.gid===second).error.includes('CHAT_ADMIN_REQUIRED'));
+  assert.ok(result.body.failures.every(x=>x.error.length<=180));assert.ok(result.body.summary.length<=1500);
+  const serialized=JSON.stringify(result.body);assert.ok(!serialized.includes('https://')&&!serialized.includes('PRIVATE-SECRET')&&!serialized.includes(TOKEN)&&!serialized.includes('test-credential-token'));
+  assert.ok(result.body.summary.includes(GROUP)&&result.body.summary.includes(second));
+  assert.equal(rowCount(h,'blacklist'),1);assert.equal(h.calls.filter(x=>x.name==='banChatMember').length,2);
+  const cached=await request(h,'/api/pool/action',{body:action()});assert.deepEqual(cached.body,result.body);assert.equal(h.calls.filter(x=>x.name==='banChatMember').length,2);
+});
+test('older completed action receipt retains its cached response without inventing new flags or rerunning bans', async () => {
+  const h=harness();await init(h);h.sqlite.exec('CREATE TABLE pool_action_receipts (id TEXT PRIMARY KEY,status TEXT NOT NULL,result TEXT NOT NULL,created_at INTEGER NOT NULL)');
+  const input=action(),digest=sha(JSON.stringify({user_id:input.user_id,sample:input.sample}));
+  const response={ok:true,summary:'旧摘要只有成功失败数量'};
+  h.sqlite.prepare('INSERT INTO pool_action_receipts VALUES (?,?,?,1)').run(input.id,'done',JSON.stringify({input_hash:digest,response}));
+  const result=await request(h,'/api/pool/action',{body:input});assert.equal(result.status,200);assert.deepEqual(result.body,response);
+  assert.equal(h.calls.length,0);assert.equal(rowCount(h,'blacklist'),0);assert.equal(rowCount(h,'ad_samples'),0);
 });
 test('concurrent action retries claim a single sample phase and single enforcement', async () => {
   const h=harness(); await init(h);
@@ -203,6 +274,7 @@ test('current owner and whitelist exemptions outrank stale controller approval',
   h.sqlite.prepare("INSERT INTO ad_user_whitelist VALUES ('111',NULL,'test',1)").run(); h.sqlite.prepare("INSERT INTO ad_owners(user_id,created_at) VALUES ('222',1)").run();
   for(const [i,user_id] of [OWNER,'111','222'].entries()) {
     const r=await request(h,'/api/pool/action',{body:{...action(String(i+1).repeat(24)),user_id}}); assert.equal(r.status,200); assert.match(r.body.summary,/未保存样本或处罚/);
+    assert.equal(r.body.blacklisted,false);assert.deepEqual(r.body.failures,[]);
   }
   assert.equal(rowCount(h,'ad_samples'),0);assert.equal(rowCount(h,'blacklist'),0);assert.equal(h.calls.length,0);
 });

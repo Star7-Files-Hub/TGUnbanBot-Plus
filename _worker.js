@@ -2619,6 +2619,15 @@ function poolParsedVector(value) {
 	try { const vector = typeof value === 'string' ? JSON.parse(value) : value; return poolValidVector(vector) ? vector : null; }
 	catch (_) { return null; }
 }
+function poolSampleVariants(value) {
+	let variants;
+	try { variants = typeof value === 'string' ? JSON.parse(value) : value; } catch (_) { return []; }
+	// Dirty historical non-array JSON has never represented valid aliases.
+	if (!Array.isArray(variants)) return [];
+	if (variants.length > MERGE_VARIANTS_MAX) throw new PoolApiError(413, 'dictionary_capacity_exceeded');
+	if (variants.some(item => typeof item !== 'string' || item.length < 1 || item.length > 200)) throw new PoolApiError(503, 'dictionary_unavailable');
+	return [...new Set(variants)];
+}
 async function servePoolDictionary(env) {
 	if (!env.DB) throw new PoolApiError(503, 'dictionary_unavailable');
 	await adDetectionReady(env);
@@ -2626,11 +2635,12 @@ async function servePoolDictionary(env) {
 	// same dictionary snapshot rather than mixing pre/post-approval revisions.
 	const queries = [
 		["SELECT id, type, value, norm_value, status, source FROM ad_fingerprints ORDER BY id LIMIT ?", 5000],
-		['SELECT id, norm_hash, sample_text, kind, embedding FROM ad_samples ORDER BY id LIMIT ?', 5000],
+		['SELECT id, norm_hash, sample_text, kind, embedding, variants FROM ad_samples ORDER BY id LIMIT ?', 5000],
 		['SELECT user_id FROM ad_user_whitelist ORDER BY user_id LIMIT ?', 10000],
 		['SELECT user_id FROM ad_owners ORDER BY user_id LIMIT ?', 10000],
 		['SELECT dimension, value FROM ad_allowlist ORDER BY dimension, value LIMIT ?', 10000],
-		['SELECT chat_id FROM ad_observe_groups ORDER BY chat_id LIMIT ?', 1000]
+		['SELECT chat_id FROM ad_observe_groups ORDER BY chat_id LIMIT ?', 1000],
+		['SELECT user_id FROM blacklist ORDER BY user_id LIMIT ?', 10000]
 	];
 	const reads = await env.DB.batch(queries.map(([sql, cap]) => env.DB.prepare(sql).bind(cap + 1)));
 	const rows = reads.map((result, index) => {
@@ -2638,7 +2648,7 @@ async function servePoolDictionary(env) {
 		if (result.results.length > queries[index][1]) throw new PoolApiError(413, 'dictionary_capacity_exceeded');
 		return result.results;
 	});
-	const [fingerprintRows, rawSamples, whitelistRows, ownerRows, allowlist, observeRows] = rows;
+	const [fingerprintRows, rawSamples, whitelistRows, ownerRows, allowlist, observeRows, blacklistRows] = rows;
 	// Bound total scanned rows before filtering retired entries, so retirement
 	// history cannot turn a small active dictionary into an unbounded read.
 	const fingerprints = fingerprintRows.filter(row => row.status !== 'retired');
@@ -2646,7 +2656,7 @@ async function servePoolDictionary(env) {
 	for (const row of rawSamples) {
 		// pool-specific keys isolate source kinds in the existing UNIQUE(norm_hash) schema.
 		const hash = String(row.norm_hash || '').startsWith('pool:') ? await sha256Hex(normalizeAdText(row.sample_text)) : row.norm_hash;
-		samples.push({ id: row.id, norm_hash: hash, sample_text: row.sample_text, kind: row.kind || 'text', embedding: poolParsedVector(row.embedding)?.map(component => Math.round(component * 1e6) / 1e6) || null, count: 0 });
+		samples.push({ id: row.id, norm_hash: hash, sample_text: row.sample_text, kind: row.kind || 'text', embedding: poolParsedVector(row.embedding)?.map(component => Math.round(component * 1e6) / 1e6) || null, count: 0, variants: poolSampleVariants(row.variants) });
 	}
 	const whitelist = whitelistRows.map(row => String(row.user_id));
 	const owners = ownerRows.map(row => String(row.user_id));
@@ -2655,7 +2665,9 @@ async function servePoolDictionary(env) {
 	if (owners.length > 10000) throw new PoolApiError(413, 'dictionary_capacity_exceeded');
 	owners.sort();
 	const observe_groups = observeRows.map(row => String(row.chat_id));
-	const body = JSON.stringify({ ok: true, data: { fingerprints, samples, whitelist, owners, allowlist }, observe_groups });
+	const blacklist = blacklistRows.map(row => String(row.user_id));
+	if (blacklist.some(userId => !poolUserId(userId)) || new Set(blacklist).size !== blacklist.length) throw new PoolApiError(503, 'dictionary_unavailable');
+	const body = JSON.stringify({ ok: true, data: { fingerprints, samples, whitelist, owners, allowlist, blacklist }, observe_groups });
 	if (new TextEncoder().encode(body).byteLength > 1_700_000) throw new PoolApiError(413, 'dictionary_too_large');
 	return new Response(body, { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
 }
@@ -2745,6 +2757,24 @@ async function poolCompleteAction(env, id, lease, response) {
 	if (completed?.meta?.changes !== 1) throw new PoolApiError(409, 'action_busy');
 	return poolJson(200, response);
 }
+function poolSafeBanFailure(env, value) {
+	let message = typeof value === 'string' ? value.slice(0, 4000) : 'ban 未成功';
+	for (const [key, secret] of Object.entries(env)) {
+		if (/(?:TOKEN|SECRET|PASSWORD|API_HASH|API_KEY)/i.test(key) && typeof secret === 'string' && secret.length >= 4) message = message.split(secret).join('[redacted]');
+	}
+	message = message.replace(/(?:https?|ftp):\/\/[^\s<>"']+/gi, '[url redacted]')
+		.replace(/\b\d{5,16}:[A-Za-z0-9_-]{20,}\b/g, '[token redacted]')
+		.replace(/\b(?:Bearer\s+|(?:token|secret|password|api[_-]?key)\s*[=:]\s*)[^\s,;]+/gi, '[credential redacted]')
+		.replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+	if (/PARTICIPANT_ID_INVALID/i.test(message)) message += '（Telegram 无法识别目标用户，通常机器人尚未接触该账号）';
+	return (message || 'ban 未成功').slice(0, 180);
+}
+function poolBanFailures(env, value) {
+	return (Array.isArray(value) ? value : []).map(failure => ({
+		gid: /^-[1-9]\d{1,15}$/.test(String(failure?.gid || '')) ? String(failure.gid) : 'unknown',
+		error: poolSafeBanFailure(env, failure?.error)
+	}));
+}
 async function servePoolAction(env, input) {
 	if (!poolRecord(input) || Object.keys(input).some(key => !['id','user_id','sample'].includes(key))
 		|| typeof input.id !== 'string' || !/^[a-f0-9]{24}$/.test(input.id) || !poolUserId(input.user_id)
@@ -2766,7 +2796,7 @@ async function servePoolAction(env, input) {
 	if (row.status === 'done') return poolJson(200, receipt.response);
 	if (claim?.meta?.changes !== 1 || receipt.lease !== lease) throw new PoolApiError(409, 'action_busy');
 	try {
-		if (await poolProtectedUser(env, input.user_id)) return poolCompleteAction(env, input.id, lease, { ok: true, summary: '目标为主人或白名单用户，未保存样本或处罚' });
+		if (await poolProtectedUser(env, input.user_id)) return poolCompleteAction(env, input.id, lease, { ok: true, blacklisted: false, failures: [], summary: '目标为主人或白名单用户，未保存样本或处罚' });
 		let sample = receipt.sample;
 		if (!sample) {
 			try { sample = await poolSaveSampleOnce(env, input.id, lease, input.sample); }
@@ -2783,11 +2813,14 @@ async function servePoolAction(env, input) {
 		if (enforcing?.success === false) throw new PoolApiError(503, 'action_unavailable');
 		if (enforcing?.meta?.changes !== 1) throw new PoolApiError(409, 'action_busy');
 		const config = await loadConfig(env);
-		if (await poolProtectedUser(env, input.user_id)) return poolCompleteAction(env, input.id, lease, { ok: true, summary: '目标已加入主人或白名单，未执行封禁' });
+		if (await poolProtectedUser(env, input.user_id)) return poolCompleteAction(env, input.id, lease, { ok: true, blacklisted: false, failures: [], summary: '目标已加入主人或白名单，未执行封禁' });
 		await addBlacklist(env, input.user_id, 'spam', 'pool_confirm', 'pool_controller');
 		const bans = await banAllGroups(env, input.user_id, config, 'pool_confirm');
 		const sampleNote = sample.ok ? `${sample.merged ? '已合并' : '已保存'}语义样本${sample.sampleId ? ' #' + sample.sampleId : ''}` : sample.reason === 'empty_or_short' ? '无有效正文，未保存样本' : '样本保存失败';
-		const response = { ok: true, summary: `已列黑名单，群封禁成功 ${bans.okCount}，失败 ${bans.failures.length}；${sampleNote}` };
+		const failures = poolBanFailures(env, bans.failures);
+		const details = failures.map(failure => `${failure.gid}：${failure.error}`).join('\n');
+		const response = { ok: true, blacklisted: true, failures,
+			summary: (`已列黑名单，群封禁成功 ${bans.okCount}，失败 ${failures.length}；${sampleNote}` + (details ? '\n' + details : '')).slice(0, 1500) };
 		const completed = await poolCompleteAction(env, input.id, lease, response);
 		if (sample.ok && sample.sampleId) await maybePromoteSampleToFingerprint(env, sample.sampleId);
 		return completed;
@@ -2824,6 +2857,14 @@ async function servePoolHits(env, input) {
 	}
 	return poolJson(200, { ok: true, applied });
 }
+async function servePoolUserStatus(env, input) {
+	if (!poolRecord(input) || Object.keys(input).some(key => key !== 'user_id') || !poolUserId(input.user_id)) throw new PoolApiError(400, 'invalid_user_id');
+	if (!env.DB) throw new PoolApiError(503, 'user_status_unavailable');
+	// Indexed, read-only check for a newly blacklisted sender just before a review.
+	// No schema initialization: storage errors are unknown (503), never false.
+	const row = await env.DB.prepare('SELECT user_id FROM blacklist WHERE user_id = ?').bind(input.user_id).first();
+	return poolJson(200, { ok: true, blacklisted: row !== null && row !== undefined });
+}
 async function servePoolLegacyReport(env, input) {
 	if (!poolRecord(input) || Object.keys(input).some(key => key !== 'report_id')
 		|| !Number.isSafeInteger(input.report_id) || input.report_id < 1) throw new PoolApiError(400, 'invalid_report_id');
@@ -2842,6 +2883,7 @@ async function handlePoolApi(request, env, path) {
 		if (path === '/api/pool/dictionary') return await servePoolDictionary(env);
 		const input = await poolReadJson(request);
 		if (path === '/api/pool/legacy-report') return await servePoolLegacyReport(env, input);
+		if (path === '/api/pool/user-status') return await servePoolUserStatus(env, input);
 		return path === '/api/pool/action' ? await servePoolAction(env, input) : await servePoolHits(env, input);
 	} catch (error) { return poolJson(error instanceof PoolApiError ? error.status : 503, { ok: false, error: error instanceof PoolApiError ? error.code : 'pool_api_unavailable' }); }
 }
@@ -2982,7 +3024,7 @@ async function serveObserveIngest(request, env) {
 export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
-		if (['/api/pool/dictionary', '/api/pool/action', '/api/pool/hits', '/api/pool/legacy-report'].includes(url.pathname)) return handlePoolApi(request, env, url.pathname);
+		if (['/api/pool/dictionary', '/api/pool/action', '/api/pool/hits', '/api/pool/legacy-report', '/api/pool/user-status'].includes(url.pathname)) return handlePoolApi(request, env, url.pathname);
 		if (url.pathname === '/api/observe/ingest') return serveObserveIngest(request, env);
 		if (request.method === 'GET') {
 			if (url.pathname === '/health') return new Response('OK', { status: 200 });

@@ -16,8 +16,11 @@ export async function validSession(request, env, now = Date.now()) {
   if (!value || value.length > 1000) return false;
   try {
     const [payload, sig, extra] = value.split('.');
-    if (!payload || !sig || extra) return false;
-    if (!await crypto.subtle.verify('HMAC', await key(env.SESSION_SECRET), decode(sig), new TextEncoder().encode(payload))) return false;
+    if (!payload || !sig || extra || !/^[A-Za-z0-9_-]+$/.test(payload) || !/^[A-Za-z0-9_-]{43}$/.test(sig)) return false;
+    const signature = decode(sig);
+    // Reject noncanonical base64 aliases that differ only in unused tail bits.
+    if (encode(signature) !== sig || encode(decode(payload)) !== payload) return false;
+    if (!await crypto.subtle.verify('HMAC', await key(env.SESSION_SECRET), signature, new TextEncoder().encode(payload))) return false;
     const body = JSON.parse(new TextDecoder().decode(decode(payload)));
     return Number.isFinite(body.exp) && body.exp > now && body.exp <= now + 8 * 3600_000;
   } catch { return false; }

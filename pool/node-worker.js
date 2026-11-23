@@ -42,9 +42,11 @@ async function sha256(value) {
 function compileDictionary(version, data, payload, loadedAt = Date.now()) {
   return {
     version, data, payload, loadedAt,
-    owners: new Set(data.owners), whitelist: new Set(data.whitelist),
+    owners: new Set(data.owners), whitelist: new Set(data.whitelist), blacklist: new Set(data.blacklist || []),
     fingerprints: data.fingerprints.filter(item => item.status !== 'retired'),
-    samples: data.samples.filter(item => ['text', 'quote', 'card_name'].includes(item.kind)),
+    samples: data.samples.filter(item => ['text', 'quote', 'card_name'].includes(item.kind)).map(item => ({
+      ...item, variants: new Set((item.variants || []).map(value => normalized(value)))
+    })),
   };
 }
 async function ensureSchema(db, state, metrics) {
@@ -210,6 +212,9 @@ function labelPrompt(message) {
 }
 function withResult(kind, evidence, extra = {}) { return { ok: true, kind, evidence, ...extra }; }
 async function classifyMessage(dictionary, message, env, metrics) {
+  // Already-blacklisted senders never become a new owner review, even when their
+  // latest body/name would match a fingerprint, structure rule or AI candidate.
+  if (dictionary.blacklist.has(message.user_id)) return withResult('normal', '', { reason: 'blacklisted' });
   if (dictionary.whitelist.has(message.user_id) || dictionary.owners.has(message.user_id)) {
     return withResult('normal', '', { reason: 'user_exempt' });
   }
@@ -227,7 +232,10 @@ async function classifyMessage(dictionary, message, env, metrics) {
     if (!text || text.length < 4 || NOT_AD.test(text)) continue;
     const hash = await sha256(text);
     const samples = dictionary.samples.filter(sample => sample.kind === kind);
-    const exact = samples.find(sample => constantEqual(sample.norm_hash, hash));
+    // Variants are complete normalized aliases from the same kind. Never use
+    // substring/prefix matches: a stored 200-character truncation must not match
+    // a different, longer body just because it starts with the same phrase.
+    const exact = samples.find(sample => constantEqual(sample.norm_hash, hash) || sample.variants.has(text));
     const evidence = evidenceFor(message, kind === 'card_name' ? 'contact_name' : kind);
     if (exact) return withResult('semantic', evidence, { sample_id: exact.id, similarity: 1, matched_field: kind });
     const comparable = samples.filter(sample => validVector(sample.embedding));
